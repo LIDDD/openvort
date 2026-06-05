@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from openvort.db.models import VoiceProvider
 from openvort.services.embedding.providers.base import EmbeddingProviderBase
@@ -47,7 +48,7 @@ def _mask_secret(value: str) -> str:
 class EmbeddingService:
     """Embedding service backed by voice_providers table (service_type='embedding')."""
 
-    def __init__(self, session_factory):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
         self._session_factory = session_factory
         self._providers: dict[str, EmbeddingProviderBase] = {}
         self._default_provider_id: str = ""

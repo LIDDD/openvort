@@ -28,14 +28,8 @@ const form = ref({
     name: "",
     platform: "dashscope",
     api_key: "",
-    config_text: JSON.stringify(
-        {
-            model: "text-embedding-v3",
-            dimensions: 1024,
-        },
-        null,
-        2,
-    ),
+    model: "text-embedding-v3",
+    dimensions: 1024,
     is_default: false,
     is_enabled: true,
 });
@@ -45,14 +39,8 @@ function resetForm() {
         name: "",
         platform: "dashscope",
         api_key: "",
-        config_text: JSON.stringify(
-            {
-                model: "text-embedding-v3",
-                dimensions: 1024,
-            },
-            null,
-            2,
-        ),
+        model: "text-embedding-v3",
+        dimensions: 1024,
         is_default: false,
         is_enabled: true,
     };
@@ -80,11 +68,13 @@ function handleAdd() {
 function handleEdit(row: EmbeddingProviderItem) {
     editing.value = true;
     editingId.value = row.id;
+    const cfg = row.config || {};
     form.value = {
         name: row.name,
         platform: row.platform,
         api_key: "",
-        config_text: JSON.stringify(row.config || {}, null, 2),
+        model: cfg.model || "text-embedding-v3",
+        dimensions: cfg.dimensions || 1024,
         is_default: row.is_default,
         is_enabled: row.is_enabled,
     };
@@ -97,20 +87,17 @@ async function handleSave() {
         return;
     }
 
-    let parsedConfig: Record<string, any> = {};
-    try {
-        parsedConfig = form.value.config_text?.trim() ? JSON.parse(form.value.config_text) : {};
-    } catch {
-        message.error("配置 JSON 格式错误");
-        return;
-    }
+    const config = {
+        model: form.value.model,
+        dimensions: form.value.dimensions,
+    };
 
     saving.value = true;
     try {
         if (editing.value) {
             const payload: Record<string, any> = {
                 name: form.value.name,
-                config: parsedConfig,
+                config,
                 is_default: form.value.is_default,
                 is_enabled: form.value.is_enabled,
             };
@@ -124,7 +111,7 @@ async function handleSave() {
                 name: form.value.name,
                 platform: form.value.platform,
                 api_key: form.value.api_key,
-                config: parsedConfig,
+                config,
                 is_default: form.value.is_default,
             });
             message.success("创建成功");
@@ -180,6 +167,16 @@ onMounted(loadData);
         <VortTable :data-source="list" :loading="loading" row-key="id" :pagination="false">
             <VortTableColumn label="名称" prop="name" :min-width="180" />
             <VortTableColumn label="平台" prop="platform" :width="140" />
+            <VortTableColumn label="模型" :width="180">
+                <template #default="{ row }">
+                    <span class="text-sm">{{ row.config?.model || "-" }}</span>
+                </template>
+            </VortTableColumn>
+            <VortTableColumn label="维度" :width="80">
+                <template #default="{ row }">
+                    <span class="text-sm">{{ row.config?.dimensions || "-" }}</span>
+                </template>
+            </VortTableColumn>
             <VortTableColumn label="默认" :width="90">
                 <template #default="{ row }">
                     <VortTag v-if="row.is_default" color="blue" :bordered="false" size="small">默认</VortTag>
@@ -189,11 +186,6 @@ onMounted(loadData);
             <VortTableColumn label="启用" :width="80">
                 <template #default="{ row }">
                     <VortSwitch :checked="row.is_enabled" @change="handleToggleEnabled(row)" />
-                </template>
-            </VortTableColumn>
-            <VortTableColumn label="配置" :min-width="280">
-                <template #default="{ row }">
-                    <code class="text-xs text-gray-500 break-all">{{ JSON.stringify(row.config || {}) }}</code>
                 </template>
             </VortTableColumn>
             <VortTableColumn label="操作" :width="200" fixed="right">
@@ -232,12 +224,11 @@ onMounted(loadData);
                 <VortFormItem label="API Key">
                     <VortInputPassword v-model="form.api_key" placeholder="编辑时留空表示不修改" />
                 </VortFormItem>
-                <VortFormItem label="配置(JSON)">
-                    <VortTextarea
-                        v-model="form.config_text"
-                        :rows="6"
-                        placeholder='{"model":"text-embedding-v3","dimensions":1024}'
-                    />
+                <VortFormItem label="模型">
+                    <VortInput v-model="form.model" placeholder="text-embedding-v3" />
+                </VortFormItem>
+                <VortFormItem label="向量维度">
+                    <VortInput v-model.number="form.dimensions" type="number" placeholder="1024" />
                 </VortFormItem>
                 <VortFormItem label="设为默认">
                     <VortSwitch v-model:checked="form.is_default" />
