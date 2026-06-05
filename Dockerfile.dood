@@ -1,0 +1,12 @@
+# Docker-out-of-Docker: 基于官方 0.13.0 镜像加装 docker client。
+# 用途: 让容器内 openvort 的 Remote Node / "安装镜像" 功能能调用宿主 docker daemon
+#       (需配合 docker-compose.override.yml 挂载 /var/run/docker.sock)。
+# 仅装 client(amd64, 匹配本容器架构), 不含 dockerd/containerd。
+# ENTRYPOINT/CMD 继承自 base(python -m openvort start), 不覆盖。
+FROM ghcr.io/openvort/openvort:0.13.0
+
+ARG DOCKER_CLI_VERSION=29.5.3
+RUN curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" -o /tmp/docker.tgz \
+ && tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1 docker/docker \
+ && rm /tmp/docker.tgz \
+ && docker --version

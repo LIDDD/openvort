@@ -70,3 +70,6 @@ docs/
 
 # Root-level test scripts
 /test_*.py
+
+# 本机 Docker compose override(QEMU 启动配置,本机专用,不进 git)
+docker-compose.override.yml
