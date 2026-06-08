@@ -3,11 +3,11 @@ import { ref, computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import {
     getSkills, getSkill, createSkill, updateSkill, deleteSkill, toggleSkill,
-    getSkillTags,
+    getSkillTags, uploadSkill,
     generateSkillContentPrompt,
 } from "@/api";
 import { message, dialog } from "@openvort/vort-ui";
-import { Plus, Trash2, Save, BookOpen, Bot, X, Tag, Search, Info, ArrowUpDown, Pencil } from "lucide-vue-next";
+import { Plus, Trash2, Save, BookOpen, Bot, X, Tag, Search, Info, ArrowUpDown, Pencil, Upload } from "lucide-vue-next";
 import MarkdownView from "@/components/vort-biz/editor/MarkdownView.vue";
 
 const router = useRouter();
@@ -282,6 +282,31 @@ async function handleAiGenerateContent() {
     }
 }
 
+// ---- Upload skill package ----
+const uploading = ref(false);
+const uploadFileInput = ref<HTMLInputElement | null>(null);
+
+function triggerUpload() {
+    uploadFileInput.value?.click();
+}
+
+async function handleUploadFile(e: Event) {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    uploading.value = true;
+    try {
+        const res: any = await uploadSkill(file);
+        message.success(`技能「${res.name}」上传成功`);
+        loadSkills();
+        loadTags();
+    } catch (err: any) {
+        message.error(err?.response?.data?.detail || "上传失败");
+    } finally {
+        uploading.value = false;
+        if (uploadFileInput.value) uploadFileInput.value.value = "";
+    }
+}
+
 // ---- Helpers ----
 function scopeLabel(scope: string): string {
     if (scope === "builtin") return "内置";
@@ -326,7 +351,17 @@ onMounted(() => { loadSkills(); loadTags(); });
                     <span class="text-xs text-gray-400">管理 AI 的知识与工作流，通过知识、脚本和模板增强 AI 的专业能力</span>
                 </div>
                 <div class="flex items-center gap-2">
+                    <input
+                        ref="uploadFileInput"
+                        type="file"
+                        accept=".skill,.zip"
+                        class="hidden"
+                        @change="handleUploadFile"
+                    />
                     <AiAssistButton prompt="我想创建一个新的技能（Skill），请引导我完成创建。请先询问我技能的名称、描述和用途，然后帮我生成专业的 Skill 内容并创建。" label="AI 助手创建" />
+                    <VortButton variant="outline" :loading="uploading" @click="triggerUpload">
+                        <Upload :size="14" class="mr-1" /> 上传技能包
+                    </VortButton>
                     <VortButton variant="primary" @click="openCreateDialog">
                         <Plus :size="14" class="mr-1" /> 新建技能
                     </VortButton>
