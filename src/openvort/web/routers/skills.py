@@ -1,15 +1,22 @@
 """Skill 管理路由（管理员：内置 + 公共）"""
 
+import io
 import json as _json
+import os
+import re
+import shutil
+import tempfile
 import uuid
+import zipfile
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import delete, select
 
 from openvort.db.models import MemberSkill, PostSkill, Skill
 from openvort.skill.directories import SkillDirectoryManager
-from openvort.web.deps import get_db_session_factory
+from openvort.skill.loader import _parse_skill_file
+from openvort.web.deps import get_db_session_factory, get_skill_loader
 
 router = APIRouter()
 
@@ -64,6 +71,77 @@ async def list_skill_directories():
     directories = SkillDirectoryManager.get_all_directories()
     return {"directories": directories}
 
+
+@router.post("/upload")
+async def upload_skill(file: UploadFile):
+    """上传 .skill 包（zip 格式），解压到用户目录并立即同步入库，无需重启"""
+    content = await file.read()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="文件不是有效的 zip/.skill 包")
+
+    user_dir = SkillDirectoryManager.get_directory("user")
+    if not user_dir or not user_dir.path:
+        raise HTTPException(status_code=500, detail="用户 skill 目录不可用")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        from pathlib import Path
+        tmp_path = Path(tmp).resolve()
+
+        # [fix] Zip Slip: 解压前校验每个成员路径不逃出 tmp 目录，并拒绝绝对路径和软链
+        for info in zf.infolist():
+            member = info.filename
+            if member.startswith("/") or ".." in member.split("/"):
+                raise HTTPException(status_code=400, detail=f"zip 包含非法路径: {member}")
+            # 拒绝 Unix 符号链接（external_attr 高 16 位为 Unix 权限，0xA000 = symlink）
+            if (info.external_attr >> 16) & 0xF000 == 0xA000:
+                raise HTTPException(status_code=400, detail=f"zip 包含符号链接: {member}")
+            resolved = (tmp_path / member).resolve()
+            if not str(resolved).startswith(str(tmp_path) + os.sep) and resolved != tmp_path:
+                raise HTTPException(status_code=400, detail=f"zip 包含路径穿越: {member}")
+        zf.extractall(tmp_path)
+
+        # 递归找 SKILL.md
+        skill_md = next(tmp_path.rglob("SKILL.md"), None)
+        if skill_md is None:
+            raise HTTPException(status_code=400, detail="zip 包中未找到 SKILL.md")
+
+        parsed = _parse_skill_file(skill_md)
+        if not parsed or not parsed.get("name"):
+            raise HTTPException(status_code=400, detail="SKILL.md 解析失败或缺少 name 字段")
+
+        skill_name = parsed["name"]
+
+        # [fix] 路径穿越：skill name 只允许安全字符，并二次验证目标路径在 user dir 内
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", skill_name):
+            raise HTTPException(status_code=400, detail=f"skill name 含非法字符: {skill_name!r}")
+        target_dir = (user_dir.path / skill_name).resolve()
+        user_dir_resolved = user_dir.path.resolve()
+        if not str(target_dir).startswith(str(user_dir_resolved) + os.sep):
+            raise HTTPException(status_code=400, detail="skill name 导致路径越界")
+
+        # SKILL.md 的父目录就是要复制的 skill 根目录
+        skill_root = skill_md.parent
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        shutil.copytree(skill_root, target_dir)
+
+    # 立即同步入库，无需重启
+    loader = get_skill_loader()
+    await loader._sync_user_to_db()
+
+    factory = get_db_session_factory()
+    async with factory() as db:
+        result = await db.execute(select(Skill).where(Skill.name == skill_name, Skill.scope == "personal"))
+        row = result.scalar_one_or_none()
+
+    return {
+        "success": True,
+        "name": skill_name,
+        "description": parsed.get("description", ""),
+        "id": row.id if row else None,
+    }
 
 
 @router.get("")

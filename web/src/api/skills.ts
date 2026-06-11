@@ -38,6 +38,14 @@ export function generateSkillContentPrompt(skillId: string) {
     return request.get(`/admin/skills/${skillId}/generate-content-prompt`);
 }
 
+export function uploadSkill(file: File) {
+    const form = new FormData();
+    form.append("file", file);
+    return request.post("/admin/skills/upload", form, {
+        headers: { "Content-Type": "multipart/form-data" },
+    });
+}
+
 // ---- Member Skills ----
 
 export function getMemberSkills(memberId: string) {
