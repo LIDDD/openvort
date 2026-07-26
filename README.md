@@ -147,7 +147,7 @@ LLM 配置推荐通过 Web 面板的 **AI 配置** 页面管理（保存在数�
 | `OPENVORT_LLM_API_KEY` | LLM API Key | — |
 | `OPENVORT_LLM_PROVIDER` | 提供商（anthropic / openai_compatible） | `anthropic` |
 | `OPENVORT_LLM_API_BASE` | API 地址 | `https://api.anthropic.com` |
-| `OPENVORT_LLM_MODEL` | 模型名称 | `claude-sonnet-4-20250514` |
+| `OPENVORT_LLM_MODEL` | 模型名称 | `claude-sonnet-5` |
 
 完整配置参考 [`.env.example`](.env.example)。
 

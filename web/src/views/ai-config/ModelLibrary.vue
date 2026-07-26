@@ -61,9 +61,9 @@ interface ModelPreset {
 
 const modelPresets: ModelPreset[] = [
     {
-        name: "Claude Sonnet 4",
+        name: "Claude Sonnet 5",
         provider: "anthropic",
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-5",
         api_base: "",
         max_tokens: 8192,
         description: "Anthropic 推荐模型，智能与速度的最佳平衡，适合大多数场景",
@@ -645,7 +645,7 @@ onMounted(loadData);
                             v-model="form.model"
                             :options="availableModels"
                             :filter-option="true"
-                            placeholder="如 claude-sonnet-4-20250514"
+                            placeholder="如 claude-sonnet-5"
                             class="flex-1 min-w-0"
                             :not-found-content="fetchingModels ? '加载中...' : '请点击右侧按钮获取模型列表'"
                         />
