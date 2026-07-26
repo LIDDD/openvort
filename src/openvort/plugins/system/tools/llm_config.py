@@ -46,7 +46,7 @@ class SystemLLMConfigTool(BaseTool):
                 },
                 "model": {
                     "type": "string",
-                    "description": "模型名称，如 claude-sonnet-4-20250514, gpt-4o (add 时必填, update 时可选)",
+                    "description": "模型名称，如 claude-sonnet-5, gpt-4o (add 时必填, update 时可选)",
                 },
                 "api_key": {
                     "type": "string",
@@ -150,7 +150,7 @@ class SystemLLMConfigTool(BaseTool):
         model = (params.get("model") or "").strip()
         api_key = (params.get("api_key") or "").strip()
         if not model:
-            return "错误：添加模型时 model 必填（如 gpt-4o、claude-sonnet-4-20250514）"
+            return "错误：添加模型时 model 必填（如 gpt-4o、claude-sonnet-5）"
         if not api_key:
             return "错误：添加模型时 api_key 必填"
         name = (params.get("name") or "").strip()

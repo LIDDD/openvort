@@ -33,7 +33,7 @@ class LLMModelConfig(BaseSettings):
     provider: str = "anthropic"
     api_key: str = ""
     api_base: str = ""
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "claude-sonnet-5"
     max_tokens: int = 4096
     timeout: int = 120
     api_format: str = "auto"
@@ -61,7 +61,7 @@ class LLMSettings(BaseSettings):
     provider: str = "anthropic"
     api_key: str = ""
     api_base: str = "https://api.anthropic.com"
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "claude-sonnet-5"
     max_tokens: int = 4096
     timeout: int = 120
     api_format: str = "auto"

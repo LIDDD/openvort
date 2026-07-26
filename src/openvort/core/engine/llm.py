@@ -115,6 +115,14 @@ class LLMProvider(ABC):
 
 # ============ Anthropic Provider ============
 
+# Claude 4.6+ / 5 系拒绝 legacy extended-thinking 格式
+# （{"type": "enabled", "budget_tokens": N}）会返回 400，须改用 adaptive 思考；
+# 其余老模型（Sonnet 4/4.5、Opus 4.0/4.1/4.5、Haiku 4.5）仍用 budget_tokens。
+_ADAPTIVE_THINKING_MARKERS = (
+    "sonnet-5", "opus-5", "fable-5", "mythos-5",
+    "opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6",
+)
+
 
 class AnthropicProvider(LLMProvider):
     """Anthropic Claude Provider"""
@@ -144,7 +152,7 @@ class AnthropicProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
         if thinking:
-            kwargs["thinking"] = thinking
+            kwargs["thinking"] = self._normalize_thinking(thinking, model)
         if self._enable_caching:
             self._apply_caching(kwargs)
         resp = await self._client.messages.create(**kwargs)
@@ -160,7 +168,7 @@ class AnthropicProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
         if thinking:
-            kwargs["thinking"] = thinking
+            kwargs["thinking"] = self._normalize_thinking(thinking, model)
         if self._enable_caching:
             self._apply_caching(kwargs)
         return AnthropicStreamWrapper(self._client, kwargs)
@@ -182,6 +190,19 @@ class AnthropicProvider(LLMProvider):
             tools = [dict(t) for t in tools]
             tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
             kwargs["tools"] = tools
+
+    @staticmethod
+    def _normalize_thinking(thinking: dict | None, model: str) -> dict | None:
+        """把 legacy extended-thinking 参数适配到目标模型支持的格式。
+
+        `{"type": "enabled", "budget_tokens": N}` 在 Claude 4.6+/5 系会被 400 拒绝，
+        这些模型改用 adaptive 思考（深度由模型自适应决定）；其余老模型保持原格式不变。
+        """
+        if not thinking or thinking.get("type") != "enabled":
+            return thinking
+        if any(m in model.lower() for m in _ADAPTIVE_THINKING_MARKERS):
+            return {"type": "adaptive"}
+        return thinking
 
     @staticmethod
     def _convert_response(resp) -> LLMResponse:

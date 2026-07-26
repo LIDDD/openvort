@@ -7,7 +7,7 @@
 当用户需要添加或管理 AI 模型时，使用 `system_llm_config` 工具：
 
 1. **查看现状**：先用 `system_llm_config` action=list 列出当前所有模型及主模型/备选
-2. **添加模型**：用户提供 provider（如 openai、anthropic、deepseek）、model（如 gpt-4o、claude-sonnet-4-20250514）、api_key；可选 api_base、name、max_tokens、timeout。调用 action=add 并传入上述字段
+2. **添加模型**：用户提供 provider（如 openai、anthropic、deepseek）、model（如 gpt-4o、claude-sonnet-5）、api_key；可选 api_base、name、max_tokens、timeout。调用 action=add 并传入上述字段
 3. **设为主模型**：添加后若用户希望用新模型作为主模型，用 action=set_primary，primary_model_id 填新模型的 id，fallback_model_ids 填其余备选 id 列表（可为空）
 4. **更新/删除**：action=update 需 model_id + 要修改的字段；action=remove 需 model_id（若为主/备选需先 set_primary 更换）
 5. **查看详情**：action=get 且 model_id=xxx 可查看单个模型配置（api_key 会脱敏）
