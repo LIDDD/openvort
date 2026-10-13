@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from openvort.utils.logging import get_logger
+from openvort.utils.time import naive_local_to_epoch
 
 log = get_logger("core.session")
 
@@ -408,8 +409,8 @@ class SessionStore:
                 {
                     "session_id": row.session_id,
                     "title": row.title,
-                    "created_at": row.created_at.timestamp() if row.created_at else 0,
-                    "updated_at": row.updated_at.timestamp() if row.updated_at else 0,
+                    "created_at": naive_local_to_epoch(row.created_at),
+                    "updated_at": naive_local_to_epoch(row.updated_at),
                     "target_type": row.target_type or "ai",
                     "target_id": row.target_id or "",
                     "pinned": row.pinned if hasattr(row, "pinned") else False,
@@ -676,11 +677,11 @@ class SessionStore:
                 return None
 
             messages = json.loads(row.messages) if row.messages else []
-            updated_at = row.updated_at.timestamp() if row.updated_at else time.time()
-            created_at = row.created_at.timestamp() if row.created_at else updated_at
+            updated_at = naive_local_to_epoch(row.updated_at) or time.time()
+            created_at = naive_local_to_epoch(row.created_at) or updated_at
 
             context_reset_at_dt = getattr(row, "context_reset_at", None)
-            context_reset_ts = context_reset_at_dt.timestamp() if context_reset_at_dt else 0
+            context_reset_ts = naive_local_to_epoch(context_reset_at_dt)
 
             session = Session(
                 channel=channel,

@@ -120,9 +120,17 @@ const handleOk = async () => {
             <ul class="list-disc list-inside space-y-0.5">
                 <li>使用 Let's Encrypt 免费签发 DV 级 SSL 证书</li>
                 <li>通过 DNS-01 验证域名所有权，需要 DNS 服务商 API 权限</li>
+                <li>签发耗时通常 30 秒 ~ 3 分钟（DNS 记录传播 + Let's Encrypt 验证），请耐心等待，不要关闭弹窗</li>
                 <li>证书有效期 90 天，到期前可续期</li>
                 <li>签发完成后可在「证书总览」中查看和下载证书</li>
             </ul>
+        </div>
+
+        <div v-if="loading" class="mt-3 p-3 bg-blue-50 rounded-lg text-sm text-blue-600 flex items-start gap-2">
+            <span class="text-base leading-5">⏳</span>
+            <div>
+                正在签发中，预计需要 1 ~ 3 分钟。后台正在添加 DNS TXT 记录、等待传播并向 Let's Encrypt 申请证书，请勿关闭弹窗或刷新页面。
+            </div>
         </div>
     </Dialog>
 </template>

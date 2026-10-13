@@ -1,6 +1,6 @@
 """联系人路由"""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from openvort.web.deps import get_db_session_factory
@@ -74,7 +74,7 @@ async def sync_contacts(channel: str | None = None):
 
         return {"success": True, "results": results}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/suggestions")
@@ -139,4 +139,4 @@ async def dedup_contacts():
         stats = await service.dedup_members()
         return {"success": True, **stats}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))

@@ -65,9 +65,14 @@ class QueryTool(BaseTool):
             if query_type == "projects":
                 result = await session.execute(select(FlowProject).order_by(FlowProject.created_at.desc()).limit(50))
                 rows = result.scalars().all()
-                data = [{"id": r.id, "name": r.name, "product": r.product, "iteration": r.iteration,
-                          "start_date": r.start_date.isoformat() if r.start_date else None,
-                          "end_date": r.end_date.isoformat() if r.end_date else None} for r in rows]
+                data = [{
+                    "id": r.id,
+                    "name": r.name,
+                    "code": r.code,
+                    "description": r.description,
+                    "start_date": r.start_date.isoformat() if r.start_date else None,
+                    "end_date": r.end_date.isoformat() if r.end_date else None,
+                } for r in rows]
                 return json.dumps({"ok": True, "count": len(data), "projects": data}, ensure_ascii=False)
 
             elif query_type == "stories":
@@ -146,14 +151,21 @@ class QueryTool(BaseTool):
                 stmt = select(FlowVersion).order_by(FlowVersion.created_at.desc()).limit(50)
                 if params.get("project_id"):
                     stmt = stmt.where(FlowVersion.project_id == params["project_id"])
+                if params.get("state"):
+                    stmt = stmt.where(FlowVersion.status == params["state"])
                 if params.get("keyword"):
                     like = f"%{params['keyword']}%"
                     stmt = stmt.where(FlowVersion.name.ilike(like))
                 result = await session.execute(stmt)
                 rows = result.scalars().all()
-                data = [{"id": r.id, "name": r.name, "project_id": r.project_id,
-                          "stage": r.stage,
-                          "release_date": r.release_date.isoformat() if r.release_date else None} for r in rows]
+                data = [{
+                    "id": r.id,
+                    "name": r.name,
+                    "project_id": r.project_id,
+                    "status": r.status,
+                    "planned_release_at": r.planned_release_at.isoformat() if r.planned_release_at else None,
+                    "actual_release_at": r.actual_release_at.isoformat() if r.actual_release_at else None,
+                } for r in rows]
                 return json.dumps({"ok": True, "count": len(data), "versions": data}, ensure_ascii=False)
 
             elif query_type == "project_members":

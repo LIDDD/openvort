@@ -1019,6 +1019,97 @@ async def init_db(database_url: str) -> None:
                     connection.execute(text(ddl))
         await conn.run_sync(_sync_missing_columns)
 
+    # VortFlow: backfill sort_order for stories/tasks/bugs (一次性，仅填 NULL 行)。
+    # 步长 1024 让后续 fractional ranking 插入有充足的空间。
+    async with _engine.begin() as conn:
+        # stories: 按 parent_id 分组
+        await conn.execute(text("""
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(parent_id, '')
+                           ORDER BY created_at DESC, id DESC
+                       ) AS rn
+                FROM flow_stories
+                WHERE sort_order IS NULL
+            )
+            UPDATE flow_stories AS s
+            SET sort_order = ranked.rn * 1024
+            FROM ranked
+            WHERE s.id = ranked.id
+        """))
+        # tasks: 按 (story_id, parent_id) 分组
+        await conn.execute(text("""
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(story_id, ''), COALESCE(parent_id, '')
+                           ORDER BY created_at DESC, id DESC
+                       ) AS rn
+                FROM flow_tasks
+                WHERE sort_order IS NULL
+            )
+            UPDATE flow_tasks AS s
+            SET sort_order = ranked.rn * 1024
+            FROM ranked
+            WHERE s.id = ranked.id
+        """))
+        # bugs: 按 (story_id, task_id) 分组
+        await conn.execute(text("""
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(story_id, ''), COALESCE(task_id, '')
+                           ORDER BY created_at DESC, id DESC
+                       ) AS rn
+                FROM flow_bugs
+                WHERE sort_order IS NULL
+            )
+            UPDATE flow_bugs AS s
+            SET sort_order = ranked.rn * 1024
+            FROM ranked
+            WHERE s.id = ranked.id
+        """))
+
+    # VortFlow: backfill priority_score from priority for stories.
+    # 必须放在自动同步列之后，确保 priority_score 列已存在。
+    # Mapping: priority 1/2/3/4 -> score 80/60/40/20 (默认=段起始值，同段内分数越大越优先)
+    # Only updates rows where priority_score IS NULL, so manual adjustments are preserved.
+    async with _engine.begin() as conn:
+        await conn.execute(text("""
+            UPDATE flow_stories
+            SET priority_score = CASE
+                WHEN priority = 1 THEN 80
+                WHEN priority = 2 THEN 60
+                WHEN priority = 3 THEN 40
+                WHEN priority = 4 THEN 20
+                ELSE 0
+            END
+            WHERE priority_score IS NULL
+        """))
+        await conn.execute(text("""
+            UPDATE flow_tasks
+            SET priority_score = CASE
+                WHEN estimate_hours IS NULL THEN 40
+                WHEN estimate_hours >= 16 THEN 80
+                WHEN estimate_hours >= 8 THEN 60
+                WHEN estimate_hours >= 4 THEN 40
+                ELSE 20
+            END
+            WHERE priority_score IS NULL
+        """))
+        await conn.execute(text("""
+            UPDATE flow_bugs
+            SET priority_score = CASE
+                WHEN severity = 1 THEN 80
+                WHEN severity = 2 THEN 60
+                WHEN severity = 3 THEN 40
+                WHEN severity = 4 THEN 20
+                ELSE 0
+            END
+            WHERE priority_score IS NULL
+        """))
+
     log.info(f"数据库已初始化: {database_url.split('://')[0]}")
 
 

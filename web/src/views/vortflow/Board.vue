@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, onMounted, watch, type Ref } from "vue";
 import { z } from "zod";
 import { useRouter } from "vue-router";
 import dayjs from "dayjs";
@@ -16,7 +16,7 @@ import {
     getVortflowStats, getVortflowProjects, createVortflowProject,
     updateVortflowProject, deleteVortflowProject,
     getVortgitRepos,
-    getVortflowIterations,
+    getAllVortflowIterations,
     addVortflowProjectMember,
 } from "@/api";
 
@@ -26,9 +26,6 @@ interface ProjectItem {
     code: string;
     color: string;
     description: string;
-    product: string;
-    iteration: string;
-    version: string;
     owner_id: string | null;
     start_date: string | null;
     end_date: string | null;
@@ -57,7 +54,21 @@ const vortFlowStore = useVortFlowStore();
 const {
     memberOptions, ownerGroups, getMemberNameById, getMemberIdByName,
     getAvatarBg, getAvatarLabel, getMemberAvatarUrl, loadMemberOptions,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
+
+const boardEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const boardEnrichedCollapsed = ref<string[]>([]);
+const boardActiveGroups = computed(() =>
+    boardEnrichedGroups.value.length > 0 ? boardEnrichedGroups.value : ownerGroups.value,
+);
+const refreshBoardEnrichedGroups = (projectId?: string) => {
+    const pid = projectId || "";
+    getEnrichedOwnerGroups(pid).then((groups) => {
+        boardEnrichedGroups.value = groups;
+        boardEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+    });
+};
 const loading = ref(true);
 const stats = ref<DashboardStats>({ stories: { total: 0, done: 0 }, tasks: { total: 0, done: 0 }, bugs: { total: 0, closed: 0 } });
 const projects = ref<ProjectItem[]>([]);
@@ -124,7 +135,7 @@ const loadData = async () => {
     try {
         const [statsRes, projectsRes, iterRes] = await Promise.all([
             getVortflowStats(), getVortflowProjects(),
-            getVortflowIterations({ page: 1, page_size: 100 }),
+            getAllVortflowIterations({ page_size: 200 }),
         ]);
         if (statsRes) {
             const r = statsRes as any;
@@ -186,7 +197,6 @@ const projectValidationSchema = z.object({
     name: z.string().min(1, '项目名称不能为空'),
     code: z.string().optional().or(z.literal('')),
     color: z.string().optional().or(z.literal('')),
-    product: z.string().optional().or(z.literal('')),
     start_date: z.string().optional().or(z.literal('')),
     end_date: z.string().optional().or(z.literal('')),
     description: z.string().optional().or(z.literal('')),
@@ -206,6 +216,7 @@ const handleAddProject = async () => {
     drawerVisible.value = true;
     takeSnapshot();
     await Promise.all([loadMemberOptions(), loadAllRepos()]);
+    refreshBoardEnrichedGroups();
 };
 
 const handleEditProject = async (p: ProjectItem) => {
@@ -225,6 +236,7 @@ const handleEditProject = async (p: ProjectItem) => {
     drawerVisible.value = true;
     takeSnapshot();
     await Promise.all([loadMemberOptions(), loadAllRepos()]);
+    refreshBoardEnrichedGroups(p.id);
 };
 
 const handleViewProject = (p: ProjectItem) => {
@@ -244,7 +256,7 @@ const handleSaveProject = async () => {
                 .filter(Boolean) as string[];
             await createVortflowProject({
                 name: r.name!, code: r.code, color: r.color,
-                description: r.description, product: r.product,
+                description: r.description,
                 start_date: r.start_date || undefined, end_date: r.end_date || undefined,
                 owner_id: ownerId, member_ids: memberIds,
                 repo_ids: selectedRepoIds.value.length ? selectedRepoIds.value : undefined,
@@ -252,7 +264,7 @@ const handleSaveProject = async () => {
         } else {
             await updateVortflowProject(r.id!, {
                 name: r.name, code: r.code, color: r.color,
-                description: r.description, product: r.product,
+                description: r.description,
                 start_date: r.start_date || undefined, end_date: r.end_date || undefined,
                 owner_id: ownerId,
             });
@@ -592,9 +604,6 @@ watch(() => vortFlowStore.selectedProjectId, () => {
                         </button>
                     </div>
                 </vort-form-item>
-                <vort-form-item label="产品" name="product">
-                    <vort-input v-model="currentProject.product" placeholder="产品名称（可选）" />
-                </vort-form-item>
                 <vort-form-item label="关联仓库">
                     <vort-select
                         v-model="selectedRepoIds"
@@ -616,14 +625,15 @@ watch(() => vortFlowStore.selectedProjectId, () => {
                     <WorkItemMemberPicker
                         mode="owner"
                         :owner="selectedOwnerName"
-                        :groups="ownerGroups"
+                        :groups="boardActiveGroups"
+                        :default-collapsed="boardEnrichedCollapsed"
                         :get-avatar-bg="getAvatarBg"
                         :get-avatar-label="getAvatarLabel"
                         :get-avatar-url="getMemberAvatarUrl"
                         placeholder="请选择负责人"
                         :bordered="true"
                         :dropdown-width="380"
-                        @update:owner="selectedOwnerName = $event"
+                        @update:owner="(v) => { selectedOwnerName = v; if (v) recordRecentMember(v); }"
                     >
                         <template #trigger="{ open: triggerOpen }">
                             <div class="border rounded-lg px-3 py-1.5 cursor-pointer hover:border-blue-400 transition-colors flex items-center gap-2 min-h-[34px]"
@@ -645,14 +655,15 @@ watch(() => vortFlowStore.selectedProjectId, () => {
                     <WorkItemMemberPicker
                         mode="collaborators"
                         :collaborators="selectedMemberNames"
-                        :groups="ownerGroups"
+                        :groups="boardActiveGroups"
+                        :default-collapsed="boardEnrichedCollapsed"
                         :get-avatar-bg="getAvatarBg"
                         :get-avatar-label="getAvatarLabel"
                         :get-avatar-url="getMemberAvatarUrl"
                         placeholder="请选择企业成员，可多选"
                         :bordered="true"
                         :dropdown-width="380"
-                        @update:collaborators="selectedMemberNames = $event"
+                        @update:collaborators="(v) => { selectedMemberNames = v; v.forEach(recordRecentMember); }"
                     >
                         <template #trigger="{ open: triggerOpen }">
                             <div class="border rounded-lg px-3 py-1.5 cursor-pointer hover:border-blue-400 transition-colors flex items-center gap-2 min-h-[34px] flex-wrap"

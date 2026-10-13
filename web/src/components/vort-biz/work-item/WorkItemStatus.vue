@@ -44,6 +44,7 @@ const statusClassMap: Record<string, string> = {
     暂搁置: "bg-slate-100 text-slate-500",
     设计中: "bg-indigo-100 text-indigo-600",
     设计完成: "bg-sky-100 text-sky-700",
+    待开发: "bg-purple-100 text-purple-700",
     开发中: "bg-blue-100 text-blue-600",
     开发完成: "bg-cyan-100 text-cyan-700",
     测试完成: "bg-violet-100 text-violet-700",
@@ -104,17 +105,23 @@ const handleTriggerClick = (event: MouseEvent) => {
                 v-for="opt in filteredOptions"
                 :key="opt.value"
                 class="status-filter-row"
-                :class="{ 'is-active': modelValue === opt.value, 'is-disabled': disabled }"
-                @click.stop="!disabled && handleSelect(opt.value)"
+                :class="{
+                    'is-active': modelValue === opt.value,
+                    'is-disabled': disabled || opt.syncable === false,
+                }"
+                :title="opt.syncable === false ? '该状态尚未配置后端流转规则，无法同步' : undefined"
+                @click.stop="(!disabled && opt.syncable !== false) && handleSelect(opt.value)"
             >
                 <div class="status-filter-row-left">
                     <vort-checkbox
                         :checked="modelValue === opt.value"
+                        :disabled="opt.syncable === false"
                         @click.stop
-                        @update:checked="!disabled && handleSelect(opt.value)"
+                        @update:checked="(!disabled && opt.syncable !== false) && handleSelect(opt.value)"
                     />
                     <StatusIcon v-if="opt.icon" :name="opt.icon" :size="14" :color="opt.iconColor" />
                     <span class="text-sm text-gray-700 leading-5">{{ opt.label }}</span>
+                    <span v-if="opt.syncable === false" class="status-filter-row-hint">仅展示</span>
                 </div>
             </div>
         </div>
@@ -171,5 +178,15 @@ const handleTriggerClick = (event: MouseEvent) => {
     display: flex;
     align-items: center;
     gap: 12px;
+}
+
+.status-filter-row-hint {
+    margin-left: auto;
+    padding: 0 6px;
+    font-size: 11px;
+    color: #94a3b8;
+    border: 1px dashed #cbd5e1;
+    border-radius: 4px;
+    line-height: 16px;
 }
 </style>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, watch, onMounted, onBeforeUnmount, type Ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
     Plus, Search, ChevronRight, ChevronDown, FolderOpen, Folder,
@@ -49,7 +49,22 @@ const {
     getAvatarBg, getAvatarLabel, getMemberAvatarUrl,
     loadMemberOptions, getMemberIdByName, getMemberNameById,
     ownerGroups,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
+
+const tpDetailEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const tpDetailEnrichedCollapsed = ref<string[]>([]);
+const tpDetailActiveGroups = computed(() =>
+    tpDetailEnrichedGroups.value.length > 0 ? tpDetailEnrichedGroups.value : ownerGroups.value,
+);
+const refreshTpDetailEnrichedGroups = () => {
+    const pid = plan.value?.project_id || "";
+    if (!pid) return;
+    getEnrichedOwnerGroups(pid).then((groups) => {
+        tpDetailEnrichedGroups.value = groups;
+        tpDetailEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+    });
+};
 
 const planId = computed(() => route.params.id as string);
 const plan = ref<any>({});
@@ -835,11 +850,28 @@ const iterLinkOpen = ref(false);
 const verLinkOpen = ref(false);
 const iterLinkSearch = ref("");
 const verLinkSearch = ref("");
+const iterationLoading = ref(false);
+const iterationLoaded = ref(false);
+const iterationLoadError = ref(false);
+const iterationHasMore = ref(false);
+const iterationPage = ref(0);
+const iterationTotal = ref<number | undefined>(undefined);
+let iterationRequestSeq = 0;
+let iterationSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let iterationPendingKey: string | null = null;
 
 const filteredIterations = computed(() => {
     const kw = iterLinkSearch.value.trim().toLowerCase();
-    if (!kw) return iterationOptions.value;
-    return iterationOptions.value.filter(i => i.name.toLowerCase().includes(kw));
+    const options = [...iterationOptions.value];
+    const selectedId = String(plan.value?.iteration_id || "").trim();
+    const selectedName = String(plan.value?.iteration_name || "").trim();
+    if (selectedId && !options.some((item) => item.id === selectedId)) {
+        options.unshift({ id: selectedId, name: selectedName || selectedId });
+    }
+    if (!kw) return options;
+    return options.filter(i =>
+        i.name.toLowerCase().includes(kw) || i.id.toLowerCase().includes(kw)
+    );
 });
 
 const filteredVersions = computed(() => {
@@ -848,14 +880,119 @@ const filteredVersions = computed(() => {
     return versionOptions.value.filter(v => v.name.toLowerCase().includes(kw));
 });
 
+const resetIterationOptions = () => {
+    iterationRequestSeq += 1;
+    iterationPendingKey = null;
+    iterationOptions.value = [];
+    iterationLoading.value = false;
+    iterationLoaded.value = false;
+    iterationLoadError.value = false;
+    iterationHasMore.value = false;
+    iterationPage.value = 0;
+    iterationTotal.value = undefined;
+};
+
+const parseIterationTotal = (value: unknown): number | undefined => {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    if (typeof value === "string" && value.trim()) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+    }
+    return undefined;
+};
+
+const loadIterationPage = async (reset = false) => {
+    const projectId = plan.value?.project_id;
+    if (!projectId || (!reset && iterationLoading.value) || (!reset && !iterationHasMore.value)) return;
+    const page = reset ? 1 : iterationPage.value + 1;
+    const search = iterLinkSearch.value.trim();
+    const requestKey = `${projectId}|${search}`;
+    if (iterationLoading.value && iterationPendingKey === requestKey) return;
+    const seq = ++iterationRequestSeq;
+    if (reset) {
+        iterationOptions.value = [];
+        iterationPage.value = 0;
+        iterationTotal.value = undefined;
+        iterationHasMore.value = false;
+        iterationLoaded.value = false;
+    }
+    iterationLoading.value = true;
+    iterationPendingKey = requestKey;
+    iterationLoadError.value = false;
+    try {
+        const res: any = await getVortflowIterations({
+            project_id: projectId,
+            keyword: search || undefined,
+            page,
+            page_size: 100,
+        });
+        if (seq !== iterationRequestSeq) return;
+        const items = ((res?.items || []) as any[]).map((i: any) => ({
+            id: String(i.id || ""),
+            name: String(i.name || i.id || ""),
+            status: i.status,
+        })).filter((i) => i.id && i.name);
+        const merged = reset ? items : [...iterationOptions.value, ...items];
+        const seen = new Set<string>();
+        iterationOptions.value = merged.filter((item) => {
+            if (seen.has(item.id)) return false;
+            seen.add(item.id);
+            return true;
+        });
+        iterationPage.value = page;
+        iterationTotal.value = parseIterationTotal(res?.total);
+        iterationHasMore.value = iterationTotal.value !== undefined
+            ? iterationOptions.value.length < iterationTotal.value
+            : items.length >= 100;
+        iterationLoaded.value = true;
+    } catch {
+        if (seq === iterationRequestSeq) {
+            iterationLoadError.value = true;
+            iterationLoaded.value = true;
+        }
+    } finally {
+        if (seq === iterationRequestSeq) {
+            iterationLoading.value = false;
+            iterationPendingKey = null;
+        }
+    }
+};
+
+const handleIterationDropdownOpen = (open: boolean) => {
+    iterLinkOpen.value = open;
+    if (open) {
+        // 首次打开或上次请求失败时，由本次用户打开动作发起/重试请求。
+        if (!iterationLoaded.value || iterationLoadError.value) {
+            void loadIterationPage(iterationPage.value === 0);
+        }
+    } else {
+        if (iterationSearchTimer) clearTimeout(iterationSearchTimer);
+        iterLinkSearch.value = "";
+        resetIterationOptions();
+    }
+};
+
+const handleIterationSearch = (value: string) => {
+    iterLinkSearch.value = String(value ?? "");
+    if (!iterLinkOpen.value) return;
+    if (iterationSearchTimer) clearTimeout(iterationSearchTimer);
+    iterationSearchTimer = setTimeout(() => {
+        void loadIterationPage(true);
+    }, 220);
+};
+
+const handleIterationListScroll = (event: Event) => {
+    const target = event.currentTarget as HTMLElement | null;
+    if (target && target.scrollHeight - target.scrollTop - target.clientHeight <= 32) {
+        void loadIterationPage(false);
+    }
+};
+
 const loadLinkOptions = async () => {
     const projectId = plan.value?.project_id;
     if (!projectId) return;
-    const [iterRes, verRes] = await Promise.all([
-        getVortflowIterations({ project_id: projectId, page_size: 100 }),
-        getVortflowVersions({ project_id: projectId, page_size: 100 }),
-    ]);
-    iterationOptions.value = ((iterRes as any).items || []).map((i: any) => ({ id: i.id, name: i.name, status: i.status }));
+    resetIterationOptions();
+    const verRes = await getVortflowVersions({ project_id: projectId, page_size: 100 });
     versionOptions.value = ((verRes as any).items || []).map((v: any) => ({ id: v.id, name: v.name, stage: v.stage }));
 };
 
@@ -881,12 +1018,26 @@ const verStageLabels: Record<string, string> = { dev: "开发环境", staging: "
 onMounted(async () => {
     await loadMemberOptions();
     await loadPlan();
+    refreshTpDetailEnrichedGroups();
     await Promise.all([loadModules(), loadCases(), loadModuleCaseCounts(), loadReviews(), loadReports(), loadLinkOptions(), loadPlanSwitcherList()]);
 });
 
 watch(planId, async () => {
+    // 计划切换可能对应另一项目；清掉旧项目的迭代分页缓存，等用户打开下拉后再请求。
+    if (iterationSearchTimer) clearTimeout(iterationSearchTimer);
+    iterLinkSearch.value = "";
+    resetIterationOptions();
     await loadPlan();
-    await Promise.all([loadModules(), loadCases(), loadModuleCaseCounts(), loadReviews()]);
+    refreshTpDetailEnrichedGroups();
+    await Promise.all([
+        loadModules(), loadCases(), loadModuleCaseCounts(), loadReviews(),
+        loadLinkOptions(), loadPlanSwitcherList(),
+    ]);
+});
+
+onBeforeUnmount(() => {
+    if (iterationSearchTimer) clearTimeout(iterationSearchTimer);
+    iterationRequestSeq += 1;
 });
 </script>
 
@@ -1001,19 +1152,24 @@ watch(planId, async () => {
                     </div>
                     <div class="flex items-center gap-1.5">
                         <span class="text-gray-400">关联迭代:</span>
-                        <Dropdown v-model:open="iterLinkOpen" trigger="click">
+                        <Dropdown
+                            v-model:open="iterLinkOpen"
+                            trigger="click"
+                            @open-change="handleIterationDropdownOpen"
+                        >
                             <span class="text-blue-600 cursor-pointer hover:underline" v-if="plan.iteration_name">{{ plan.iteration_name }}</span>
                             <span v-else class="text-gray-500 cursor-pointer hover:text-blue-600">点击关联</span>
                             <template #overlay>
                                 <div class="p-2 w-[240px]">
                                     <vort-input-search
                                         v-model="iterLinkSearch"
+                                        @update:model-value="handleIterationSearch"
                                         placeholder="搜索..."
                                         allow-clear
                                         size="small"
                                         class="mb-2"
                                     />
-                                    <div class="max-h-[240px] overflow-y-auto">
+                                    <div class="max-h-[240px] overflow-y-auto" @scroll.passive="handleIterationListScroll">
                                         <div
                                             class="px-3 py-2 text-sm cursor-pointer rounded hover:bg-gray-50 font-medium text-gray-700"
                                             @click="handleLinkIteration(null)"
@@ -1453,14 +1609,15 @@ watch(planId, async () => {
                                 v-model:open="reviewerPickerOpenMap[row.id]"
                                 mode="owner"
                                 :owner="row.reviewer_name || ''"
-                                :groups="ownerGroups"
+                                :groups="tpDetailActiveGroups"
+                                :default-collapsed="tpDetailEnrichedCollapsed"
                                 :bordered="false"
                                 :dropdown-max-height="320"
                                 placeholder="指定评审人"
                                 :get-avatar-bg="getAvatarBg"
                                 :get-avatar-label="getAvatarLabel"
                                 :get-avatar-url="getMemberAvatarUrl"
-                                @update:owner="(name: string) => handleAssignReviewer(row, name)"
+                                @update:owner="(name: string) => { handleAssignReviewer(row, name); if (name) recordRecentMember(name); }"
                             >
                                 <template #trigger>
                                     <div class="flex items-center gap-1.5 cursor-pointer py-0.5">

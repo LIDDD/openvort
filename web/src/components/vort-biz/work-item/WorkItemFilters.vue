@@ -1,24 +1,32 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import { DownOutlined } from "@openvort/vort-ui";
+import { computed, ref, watch } from "vue";
+import { DownOutlined, Dropdown, DropdownMenuItem } from "@openvort/vort-ui";
 import PopoverSelect from "@/components/vort-biz/popover-select/PopoverSelect.vue";
 import WorkItemMemberPicker from "./WorkItemMemberPicker.vue";
-import StatusIcon from "./StatusIcon.vue";
-import type { WorkItemType, Status, MemberOption } from "../work-item";
+import WorkItemStatusFilter, { type StatusFilterGroup } from "./WorkItemStatusFilter.vue";
+import type { WorkItemType, StatusOption, MemberOption } from "./WorkItemTable.types";
 
 export interface WorkItemFiltersProps {
     keyword?: string;
     owner?: string[];
-    type?: WorkItemType | "";
+    type?: WorkItemType[];
     status?: string[];
     pageTitle?: string;
     createButtonText?: string;
     totalCount?: number;
     memberOptions?: MemberOption[];
     ownerGroups?: Array<{ label: string; members: string[] }>;
-    statusOptions?: Array<{ label: string; value: Status; icon: string; iconClass: string }>;
+    statusOptions?: StatusOption[];
+    /** 工作墙等跨类型场景：传入分组数据，状态弹窗按需求/任务/缺陷分列展示 */
+    statusGroups?: StatusFilterGroup[];
+    /** 在状态弹窗顶部展示「在手工作项」快捷选项（一般工作墙模式启用） */
+    showStatusPendingShortcut?: boolean;
     typeOptions?: WorkItemType[];
     showTypeFilter?: boolean;
+    /** 标题旁以 tab 形式展示类型筛选（工作墙模式），与 showTypeFilter 互斥 */
+    showTypeTabs?: boolean;
+    /** 当传入时，新建按钮变为 dropdown，三选一触发 create 事件并附带 type 参数（用于工作墙） */
+    createTypeOptions?: WorkItemType[];
     getAvatarBg?: (name: string) => string;
     getAvatarLabel?: (name: string) => string;
     getAvatarUrl?: (name: string) => string;
@@ -27,7 +35,7 @@ export interface WorkItemFiltersProps {
 const props = withDefaults(defineProps<WorkItemFiltersProps>(), {
     keyword: "",
     owner: () => [],
-    type: "",
+    type: () => [],
     status: () => [],
     pageTitle: "缺陷",
     createButtonText: "+ 新建缺陷",
@@ -35,8 +43,12 @@ const props = withDefaults(defineProps<WorkItemFiltersProps>(), {
     memberOptions: () => [],
     ownerGroups: () => [],
     statusOptions: () => [],
+    statusGroups: () => [],
+    showStatusPendingShortcut: false,
     typeOptions: () => ["缺陷", "需求", "任务"],
     showTypeFilter: true,
+    showTypeTabs: false,
+    createTypeOptions: () => [],
     getAvatarBg: undefined,
     getAvatarLabel: undefined,
     getAvatarUrl: undefined,
@@ -45,11 +57,11 @@ const props = withDefaults(defineProps<WorkItemFiltersProps>(), {
 const emit = defineEmits<{
     "update:keyword": [value: string];
     "update:owner": [value: string[]];
-    "update:type": [value: string];
+    "update:type": [value: WorkItemType[]];
     "update:status": [value: string[]];
     search: [];
     reset: [];
-    create: [];
+    create: [type?: WorkItemType];
 }>();
 
 const keyword = computed({
@@ -57,31 +69,17 @@ const keyword = computed({
     set: (val) => emit("update:keyword", val)
 });
 
-const type = computed({
-    get: () => props.type,
-    set: (val) => emit("update:type", val)
+const typeDisplayLabel = computed(() => {
+    if (!props.type.length) return "类型";
+    return props.type[0] || "类型";
 });
 
-const statusDisplayLabel = computed(() => {
-    if (!props.status.length) return "状态";
-    const opt = props.statusOptions.find(o => o.value === props.status[0]);
-    return opt?.label || props.status[0];
-});
-
-const statusExtraCount = computed(() => Math.max(0, props.status.length - 1));
+const typeExtraCount = computed(() => Math.max(0, props.type.length - 1));
 
 const ownerDropdownOpen = ref(false);
 const ownerKeyword = ref("");
 const typeDropdownOpen = ref(false);
 const typeKeyword = ref("");
-const statusDropdownOpen = ref(false);
-const statusKeyword = ref("");
-
-const filteredStatusOptions = computed(() => {
-    const kw = statusKeyword.value.trim().toLowerCase();
-    if (!kw) return props.statusOptions;
-    return props.statusOptions.filter(opt => opt.label.toLowerCase().includes(kw));
-});
 
 const filteredTypeOptions = computed(() => {
     const kw = typeKeyword.value.trim();
@@ -98,35 +96,138 @@ const ownerDisplayLabel = computed(() => {
 
 const ownerExtraCount = computed(() => Math.max(0, props.owner.length - 1));
 
-const selectType = (value: WorkItemType) => {
-    type.value = value;
-    typeDropdownOpen.value = false;
-    typeKeyword.value = "";
+// "全不选" 内部状态：区分 "默认全选(props=[])" 与 "用户主动取消全部(props=[])"
+const typeClearedByUser = ref(false);
+
+watch(() => props.type, (val) => {
+    if (val.length > 0) typeClearedByUser.value = false;
+});
+
+const statusFilterRef = ref<{ reset: () => void } | null>(null);
+
+// === Type 视觉状态 ===
+const isAllTypeChecked = computed(() => {
+    if (typeClearedByUser.value) return false;
+    if (!props.typeOptions.length) return false;
+    return props.type.length === 0
+        || props.typeOptions.every(t => props.type.includes(t));
+});
+
+const isTypeIndeterminate = computed(() => {
+    if (typeClearedByUser.value) return false;
+    if (props.type.length === 0) return false;
+    return props.type.length < props.typeOptions.length;
+});
+
+const isTypeItemChecked = (value: WorkItemType) => {
+    if (typeClearedByUser.value) return false;
+    return props.type.length === 0 || props.type.includes(value);
 };
 
-const toggleStatus = (value: string) => {
-    const current = [...props.status];
+const toggleType = (value: WorkItemType) => {
+    if (typeClearedByUser.value) {
+        typeClearedByUser.value = false;
+        emit("update:type", [value]);
+        return;
+    }
+
+    if (!props.type.length) {
+        // 当前视觉全选：取消该项 → 仅勾选其他所有项
+        const next = props.typeOptions.filter(t => t !== value);
+        emit("update:type", next);
+        return;
+    }
+
+    const current = [...props.type];
     const idx = current.indexOf(value);
     if (idx >= 0) {
         current.splice(idx, 1);
+        if (current.length === 0) {
+            typeClearedByUser.value = true;
+            emit("update:type", []);
+            return;
+        }
     } else {
         current.push(value);
+        if (props.typeOptions.every(t => current.includes(t))) {
+            // 加上后已包含所有项 → 归一化为空数组（全选）
+            emit("update:type", []);
+            return;
+        }
     }
-    emit("update:status", current);
+    emit("update:type", current);
 };
 
-const selectAllStatus = () => {
-    emit("update:status", []);
+const toggleAllType = () => {
+    if (isAllTypeChecked.value) {
+        // 全选 → 全不选
+        typeClearedByUser.value = true;
+        emit("update:type", []);
+    } else {
+        // 半选或全不选 → 全选
+        typeClearedByUser.value = false;
+        emit("update:type", []);
+    }
+};
+
+// === Type 标题 Tab（工作墙）===
+// 与下拉筛选互斥：tab 模式下 type 取值语义为单选 —— [] 代表"所有"，[T] 代表单类型。
+const typeTabOptions = computed<{ value: WorkItemType | null; label: string }[]>(() => [
+    { value: null, label: "所有" },
+    { value: "需求", label: "需求" },
+    { value: "任务", label: "任务" },
+    { value: "缺陷", label: "缺陷" },
+]);
+
+const activeTypeTab = computed<WorkItemType | null>(() => {
+    if (typeClearedByUser.value) return null;
+    if (props.type.length === 1) {
+        const v = props.type[0]!;
+        if (v === "需求" || v === "任务" || v === "缺陷") return v;
+    }
+    return null;
+});
+
+const selectTypeTab = (value: WorkItemType | null) => {
+    typeClearedByUser.value = false;
+    emit("update:type", value ? [value] : []);
 };
 
 const onSearch = () => emit("search");
-const onReset = () => emit("reset");
+const onReset = () => {
+    statusFilterRef.value?.reset();
+    typeClearedByUser.value = false;
+    emit("reset");
+};
+
+const onStatusUpdate = (value: string[]) => emit("update:status", value);
 const onCreate = () => emit("create");
+const onCreateWithType = (t: WorkItemType) => {
+    createDropdownOpen.value = false;
+    emit("create", t);
+};
+
+const createDropdownOpen = ref(false);
+const showCreateDropdown = computed(() => (props.createTypeOptions?.length ?? 0) > 0);
 </script>
 
 <template>
     <div class="bg-white rounded-xl p-4">
-        <h3 v-if="!$slots['before-count']" class="text-base font-medium text-gray-800 mb-3">{{ props.pageTitle }}</h3>
+        <div v-if="!$slots['before-count']" class="title-row flex items-center gap-6 mb-3">
+            <h3 class="title-text m-0">{{ props.pageTitle }}</h3>
+            <div v-if="props.showTypeTabs" class="type-tabs">
+                <button
+                    v-for="opt in typeTabOptions"
+                    :key="opt.label"
+                    type="button"
+                    class="type-tab"
+                    :class="{ active: activeTypeTab === opt.value }"
+                    @click="selectTypeTab(opt.value)"
+                >
+                    {{ opt.label }}
+                </button>
+            </div>
+        </div>
         <div class="flex flex-wrap items-center gap-3 text-sm">
             <slot name="before-count" />
             <div class="text-gray-600"><span class="text-gray-900 font-medium">共 {{ totalCount }} 项</span></div>
@@ -177,7 +278,7 @@ const onCreate = () => emit("create");
                 v-model:keyword="typeKeyword"
                 :show-search="true"
                 search-placeholder="搜索..."
-                :dropdown-width="180"
+                :dropdown-width="200"
                 :dropdown-max-height="260"
                 :bordered="false"
             >
@@ -188,54 +289,11 @@ const onCreate = () => emit("create");
                         tabindex="0"
                         @click.stop="typeDropdownOpen = !typeDropdownOpen"
                     >
-                        <div class="flex items-center w-full gap-2 min-w-0">
-                            <span class="filter-select-value text-sm truncate" :class="type ? 'text-[var(--vort-text,rgba(0,0,0,0.88))]' : 'text-[var(--vort-text-quaternary,rgba(0,0,0,0.25))]'">
-                                {{ type || "类型" }}
-                            </span>
-                            <span class="vort-select-arrow ml-auto" :class="{ 'vort-select-arrow-open': open }">
-                                <DownOutlined />
-                            </span>
-                        </div>
-                    </div>
-                </template>
-
-                <div class="p-2 pt-1">
-                    <VortButton
-                        v-for="group in filteredTypeOptions"
-                        :key="group"
-                        class="w-full h-9 px-3 flex items-center justify-between text-left"
-                        variant="text"
-                        :class="type === group ? 'bg-slate-100' : ''"
-                        @click.stop="selectType(group)"
-                    >
-                        <span class="text-gray-700 text-sm">{{ group }}</span>
-                        <span v-if="type === group" class="text-blue-500">✓</span>
-                    </VortButton>
-                </div>
-            </PopoverSelect>
-
-            <!-- Status Filter -->
-            <PopoverSelect
-                v-model:open="statusDropdownOpen"
-                v-model:keyword="statusKeyword"
-                :show-search="true"
-                search-placeholder="搜索..."
-                :dropdown-width="240"
-                :dropdown-max-height="220"
-                :bordered="false"
-            >
-                <template #trigger="{ open }">
-                    <div
-                        class="filter-select-trigger min-w-[130px]"
-                        :class="{ active: open }"
-                        tabindex="0"
-                        @click.stop="statusDropdownOpen = !statusDropdownOpen"
-                    >
                         <div class="flex items-center w-full gap-1.5 min-w-0">
-                            <span class="filter-select-value text-sm truncate" :class="props.status.length ? 'text-[var(--vort-text,rgba(0,0,0,0.88))]' : 'text-[var(--vort-text-quaternary,rgba(0,0,0,0.25))]'">
-                                {{ statusDisplayLabel }}
+                            <span class="filter-select-value text-sm truncate" :class="props.type.length ? 'text-[var(--vort-text,rgba(0,0,0,0.88))]' : 'text-[var(--vort-text-quaternary,rgba(0,0,0,0.25))]'">
+                                {{ typeDisplayLabel }}
                             </span>
-                            <span v-if="statusExtraCount > 0" class="status-extra-badge">(+{{ statusExtraCount }})</span>
+                            <span v-if="typeExtraCount > 0" class="status-extra-badge">(+{{ typeExtraCount }})</span>
                             <span class="vort-select-arrow ml-auto" :class="{ 'vort-select-arrow-open': open }">
                                 <DownOutlined />
                             </span>
@@ -246,45 +304,67 @@ const onCreate = () => emit("create");
                 <div class="p-2 pt-1">
                     <div
                         class="status-filter-row"
-                        :class="{ 'is-active': !props.status.length }"
-                        @click.stop="selectAllStatus()"
+                        :class="{ 'is-active': isAllTypeChecked }"
+                        @click.stop="toggleAllType()"
                     >
                         <div class="flex items-center gap-3">
                             <vort-checkbox
-                                :checked="!props.status.length"
+                                :checked="isAllTypeChecked"
+                                :indeterminate="isTypeIndeterminate"
                                 @click.stop
-                                @update:checked="selectAllStatus()"
+                                @update:checked="toggleAllType()"
                             />
                             <span class="text-sm text-gray-700 leading-5">全部</span>
                         </div>
                     </div>
                     <div
-                        v-for="opt in filteredStatusOptions"
-                        :key="opt.value"
+                        v-for="group in filteredTypeOptions"
+                        :key="group"
                         class="status-filter-row"
-                        :class="{ 'is-active': props.status.includes(opt.value) }"
-                        @click.stop="toggleStatus(opt.value)"
+                        :class="{ 'is-active': isTypeItemChecked(group) }"
+                        @click.stop="toggleType(group)"
                     >
                         <div class="flex items-center gap-3">
                             <vort-checkbox
-                                :checked="props.status.includes(opt.value)"
+                                :checked="isTypeItemChecked(group)"
                                 @click.stop
-                                @update:checked="toggleStatus(opt.value)"
+                                @update:checked="toggleType(group)"
                             />
-                            <span :class="opt.iconClass" class="flex items-center">
-                                <StatusIcon :name="opt.icon" :size="14" :color="opt.iconColor" />
-                            </span>
-                            <span class="text-sm text-gray-700 leading-5">{{ opt.label }}</span>
+                            <span class="text-sm text-gray-700 leading-5">{{ group }}</span>
                         </div>
                     </div>
                 </div>
             </PopoverSelect>
 
+            <WorkItemStatusFilter
+                ref="statusFilterRef"
+                :model-value="props.status"
+                :options="props.statusOptions"
+                :groups="props.statusGroups"
+                :show-pending-shortcut="props.showStatusPendingShortcut"
+                @update:model-value="onStatusUpdate"
+            />
+
             <VortButton variant="primary" @click="onSearch">查询</VortButton>
             <VortButton @click="onReset">重置</VortButton>
             <slot name="after-filters" />
             <div class="ml-auto flex items-center gap-2">
-                <VortButton variant="primary" @click="onCreate">{{ props.createButtonText }}</VortButton>
+                <Dropdown v-if="showCreateDropdown" v-model:open="createDropdownOpen" trigger="click" placement="bottomRight">
+                    <VortButton variant="primary">
+                        {{ props.createButtonText }}
+                        <span class="create-dropdown-arrow ml-1"><DownOutlined /></span>
+                    </VortButton>
+                    <template #overlay>
+                        <DropdownMenuItem
+                            v-for="t in props.createTypeOptions"
+                            :key="t"
+                            @click="onCreateWithType(t)"
+                        >
+                            <span>{{ t }}</span>
+                        </DropdownMenuItem>
+                    </template>
+                </Dropdown>
+                <VortButton v-else variant="primary" @click="onCreate">{{ props.createButtonText }}</VortButton>
                 <slot name="extra-actions" />
             </div>
         </div>
@@ -360,5 +440,62 @@ const onCreate = () => emit("create");
     margin-left: 2px;
     font-size: 13px;
     color: var(--vort-text, rgba(0, 0, 0, 0.88));
+}
+
+.create-dropdown-arrow {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    line-height: 1;
+}
+
+.title-row {
+    line-height: 1.4;
+}
+
+.title-text {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--vort-text, rgba(0, 0, 0, 0.88));
+    line-height: 1.4;
+}
+
+.type-tabs {
+    display: inline-flex;
+    align-items: center;
+    gap: 24px;
+}
+
+.type-tab {
+    position: relative;
+    padding: 4px 0;
+    border: none;
+    background: transparent;
+    font-size: 14px;
+    color: var(--vort-text-secondary, #6b7280);
+    cursor: pointer;
+    transition: color 0.2s;
+    line-height: 1.4;
+}
+
+.type-tab:hover {
+    color: var(--vort-primary, #1456f0);
+}
+
+.type-tab.active {
+    color: var(--vort-primary, #1456f0);
+    font-weight: 500;
+}
+
+.type-tab.active::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: -4px;
+    width: 24px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--vort-primary, #1456f0);
+    transform: translateX(-50%);
 }
 </style>

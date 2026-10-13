@@ -1,0 +1,26 @@
+{
+    "name": "OpenVort",
+    "short_name": "OpenVort",
+    "description": "OpenVort AI 研发工作流引擎",
+    "lang": "zh-CN",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "any",
+    "background_color": "#ffffff",
+    "theme_color": "#2563eb",
+    "icons": [
+        {
+            "src": "/logo.png",
+            "sizes": "192x192 256x256 384x384 447x447 512x512",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "/logo.png",
+            "sizes": "192x192 512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}

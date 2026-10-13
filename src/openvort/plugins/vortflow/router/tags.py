@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from sqlalchemy import func, select
 
 from openvort.db.engine import get_session_factory
@@ -37,7 +37,7 @@ async def create_tag(body: TagCreate):
             select(FlowTag).where(FlowTag.name == body.name)
         )
         if existing.scalar_one_or_none():
-            return {"error": "标签名称已存在"}
+            raise HTTPException(status_code=409, detail="标签名称已存在")
         max_order = await session.execute(
             select(func.coalesce(func.max(FlowTag.sort_order), 0))
         )
@@ -67,14 +67,14 @@ async def update_tag(tag_id: str, body: TagUpdate):
     async with sf() as session:
         tag = await session.get(FlowTag, tag_id)
         if not tag:
-            return {"error": "标签不存在"}
+            raise HTTPException(status_code=404, detail="标签不存在")
         old_name = tag.name
         if body.name is not None and body.name != old_name:
             dup = await session.execute(
                 select(FlowTag).where(FlowTag.name == body.name, FlowTag.id != tag_id)
             )
             if dup.scalar_one_or_none():
-                return {"error": "标签名称已存在"}
+                raise HTTPException(status_code=409, detail="标签名称已存在")
             await _replace_tag_in_items(session, old_name, body.name)
             tag.name = body.name
         if body.color is not None:
@@ -90,7 +90,7 @@ async def delete_tag(tag_id: str):
     async with sf() as session:
         tag = await session.get(FlowTag, tag_id)
         if not tag:
-            return {"error": "标签不存在"}
+            raise HTTPException(status_code=404, detail="标签不存在")
         await _replace_tag_in_items(session, tag.name, None)
         await session.delete(tag)
         await session.commit()
@@ -103,12 +103,12 @@ async def migrate_tag(tag_id: str, body: TagMigrate):
     async with sf() as session:
         source_tag = await session.get(FlowTag, tag_id)
         if not source_tag:
-            return {"error": "原标签不存在"}
+            raise HTTPException(status_code=404, detail="原标签不存在")
         target_name: str | None = None
         if body.target_tag_id:
             target_tag = await session.get(FlowTag, body.target_tag_id)
             if not target_tag:
-                return {"error": "目标标签不存在"}
+                raise HTTPException(status_code=404, detail="目标标签不存在")
             target_name = target_tag.name
         affected = await _count_tag_usage(session, source_tag.name)
         await _replace_tag_in_items(session, source_tag.name, target_name)

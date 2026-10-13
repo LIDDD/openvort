@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from openvort.services.asr import ASRService
-from openvort.web.deps import get_db_session_factory
+from openvort.web.deps import get_asr_service, get_db_session_factory
 
 router = APIRouter()
 
@@ -31,6 +31,13 @@ async def _build_asr_service() -> ASRService:
     return service
 
 
+async def _reload_singleton() -> None:
+    """刷新全局 ASR 单例，让 channel 持有的实例感知到配置变更。"""
+    asr_svc = get_asr_service()
+    if asr_svc is not None:
+        await asr_svc.load_providers()
+
+
 @router.get("")
 async def list_voice_providers():
     """列出语音服务商（ASR）"""
@@ -54,6 +61,7 @@ async def create_voice_provider(req: VoiceProviderCreateRequest):
             config=req.config or {},
             is_default=req.is_default,
         )
+        await _reload_singleton()
         return {"id": provider.id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"创建语音服务商失败: {e}") from e
@@ -76,6 +84,7 @@ async def update_voice_provider(provider_id: str, req: VoiceProviderUpdateReques
         )
         if not provider:
             raise HTTPException(status_code=404, detail="语音服务商不存在")
+        await _reload_singleton()
         return {"success": True}
     except HTTPException:
         raise
@@ -93,6 +102,7 @@ async def delete_voice_provider(provider_id: str):
         deleted = await asr_service.delete_provider(provider_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="语音服务商不存在")
+        await _reload_singleton()
         return {"success": True}
     except HTTPException:
         raise

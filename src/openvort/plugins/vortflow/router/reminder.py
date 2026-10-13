@@ -2,7 +2,7 @@
 
 import json
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -78,7 +78,7 @@ async def get_reminder_settings(project_id: str):
     async with sf() as session:
         proj = await session.get(FlowProject, project_id)
         if not proj:
-            return {"error": "项目不存在"}
+            raise HTTPException(status_code=404, detail="项目不存在")
         setting = (await session.execute(
             select(FlowReminderSettings).where(FlowReminderSettings.project_id == project_id)
         )).scalar_one_or_none()
@@ -141,7 +141,7 @@ async def update_reminder_settings(project_id: str, body: ReminderSettingsBody):
     async with sf() as session:
         proj = await session.get(FlowProject, project_id)
         if not proj:
-            return {"error": "项目不存在"}
+            raise HTTPException(status_code=404, detail="项目不存在")
 
         setting = (await session.execute(
             select(FlowReminderSettings).where(FlowReminderSettings.project_id == project_id)
@@ -175,6 +175,6 @@ class TestReminderBody(BaseModel):
 async def test_reminder(body: TestReminderBody):
     """Trigger a test reminder for the given projects and scene."""
     if not body.project_ids:
-        return {"error": "请选择至少一个项目"}
+        raise HTTPException(status_code=400, detail="请选择至少一个项目")
     result = await reminder_service.run_now(body.project_ids, body.scene)
     return result

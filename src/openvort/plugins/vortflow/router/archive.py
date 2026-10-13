@@ -1,6 +1,6 @@
 """Batch archive / unarchive work items with cascade."""
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select, update as sa_update
 
 from openvort.db.engine import get_session_factory
@@ -19,7 +19,7 @@ async def batch_archive(body: BatchArchiveBody, request: Request):
     if not body.ids:
         return {"ok": True, "count": 0}
     if body.type not in ("story", "task", "bug"):
-        return {"error": f"无效类型: {body.type}"}
+        raise HTTPException(status_code=400, detail=f"无效类型: {body.type}")
 
     sf = get_session_factory()
     async with sf() as session:

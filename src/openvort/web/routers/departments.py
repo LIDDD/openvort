@@ -1,6 +1,6 @@
 """部门管理路由"""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from openvort.web.deps import get_db_session_factory
@@ -53,7 +53,7 @@ async def get_department(dept_id: int):
     service = _get_service()
     dept = await service.get_department(dept_id)
     if not dept:
-        return {"error": "部门不存在"}
+        raise HTTPException(status_code=404, detail="部门不存在")
     return {
         "id": dept.id,
         "name": dept.name,
@@ -72,7 +72,7 @@ async def create_department(req: CreateDepartmentRequest):
         dept = await service.create_department(req.name, req.parent_id)
         return {"success": True, "id": dept.id}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.put("/{dept_id}")

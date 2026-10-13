@@ -169,6 +169,8 @@ class IntakeStoryTool(BaseTool):
                 deadline=deadline,
                 submitter_id=member_id or None,
                 assignee_id=assignee_id,
+                # pm_id 与 assignee_id 双轨；统一以 assignee_id 为权威，新建时同步覆盖避免分叉。
+                pm_id=assignee_id,
             )
             session.add(story)
 
@@ -237,6 +239,7 @@ class IntakeStoryTool(BaseTool):
                     priority=priority,
                     submitter_id=member_id or None,
                     assignee_id=assignee_id,
+                    pm_id=assignee_id,
                 )
                 session.add(child_story)
                 session.add(

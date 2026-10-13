@@ -3,11 +3,32 @@
     <head>
         <meta charset="UTF-8" />
         <link rel="icon" type="image/png" href="/logo.png" />
+        <link rel="apple-touch-icon" href="/logo.png" />
+        <link rel="manifest" href="/manifest.webmanifest" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="theme-color" content="#2563eb" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+        <meta name="apple-mobile-web-app-title" content="OpenVort" />
         <title>OpenVort</title>
     </head>
     <body>
         <div id="app"></div>
         <script type="module" src="/src/main.ts"></script>
+        <script>
+            // 注册 Service Worker：仅生产环境启用，避免影响 Vite HMR
+            if ("serviceWorker" in navigator && location.hostname !== "localhost" && location.protocol !== "file:") {
+                window.addEventListener("load", () => {
+                    navigator.serviceWorker
+                        .register("/sw.js", { scope: "/" })
+                        .catch(() => { /* silent */ });
+                });
+                navigator.serviceWorker.addEventListener("message", (event) => {
+                    if (event?.data?.type === "navigate" && event.data.url) {
+                        try { window.location.assign(event.data.url); } catch (_) { /* noop */ }
+                    }
+                });
+            }
+        </script>
     </body>
 </html>

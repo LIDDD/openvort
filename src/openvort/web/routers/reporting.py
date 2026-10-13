@@ -1,6 +1,6 @@
 """汇报关系路由"""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from openvort.web.deps import get_db_session_factory
@@ -64,7 +64,7 @@ async def create_relation(req: CreateRelationRequest):
     from openvort.contacts.models import ReportingRelation
 
     if req.reporter_id == req.supervisor_id:
-        return {"success": False, "error": "不能向自己汇报"}
+        raise HTTPException(status_code=400, detail="不能向自己汇报")
 
     session_factory = get_db_session_factory()
     async with session_factory() as session:
@@ -81,7 +81,7 @@ async def create_relation(req: CreateRelationRequest):
             return {"success": True, "id": rel.id}
         except Exception:
             await session.rollback()
-            return {"success": False, "error": "汇报关系已存在或数据无效"}
+            raise HTTPException(status_code=409, detail="汇报关系已存在或数据无效")
 
 
 @router.put("/{relation_id}")
@@ -97,7 +97,7 @@ async def update_relation(relation_id: int, req: UpdateRelationRequest):
         result = await session.execute(stmt)
         rel = result.scalar_one_or_none()
         if not rel:
-            return {"success": False, "error": "汇报关系不存在"}
+            raise HTTPException(status_code=404, detail="汇报关系不存在")
 
         if req.relation_type is not None:
             rel.relation_type = req.relation_type

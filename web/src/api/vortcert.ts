@@ -1,5 +1,15 @@
 import request from "@/utils/request";
 
+// 长任务超时配置（毫秒）
+// acme.sh 签发 / 续签需要 DNS 传播 + Let's Encrypt 验证，通常 30s ~ 3min
+const ISSUE_TIMEOUT = 5 * 60 * 1000;
+// 多域名并发巡检
+const CHECK_ALL_TIMEOUT = 2 * 60 * 1000;
+// 单域名 SSL 探测后端 timeout=10s，前端留余量
+const CHECK_ONE_TIMEOUT = 30 * 1000;
+// 多目标部署：阿里云 CDN / 宝塔 API
+const DEPLOY_TIMEOUT = 3 * 60 * 1000;
+
 // ============ Stats ============
 
 export function getCertStats() {
@@ -86,15 +96,21 @@ export function importCertDomains(data: {
 // ============ Certificate Check ============
 
 export function checkAllDomains() {
-    return request.post("/cert/check");
+    return request.post("/cert/check", undefined, { timeout: CHECK_ALL_TIMEOUT });
 }
 
 export function checkSingleDomain(domainId: string) {
-    return request.post(`/cert/check/${domainId}`);
+    return request.post(`/cert/check/${domainId}`, undefined, { timeout: CHECK_ONE_TIMEOUT });
+}
+
+// 在线探测：连接目标服务器 443 端口抓取实际部署的证书（独立于域名主状态）
+export function probeSingleDomain(domainId: string) {
+    return request.post(`/cert/probe/${domainId}`, undefined, { timeout: CHECK_ONE_TIMEOUT });
 }
 
 export function getCertCheckLogs(params?: {
     domain_id?: string;
+    source?: string;
     page?: number;
     page_size?: number;
 }) {
@@ -120,11 +136,11 @@ export function issueCertificate(data: {
     domain_id: string;
     wildcard?: boolean;
 }) {
-    return request.post("/cert/certificates/issue", data);
+    return request.post("/cert/certificates/issue", data, { timeout: ISSUE_TIMEOUT });
 }
 
 export function renewCertificate(certId: string) {
-    return request.post(`/cert/certificates/${certId}/renew`);
+    return request.post(`/cert/certificates/${certId}/renew`, undefined, { timeout: ISSUE_TIMEOUT });
 }
 
 export function deleteCertificate(certId: string) {
@@ -173,7 +189,7 @@ export function deployCertificate(data: {
     certificate_id: string;
     target_ids: string[];
 }) {
-    return request.post("/cert/deploy", data);
+    return request.post("/cert/deploy", data, { timeout: DEPLOY_TIMEOUT });
 }
 
 export function getCertDeployLogs(params?: {

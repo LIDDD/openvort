@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 
@@ -114,9 +114,9 @@ async def convert_work_item(body: ConvertBody, request: Request):
     to_type = body.to_type
 
     if from_type not in _TYPE_MODEL or to_type not in _TYPE_MODEL:
-        return {"error": "无效的工作项类型"}
+        raise HTTPException(status_code=400, detail="无效的工作项类型")
     if from_type == to_type:
-        return {"error": "源类型和目标类型相同"}
+        raise HTTPException(status_code=400, detail="源类型和目标类型相同")
 
     src_model = _TYPE_MODEL[from_type]
     dst_model = _TYPE_MODEL[to_type]
@@ -125,7 +125,7 @@ async def convert_work_item(body: ConvertBody, request: Request):
     async with sf() as session:
         src = await session.get(src_model, body.id)
         if not src:
-            return {"error": f"{_TYPE_LABEL.get(from_type, from_type)}不存在"}
+            raise HTTPException(status_code=404, detail=f"{_TYPE_LABEL.get(from_type, from_type)}不存在")
 
         # --- 1. Build target record ---
         new_id = _uuid()

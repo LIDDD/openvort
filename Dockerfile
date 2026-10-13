@@ -53,6 +53,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
       pip install --no-cache-dir .; \
     fi
 COPY --from=frontend /app/web/dist web/dist
+# Alembic 配置与迁移脚本：供部署期在容器内执行 `alembic upgrade head`。
+# 缺失时 alembic 会加载空配置并报 "No 'script_location' key found in configuration"。
+COPY alembic.ini ./
+COPY alembic/ alembic/
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8090
 ENTRYPOINT ["python", "-u", "-m", "openvort"]

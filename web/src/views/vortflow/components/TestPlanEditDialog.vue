@@ -1,15 +1,15 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, computed, watch, type Ref } from "vue";
 import { z } from "zod";
 import { Dialog } from "@openvort/vort-ui";
 import { DownOutlined } from "@openvort/vort-ui";
 import { useVortFlowStore } from "@/stores";
 import WorkItemMemberPicker from "@/components/vort-biz/work-item/WorkItemMemberPicker.vue";
+import IterationSelect, { type IterationSelectOption } from "@/components/vort-biz/work-item/IterationSelect.vue";
 import { useWorkItemCommon } from "../work-item/useWorkItemCommon";
 import {
     createVortflowTestPlan,
     updateVortflowTestPlan,
-    getVortflowIterations,
     getVortflowVersions,
 } from "@/api";
 
@@ -39,7 +39,14 @@ const vortFlowStore = useVortFlowStore();
 const {
     ownerGroups, getAvatarBg, getAvatarLabel, getMemberAvatarUrl,
     loadMemberOptions, getMemberIdByName, getMemberNameById,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
+
+const tpEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const tpEnrichedCollapsed = ref<string[]>([]);
+const tpActiveGroups = computed(() =>
+    tpEnrichedGroups.value.length > 0 ? tpEnrichedGroups.value : ownerGroups.value,
+);
 
 const formRef = ref();
 const submitting = ref(false);
@@ -80,23 +87,41 @@ async function loadOptions(projectId?: string) {
         versionOptions.value = [];
         return;
     }
-    const [iterRes, verRes] = await Promise.all([
-        getVortflowIterations({ project_id: pid, page_size: 100 }),
-        getVortflowVersions({ project_id: pid, page_size: 100 }),
-    ]);
-    iterationOptions.value = ((iterRes as any).items || []).map((i: any) => ({ id: i.id, name: i.name }));
+    iterationOptions.value = [];
+    const verRes = await getVortflowVersions({ project_id: pid, page_size: 100 });
     versionOptions.value = ((verRes as any).items || []).map((v: any) => ({ id: v.id, name: v.name }));
 }
+
+const handleIterationOptionsChange = (options: IterationSelectOption[]) => {
+    const merged = new Map(iterationOptions.value.map((item) => [item.id, item]));
+    for (const item of options || []) {
+        const id = String(item?.id || "");
+        const name = String(item?.name || "");
+        if (id && name) merged.set(id, { id, name });
+    }
+    iterationOptions.value = [...merged.values()];
+};
+
+const selectedIterationLabel = computed(() => {
+    const id = form.value.iteration_id;
+    return iterationOptions.value.find((item) => item.id === id)?.name || id || "";
+});
 
 function handleProjectChange() {
     form.value.iteration_id = "";
     form.value.version_id = "";
+    iterationOptions.value = [];
     loadOptions();
 }
 
 watch(() => props.open, async (val) => {
     if (!val) return;
     await loadMemberOptions();
+    const pid = props.editData?.project_id || vortFlowStore.selectedProjectId || "";
+    getEnrichedOwnerGroups(pid).then((groups) => {
+        tpEnrichedGroups.value = groups;
+        tpEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+    });
     if (props.editData?.id) {
         form.value = {
             project_id: props.editData.project_id || "",
@@ -128,6 +153,7 @@ const handleOwnerSelect = (name: string) => {
     form.value.owner_id = getMemberIdByName(name);
     ownerDropdownOpen.value = false;
     ownerKeyword.value = "";
+    if (name) recordRecentMember(name);
 };
 
 async function handleSubmit() {
@@ -182,7 +208,8 @@ async function handleSubmit() {
                 <WorkItemMemberPicker
                     mode="owner"
                     :owner="getMemberNameById(form.owner_id)"
-                    :groups="ownerGroups"
+                    :groups="tpActiveGroups"
+                    :default-collapsed="tpEnrichedCollapsed"
                     :open="ownerDropdownOpen"
                     v-model:keyword="ownerKeyword"
                     :show-unassigned="false"
@@ -234,11 +261,14 @@ async function handleSubmit() {
             </vort-form-item>
 
             <vort-form-item label="关联迭代" name="iteration_id">
-                <vort-select v-model="form.iteration_id" placeholder="请选择" allow-clear>
-                    <vort-select-option v-for="opt in iterationOptions" :key="opt.id" :value="opt.id">
-                        {{ opt.name }}
-                    </vort-select-option>
-                </vort-select>
+                <IterationSelect
+                    v-model="form.iteration_id"
+                    :project-id="form.project_id"
+                    :selected-label="selectedIterationLabel"
+                    placeholder="请选择"
+                    allow-clear
+                    @options-change="handleIterationOptionsChange"
+                />
             </vort-form-item>
 
             <vort-form-item label="关联版本" name="version_id">

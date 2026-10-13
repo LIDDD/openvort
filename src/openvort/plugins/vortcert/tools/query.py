@@ -99,18 +99,36 @@ class CertQueryTool(BaseTool):
         return json.dumps({"ok": True, "count": len(items), "domains": items}, ensure_ascii=False)
 
     async def _check_one(self, domain: str) -> str:
+        """Refresh a single domain's status by deriving from its latest issued certificate.
+
+        Does NOT perform any network probing. Use the web UI's "online probe" button
+        for live 443 SSL inspection.
+        """
         if not domain:
             return json.dumps({"ok": False, "message": "请提供要检查的域名"}, ensure_ascii=False)
 
-        from openvort.plugins.vortcert.checker import check_domain_cert
-        result = await check_domain_cert(domain)
+        from openvort.plugins.vortcert.router import refresh_domain_status
+
+        sf = get_session_factory()
+        async with sf() as session:
+            domain_obj = await session.scalar(
+                select(CertDomain).where(CertDomain.domain == domain)
+            )
+            if not domain_obj:
+                return json.dumps(
+                    {"ok": False, "message": f"未找到域名：{domain}"},
+                    ensure_ascii=False,
+                )
+
+            derived = await refresh_domain_status(session, domain_obj.id)
+            await session.commit()
 
         return json.dumps({
             "ok": True,
-            "domain": result.domain,
-            "status": result.status,
-            "expires_at": result.expires_at.isoformat() if result.expires_at else None,
-            "days_remaining": result.days_remaining,
-            "issuer": result.issuer,
-            "error": result.error_message,
+            "domain": derived.get("domain", domain),
+            "status": derived.get("status") or "unchecked",
+            "expires_at": derived.get("expires_at"),
+            "days_remaining": derived.get("days_remaining"),
+            "issuer": derived.get("issuer", ""),
+            "note": "状态由该域名最新签发的证书派生（不进行 443 在线探测）",
         }, ensure_ascii=False)

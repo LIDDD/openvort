@@ -23,9 +23,6 @@ class FlowProject(Base):
     code: Mapped[str] = mapped_column(String(64), default="")
     color: Mapped[str] = mapped_column(String(32), default="#3b82f6")
     description: Mapped[str] = mapped_column(Text, default="")
-    product: Mapped[str] = mapped_column(String(200), default="")
-    iteration: Mapped[str] = mapped_column(String(200), default="")
-    version: Mapped[str] = mapped_column(String(64), default="")
     owner_id: Mapped[str] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
     start_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     end_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -43,15 +40,20 @@ class FlowStory(Base):
     title: Mapped[str] = mapped_column(String(500))
     description: Mapped[str] = mapped_column(Text, default="")
     state: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
-    priority: Mapped[int] = mapped_column(Integer, default=3)  # 1=紧急 2=高 3=中 4=低
+    priority: Mapped[int] = mapped_column(Integer, default=3)  # 1=紧急 2=高 3=中 4=低（保留作为等级标签）
+    # 0-100 分数 priority_score：80-100=紧急/60-79=高/40-59=中/20-39=低/0-19=无；
+    # 默认值=段起始值（紧急 80、高 60、中 40、低 20、无 0），同等级内分数越大越优先。
+    # 排序：ORDER BY priority_score DESC, updated_at DESC, id DESC
+    priority_score: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     parent_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("flow_stories.id"), nullable=True, index=True
     )
+    # 手动排序键，使用 float 支持 fractional ranking（插入两行之间取中点，避免大量重排）。
+    # NULL 视为"未排过序"，按 (sort_order ASC NULLS LAST, created_at DESC) 自然落到列表末尾。
+    sort_order: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     submitter_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
-    assignee_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
-    pm_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
-    designer_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
-    reviewer_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
+    assignee_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True, index=True)
+    pm_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True, index=True)
     tags_json: Mapped[str] = mapped_column(Text, default="[]")
     collaborators_json: Mapped[str] = mapped_column(Text, default="[]")
     attachments_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -67,7 +69,7 @@ class FlowStory(Base):
     branch: Mapped[str] = mapped_column(String(200), default="")
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), index=True)
 
 
 class FlowTask(Base):
@@ -81,11 +83,16 @@ class FlowTask(Base):
     parent_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("flow_tasks.id"), nullable=True, index=True
     )
+    # 手动排序键（Gitee 风格拖拽排序），按 (project_id, story_id, parent_id) 分组独立递增。
+    # NULL 视为"未排过序"，按 sort_order ASC NULLS LAST + created_at DESC 落到列表末尾。
+    sort_order: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(500))
     description: Mapped[str] = mapped_column(Text, default="")
     task_type: Mapped[str] = mapped_column(String(32), default="fullstack")  # frontend/backend/fullstack/test
     state: Mapped[str] = mapped_column(String(32), default="todo", index=True)
-    assignee_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
+    # 0-100 精排分数，与需求/缺陷工作墙混排一致；默认可由估时回填。
+    priority_score: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    assignee_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True, index=True)
     creator_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
     tags_json: Mapped[str] = mapped_column(Text, default="[]")
     collaborators_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -101,7 +108,7 @@ class FlowTask(Base):
     branch: Mapped[str] = mapped_column(String(200), default="")
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), index=True)
 
 
 class FlowBug(Base):
@@ -113,13 +120,18 @@ class FlowBug(Base):
     project_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("flow_projects.id"), nullable=True, index=True)
     story_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("flow_stories.id"), nullable=True, index=True)
     task_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("flow_tasks.id"), nullable=True)
+    # 手动排序键（Gitee 风格拖拽排序），按 (project_id, story_id, task_id) 分组独立递增。
+    # NULL 视为"未排过序"，按 sort_order ASC NULLS LAST + created_at DESC 落到列表末尾。
+    sort_order: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(500))
     description: Mapped[str] = mapped_column(Text, default="")
     severity: Mapped[int] = mapped_column(Integer, default=3)  # 1=致命 2=严重 3=一般 4=轻微
+    # 0-100 精排；与 severity 联动，规则同需求 priority/priority_score。
+    priority_score: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     state: Mapped[str] = mapped_column(String(32), default="open", index=True)
-    reporter_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
-    assignee_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
-    developer_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True)
+    reporter_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True, index=True)
+    assignee_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True, index=True)
+    developer_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("members.id"), nullable=True, index=True)
     tags_json: Mapped[str] = mapped_column(Text, default="[]")
     collaborators_json: Mapped[str] = mapped_column(Text, default="[]")
     attachments_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -133,7 +145,7 @@ class FlowBug(Base):
     branch: Mapped[str] = mapped_column(String(200), default="")
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), index=True)
 
 
 
@@ -166,19 +178,19 @@ class FlowProjectMember(Base):
     joined_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
-class FlowExternalMapping(Base):
-    """外部系统映射（双向同步用）"""
+class FlowProjectStar(Base):
+    """项目星标 — 成员个人关注的项目（个人级偏好，与项目成员关系解耦）"""
 
-    __tablename__ = "flow_external_mappings"
+    __tablename__ = "flow_project_stars"
+    __table_args__ = (
+        UniqueConstraint("member_id", "project_id", name="uq_flow_project_star"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    local_type: Mapped[str] = mapped_column(String(32), index=True)  # story/task/bug
-    local_id: Mapped[str] = mapped_column(String(32), index=True)
-    adapter: Mapped[str] = mapped_column(String(32), index=True)  # zentao/jira
-    external_id: Mapped[str] = mapped_column(String(128))
-    sync_cursor: Mapped[str] = mapped_column(String(128), default="")
-    conflict_state: Mapped[str] = mapped_column(String(16), default="ok")  # ok/conflict/pending
-    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    member_id: Mapped[str] = mapped_column(String(32), ForeignKey("members.id"), index=True)
+    project_id: Mapped[str] = mapped_column(String(32), ForeignKey("flow_projects.id"), index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class FlowIteration(Base):

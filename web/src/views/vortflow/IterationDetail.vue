@@ -4,7 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import { Filter, Plus, LayoutList, Ellipsis, Play, CheckCircle, Pencil, Trash2 } from "lucide-vue-next";
 import { message } from "@openvort/vort-ui";
 import {
-    getVortflowIteration, getVortflowIterations,
+    getVortflowIteration, getAllVortflowIterations,
     getVortflowStories, getVortflowTasks, getVortflowBugs,
     updateVortflowIteration, deleteVortflowIteration,
 } from "@/api";
@@ -48,6 +48,9 @@ const projectId = computed(() => iteration.value?.project_id || vortFlowStore.se
 const projectName = computed(() =>
     vortFlowStore.projects.find(p => p.id === projectId.value)?.name || ""
 );
+const showIterationProjectName = computed(() => vortFlowStore.selectedProjectIds.length !== 1);
+const iterationProjectName = (item: any) =>
+    item.project_name || vortFlowStore.projects.find(p => p.id === item.project_id)?.name || "";
 
 // Sidebar: "unplanned" vs normal iteration view
 const activeView = ref<"unplanned" | "iteration">("iteration");
@@ -137,7 +140,10 @@ const resetSidebarFilter = () => {
 const unplannedCount = ref(0);
 const loadUnplannedCount = async (pid?: string) => {
     const resolvedPid = pid || projectId.value;
-    if (!resolvedPid) return;
+    if (!resolvedPid) {
+        unplannedCount.value = 0;
+        return;
+    }
     try {
         const [stories, tasks, bugs] = await Promise.all([
             getVortflowStories({ project_id: resolvedPid, iteration_id: "__unplanned__", parent_id: "root", page: 1, page_size: 1 }),
@@ -160,8 +166,11 @@ const loadIteration = async () => {
 
 const loadIterations = async () => {
     try {
-        const pid = iteration.value?.project_id || vortFlowStore.selectedProjectId || undefined;
-        const res = await getVortflowIterations({ project_id: pid, page: 1, page_size: 200 });
+        const projectIds = vortFlowStore.selectedProjectIds || [];
+        const res = await getAllVortflowIterations({
+            project_ids: projectIds.length ? projectIds.join(",") : undefined,
+            page_size: 200,
+        });
         iterations.value = (res as any)?.items || [];
     } catch { iterations.value = []; }
 };
@@ -178,7 +187,9 @@ const handleIterationClick = (id: string) => {
     if (id === selectedIterationId.value && activeView.value === "iteration") return;
     activeView.value = "iteration";
     selectedIterationId.value = id;
-    iteration.value = iterations.value.find((i: any) => i.id === id) || iteration.value;
+    const nextIteration = iterations.value.find((i: any) => i.id === id);
+    iteration.value = nextIteration || iteration.value;
+    if (nextIteration?.project_id) void loadUnplannedCount(nextIteration.project_id);
     window.history.replaceState({}, "", `/vortflow/iterations/${id}`);
 };
 
@@ -232,20 +243,22 @@ const handleDeleteIteration = async (iter: any) => {
     } catch { message.error("删除失败"); }
 };
 
-watch(() => vortFlowStore.selectedProjectId, async (newPid, oldPid) => {
-    if (!newPid || newPid === oldPid) return;
-    try {
-        const res = await getVortflowIterations({ project_id: newPid, page: 1, page_size: 200 });
-        iterations.value = (res as any)?.items || [];
-    } catch { iterations.value = []; }
-    loadUnplannedCount(newPid);
+watch(() => vortFlowStore.selectedProjectIds, async () => {
+    await loadIterations();
+    const current = iterations.value.find((i: any) => i.id === selectedIterationId.value);
+    if (current) {
+        iteration.value = current;
+        return;
+    }
     const first = iterations.value[0];
     if (first) {
         handleIterationClick(first.id);
     } else {
+        iteration.value = { project_id: vortFlowStore.selectedProjectId || "" };
         activeView.value = "unplanned";
+        void loadUnplannedCount(vortFlowStore.selectedProjectId || undefined);
     }
-});
+}, { deep: true });
 
 onMounted(() => loadAll());
 </script>
@@ -340,7 +353,15 @@ onMounted(() => loadAll());
                             @click="handleIterationClick(iter.id)"
                         >
                             <div class="flex items-center gap-2">
-                                <div class="text-sm font-medium text-gray-800 truncate flex-1">{{ iter.name }}</div>
+                                <div class="min-w-0 flex-1">
+                                    <div class="text-sm font-medium text-gray-800 truncate">{{ iter.name }}</div>
+                                    <div
+                                        v-if="showIterationProjectName && iterationProjectName(iter)"
+                                        class="mt-0.5 text-[11px] text-gray-400 truncate"
+                                    >
+                                        {{ iterationProjectName(iter) }}
+                                    </div>
+                                </div>
                                 <span @click.stop>
                                     <vort-popover
                                         v-model:open="iterMenuOpen[iter.id]"

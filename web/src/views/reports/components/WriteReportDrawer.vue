@@ -4,6 +4,7 @@ import { z } from "zod";
 import { message } from "@openvort/vort-ui";
 import { submitReport, getMyPublications } from "@/api";
 import { VortEditor } from "@/components/vort-biz/editor";
+import { formatLocalDate } from "@/utils/format";
 
 interface PubItem { id: string; name: string; description: string; report_type: string; content_template?: string; }
 
@@ -78,7 +79,7 @@ async function handleSubmit() {
     try {
         const payload = {
             report_type: selectedPub.value?.report_type || "daily",
-            title: `${selectedPub.value?.name || "汇报"} - ${form.value.report_date || new Date().toISOString().slice(0, 10)}`,
+            title: `${selectedPub.value?.name || "汇报"} - ${form.value.report_date || formatLocalDate()}`,
             content: form.value.content,
             report_date: form.value.report_date || undefined,
             publication_id: selectedPub.value?.id,

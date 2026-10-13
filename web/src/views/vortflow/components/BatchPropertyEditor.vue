@@ -1,21 +1,23 @@
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, type Ref } from "vue";
 import { Button, Select, SelectOption, Dialog, Input, Divider, message } from "@openvort/vort-ui";
 import WorkItemPriority from "@/components/vort-biz/work-item/WorkItemPriority.vue";
 import WorkItemStatus from "@/components/vort-biz/work-item/WorkItemStatus.vue";
 import WorkItemMemberPicker from "@/components/vort-biz/work-item/WorkItemMemberPicker.vue";
 import WorkItemTagPicker from "@/components/vort-biz/work-item/WorkItemTagPicker.vue";
+import IterationSelect, { type IterationSelectOption } from "@/components/vort-biz/work-item/IterationSelect.vue";
 import { CircleMinus, Plus } from "lucide-vue-next";
 import type { RowItem, WorkItemType, StatusOption } from "@/components/vort-biz/work-item/WorkItemTable.types";
-import { useWorkItemCommon } from "../work-item/useWorkItemCommon";
+import { useWorkItemCommon, priorityToDefaultScore } from "../work-item/useWorkItemCommon";
 import {
     updateVortflowStory, updateVortflowTask, updateVortflowBug,
-    getVortflowIterations, getVortflowVersions, getVortflowStories,
+    getVortflowVersions, getVortflowStories,
     getVortgitRepos,
     addVortflowIterationStory, addVortflowIterationTask, addVortflowIterationBug,
     removeVortflowIterationStory, removeVortflowIterationTask, removeVortflowIterationBug,
 } from "@/api";
 import { useVortFlowStore } from "@/stores";
+import { resolveBatchStatusState } from "../work-item/batchStatusMapping";
 
 interface Props {
     selectedRows: RowItem[];
@@ -46,32 +48,78 @@ const {
     ownerGroups, memberOptions, toBackendPriorityLevel,
     getBackendStatesByDisplayStatus, getMemberIdByName,
     toTaskEstimateHours,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
 
 const vortFlowStore = useVortFlowStore();
 
+const batchEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const batchEnrichedCollapsed = ref<string[]>([]);
+const batchActiveGroups = computed(() =>
+    batchEnrichedGroups.value.length > 0 ? batchEnrichedGroups.value : ownerGroups.value,
+);
+
 const submitting = ref(false);
+
+// vort-range-picker / vort-date-picker(无 valueFormat 场景) v-model 是 Date 对象，
+// 这里统一格式化成 YYYY-MM-DD，避免直接拼字符串得到 "Tue Apr 28 2026..." 这种后端无法解析的格式。
+const toBackendDateString = (value: unknown): string | null => {
+    if (value == null || value === "") return null;
+    if (value instanceof Date && !isNaN(value.getTime())) {
+        const y = value.getFullYear();
+        const m = String(value.getMonth() + 1).padStart(2, "0");
+        const d = String(value.getDate()).padStart(2, "0");
+        return `${y}-${m}-${d}`;
+    }
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+        if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed;
+        const parsed = new Date(trimmed);
+        if (!Number.isNaN(parsed.getTime())) return toBackendDateString(parsed);
+    }
+    return null;
+};
 
 const repoOptions = ref<{ label: string; value: string }[]>([]);
 const iterationOptions = ref<{ label: string; value: string }[]>([]);
 const versionOptions = ref<{ label: string; value: string }[]>([]);
 const storyOptions = ref<{ label: string; value: string }[]>([]);
 
+const selectedProjectIds = computed(() => [...new Set(
+    (props.selectedRows || []).map((row) => String(row.projectId || "")).filter(Boolean),
+)]);
+const iterationProjectId = computed(() => {
+    if (selectedProjectIds.value.length === 1) return selectedProjectIds.value[0] || "";
+    return selectedProjectIds.value.length ? "" : (vortFlowStore.selectedProjectId || "");
+});
+
+const handleIterationOptionsChange = (options: IterationSelectOption[]) => {
+    const merged = new Map(iterationOptions.value.map((item) => [String(item.value), item]));
+    for (const item of options || []) {
+        const id = String(item?.id || "");
+        const name = String(item?.name || "");
+        if (id && name) merged.set(id, { label: name, value: id });
+    }
+    iterationOptions.value = [...merged.values()];
+};
+
+const getIterationLabel = (value: unknown) => {
+    const id = String(value || "");
+    return iterationOptions.value.find((item) => String(item.value) === id)?.label || id;
+};
+
 const loadDynamicOptions = async () => {
+    iterationOptions.value = [];
     const projectId = vortFlowStore.selectedProjectId || undefined;
-    const [repoRes, iterRes, verRes, storyRes] = await Promise.allSettled([
+    const [repoRes, verRes, storyRes] = await Promise.allSettled([
         getVortgitRepos({ project_id: projectId, page_size: 200 }),
-        getVortflowIterations({ project_id: projectId, page_size: 200 }),
         getVortflowVersions({ project_id: projectId, page_size: 200 }),
         getVortflowStories({ project_id: projectId, page_size: 200 }),
     ]);
     if (repoRes.status === "fulfilled") {
         const items = (repoRes.value as any)?.items || [];
         repoOptions.value = items.map((r: any) => ({ label: r.name || r.full_name, value: r.id }));
-    }
-    if (iterRes.status === "fulfilled") {
-        const items = (iterRes.value as any)?.items || [];
-        iterationOptions.value = items.map((i: any) => ({ label: i.name, value: i.id }));
     }
     if (verRes.status === "fulfilled") {
         const items = (verRes.value as any)?.items || [];
@@ -100,6 +148,11 @@ watch(open, (v) => {
         nextId.value = 1;
         changeRows.value = [{ id: 0, property: "priority", operator: "set", value: null }];
         loadDynamicOptions();
+        const pid = vortFlowStore.selectedProjectId || "";
+        getEnrichedOwnerGroups(pid).then((groups) => {
+            batchEnrichedGroups.value = groups;
+            batchEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+        });
     }
 });
 
@@ -164,36 +217,59 @@ const buildPatch = (change: PropertyChange, row: RowItem): Record<string, any> =
     const patch: Record<string, any> = {};
     const val = change.operator === "clear" ? null : change.value;
     switch (change.property) {
-        case "priority":
+        case "priority": {
+            const level = val ? toBackendPriorityLevel(val) : 4;
+            const score = val ? priorityToDefaultScore(val) : 20;
+            patch.priority_score = score;
             if (row.type === "缺陷") {
-                patch.severity = val ? toBackendPriorityLevel(val) : 4;
-            } else if (row.type === "任务") {
-                patch.estimate_hours = val ? toTaskEstimateHours(val) : 0;
-            } else {
-                patch.priority = val ? toBackendPriorityLevel(val) : 4;
+                patch.severity = level;
+            } else if (row.type === "需求") {
+                patch.priority = level;
             }
             break;
+        }
         case "status": {
-            const states = val ? getBackendStatesByDisplayStatus(val) : [];
-            if (states.length > 0) patch.state = states[0];
+            const state = resolveBatchStatusState(
+                row.type || props.workItemType,
+                val,
+                getBackendStatesByDisplayStatus,
+            );
+            if (!state) {
+                const typeLabel = row.type || props.workItemType || "当前工作项";
+                const statusLabel = typeof val === "object" && val !== null
+                    ? String((val as any).label || (val as any).value || "")
+                    : String(val || "");
+                throw new Error(`「${statusLabel}」不适用于${typeLabel}，无法同步`);
+            }
+            patch.state = state;
             break;
         }
         case "owner": {
-            const memberId = val ? getMemberIdByName(val) || val : null;
+            // 所有类型统一写 assignee_id；需求同步 pm_id、缺陷同步 developer_id，避免老字段残留分叉。
+            // ID 解析失败时一律置 null 而不是把名字当 ID，避免后端把名字写到 assignee_id 字段，
+            // 造成「负责人=张三这个字符串」式的脏数据，进而导致企微通知静默失败。
+            const memberId = val ? getMemberIdByName(val) || null : null;
+            patch.assignee_id = memberId;
             if (row.type === "需求") patch.pm_id = memberId;
-            else patch.assignee_id = memberId;
+            else if (row.type === "缺陷") patch.developer_id = memberId;
             break;
         }
-        case "collaborators":
-            patch.collaborators = val || [];
+        case "collaborators": {
+            // 协作人列表必须是 member_id 数组而非显示名，否则会被原样存进 collaborators_json，
+            // 后续状态变更/字段变更通知会拿名字当 recipient_id 投递，IM 发不出去且没日志。
+            const names: string[] = Array.isArray(val) ? val.filter(Boolean) : [];
+            patch.collaborators = names
+                .map((n) => getMemberIdByName(n))
+                .filter((id): id is string => Boolean(id));
             break;
+        }
         case "tags":
             patch.tags = val || [];
             break;
         case "planTime":
             if (val && Array.isArray(val) && val.length === 2) {
-                patch.plan_start = val[0] || null;
-                patch.deadline = val[1] || null;
+                patch.plan_start = toBackendDateString(val[0]);
+                patch.deadline = toBackendDateString(val[1]);
             } else {
                 patch.plan_start = null;
                 patch.deadline = null;
@@ -203,10 +279,10 @@ const buildPatch = (change: PropertyChange, row: RowItem): Record<string, any> =
             patch.estimate_hours = val ? Number(val) : 0;
             break;
         case "startAt":
-            patch.start_at = val;
+            patch.start_at = toBackendDateString(val);
             break;
         case "endAt":
-            patch.end_at = val;
+            patch.end_at = toBackendDateString(val);
             break;
         case "repo":
             patch.repo_id = val;
@@ -320,6 +396,7 @@ const handleCancel = () => {
                         <WorkItemPriority
                             v-if="row.property === 'priority'"
                             :model-value="row.value || 'medium'"
+                            :enable-score-slider="false"
                             @change="(v) => row.value = v"
                         />
                         <WorkItemStatus
@@ -332,15 +409,17 @@ const handleCancel = () => {
                             v-else-if="row.property === 'owner'"
                             mode="owner"
                             :owner="row.value || ''"
-                            :groups="ownerGroups"
-                            @update:owner="(v) => row.value = v"
+                            :groups="batchActiveGroups"
+                            :default-collapsed="batchEnrichedCollapsed"
+                            @update:owner="(v) => { row.value = v; if (v) recordRecentMember(v); }"
                         />
                         <WorkItemMemberPicker
                             v-else-if="row.property === 'collaborators'"
                             mode="collaborators"
                             :collaborators="row.value || []"
-                            :groups="ownerGroups"
-                            @update:collaborators="(v) => row.value = v"
+                            :groups="batchActiveGroups"
+                            :default-collapsed="batchEnrichedCollapsed"
+                            @update:collaborators="(v) => { row.value = v; v.forEach(recordRecentMember); }"
                         />
                         <WorkItemTagPicker
                             v-else-if="row.property === 'tags'"
@@ -350,13 +429,13 @@ const handleCancel = () => {
                         />
                         <vort-range-picker
                             v-else-if="row.property === 'planTime'"
-                            :model-value="row.value || []"
+                            v-model="row.value"
                             size="small"
-                            value-format="YYYY-MM-DD"
+                            format="YYYY-MM-DD"
+                            separator="~"
                             :placeholder="['开始日期', '结束日期']"
                             allow-clear
                             style="width: 100%"
-                            @change="(v: any) => row.value = v"
                         />
                         <vort-date-picker
                             v-else-if="row.property === 'startAt' || row.property === 'endAt'"
@@ -383,15 +462,17 @@ const handleCancel = () => {
                         >
                             <SelectOption v-for="o in repoOptions" :key="o.value" :value="o.value">{{ o.label }}</SelectOption>
                         </Select>
-                        <Select
+                        <IterationSelect
                             v-else-if="row.property === 'iteration'"
                             v-model="row.value"
+                            :project-id="iterationProjectId"
+                            :project-ids="selectedProjectIds"
+                            :selected-label="getIterationLabel(row.value)"
                             size="small"
                             placeholder="请选择迭代"
                             allow-clear
-                        >
-                            <SelectOption v-for="o in iterationOptions" :key="o.value" :value="o.value">{{ o.label }}</SelectOption>
-                        </Select>
+                            @options-change="handleIterationOptionsChange"
+                        />
                         <Select
                             v-else-if="row.property === 'version'"
                             v-model="row.value"
@@ -544,11 +625,30 @@ const handleCancel = () => {
 
 .value-editor :deep(.vort-datepicker-selector),
 .value-editor :deep(.vort-rangepicker-selector) {
-    width: 100%;
-    height: 100%;
+    width: 100% !important;
     border: none !important;
     box-shadow: none !important;
     outline: none !important;
+}
+/* Range picker: fixed 32px row height + flex centering so the value stays vertically centered;
+   let start/end inputs size to content to avoid the 80px truncation under the "small" size. */
+.value-editor :deep(.vort-rangepicker-selector) {
+    display: flex !important;
+    align-items: center !important;
+    height: 32px !important;
+    min-height: 32px !important;
+    box-sizing: border-box !important;
+    --_input-width: auto;
+}
+.value-editor :deep(.vort-rangepicker-input) {
+    display: inline-flex !important;
+    align-items: center !important;
+    width: auto;
+    min-width: 0;
+}
+/* Single date picker fills the container height */
+.value-editor :deep(.vort-datepicker-selector) {
+    height: 100% !important;
 }
 .value-editor :deep(.vort-datepicker-focused),
 .value-editor :deep(.vort-rangepicker-focused) {
