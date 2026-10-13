@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -122,13 +122,19 @@ async def update_comment(comment_id: int, body: CommentUpdate, request: Request)
     async with sf() as session:
         c = await session.get(FlowComment, comment_id)
         if not c:
-            return {"error": "评论不存在"}
+            raise HTTPException(status_code=404, detail="评论不存在")
         if c.author_id != member_id:
-            return {"error": "只能编辑自己的评论"}
+            raise HTTPException(status_code=403, detail="只能编辑自己的评论")
+        old_content = c.content or ""
         c.content = body.content
         c.mentions_json = json.dumps(body.mentions or [], ensure_ascii=False)
         await _log_event(session, c.entity_type, c.entity_id, "comment_updated",
-                         {"author_id": member_id, "comment_id": comment_id, "preview": body.content[:100]},
+                         {
+                             "author_id": member_id,
+                             "comment_id": comment_id,
+                             "from": old_content[:200],
+                             "to": (body.content or "")[:200],
+                         },
                          actor_id=member_id)
         await session.commit()
         await session.refresh(c)
@@ -149,13 +155,18 @@ async def delete_comment(comment_id: int, request: Request):
     async with sf() as session:
         c = await session.get(FlowComment, comment_id)
         if not c:
-            return {"error": "评论不存在"}
+            raise HTTPException(status_code=404, detail="评论不存在")
         if c.author_id != member_id:
-            return {"error": "只能删除自己的评论"}
+            raise HTTPException(status_code=403, detail="只能删除自己的评论")
         entity_type = c.entity_type
         entity_id = c.entity_id
+        deleted_preview = (c.content or "")[:200]
         await _log_event(session, entity_type, entity_id, "comment_deleted",
-                         {"author_id": member_id, "comment_id": comment_id},
+                         {
+                             "author_id": member_id,
+                             "comment_id": comment_id,
+                             "preview": deleted_preview,
+                         },
                          actor_id=member_id)
         await session.delete(c)
         await session.commit()

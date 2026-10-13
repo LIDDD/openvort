@@ -1,13 +1,21 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from "vue";
 import { useRouter } from "vue-router";
-import { getCertStats, getCertDomains, checkAllDomains, checkSingleDomain, deleteCertDomain } from "@/api";
+import {
+    getCertStats,
+    getCertDomains,
+    checkAllDomains,
+    checkSingleDomain,
+    probeSingleDomain,
+    deleteCertDomain,
+} from "@/api";
 import { message } from "@openvort/vort-ui";
-import { ShieldCheck, ShieldAlert, ShieldX, Globe, RefreshCw, Plus, Search, Rocket } from "lucide-vue-next";
+import { ShieldCheck, ShieldAlert, ShieldX, ShieldQuestion, Globe, RefreshCw, Plus } from "lucide-vue-next";
 import IssueDialog from "./IssueDialog.vue";
 import CertDetailDrawer from "./CertDetailDrawer.vue";
 import DeployDialog from "./DeployDialog.vue";
 import DeployLogsDrawer from "./DeployLogsDrawer.vue";
+import ProbeResultDialog from "./ProbeResultDialog.vue";
 import dayjs from "dayjs";
 
 const router = useRouter();
@@ -17,7 +25,7 @@ interface Stats {
     ok: number;
     warning: number;
     expired: number;
-    error: number;
+    error?: number;  // legacy field, no longer produced; kept for API compat
     unchecked: number;
 }
 
@@ -32,11 +40,23 @@ interface DomainItem {
     last_check_at: string | null;
 }
 
-const stats = ref<Stats>({ total: 0, ok: 0, warning: 0, expired: 0, error: 0, unchecked: 0 });
+interface ProbeResult {
+    domain: string;
+    status: string;
+    expires_at: string | null;
+    days_remaining: number | null;
+    issuer: string;
+    error_message: string;
+    san_list?: string[];
+    probe_target?: string;
+}
+
+const stats = ref<Stats>({ total: 0, ok: 0, warning: 0, expired: 0, unchecked: 0 });
 const domains = ref<DomainItem[]>([]);
 const loading = ref(false);
 const checkingAll = ref(false);
 const checkingId = ref("");
+const probingId = ref("");
 const keyword = ref("");
 const statusFilter = ref("");
 const issueDialogOpen = ref(false);
@@ -48,6 +68,10 @@ const deployDomainId = ref("");
 const deployDomainName = ref("");
 const deployLogsOpen = ref(false);
 const deployLogsDomainName = ref("");
+const probeDialogOpen = ref(false);
+const probeDomain = ref("");
+const probeLoading = ref(false);
+const probeResult = ref<ProbeResult | null>(null);
 
 const handleViewCert = (domain: DomainItem) => {
     certDrawerDomainId.value = domain.id;
@@ -82,7 +106,9 @@ const filteredDomains = computed(() => {
         const kw = keyword.value.toLowerCase();
         list = list.filter(d => d.domain.toLowerCase().includes(kw) || d.label?.toLowerCase().includes(kw));
     }
-    if (statusFilter.value) {
+    if (statusFilter.value === "__unchecked__") {
+        list = list.filter(d => !d.last_check_status);
+    } else if (statusFilter.value) {
         list = list.filter(d => d.last_check_status === statusFilter.value);
     }
     return list;
@@ -108,10 +134,10 @@ const handleCheckAll = async () => {
     checkingAll.value = true;
     try {
         const res = await checkAllDomains() as any;
-        message.success(`巡检完成，共检查 ${res.checked} 个域名`);
+        message.success(`已刷新 ${res.checked} 个域名状态`);
         await loadData();
     } catch (e) {
-        message.error("巡检失败");
+        message.error("刷新失败");
     } finally {
         checkingAll.value = false;
     }
@@ -121,12 +147,37 @@ const handleCheckSingle = async (domain: DomainItem) => {
     checkingId.value = domain.id;
     try {
         await checkSingleDomain(domain.id);
-        message.success(`${domain.domain} 检查完成`);
+        message.success(`${domain.domain} 已刷新`);
         await loadData();
     } catch (e) {
-        message.error("检查失败");
+        message.error("刷新失败");
     } finally {
         checkingId.value = "";
+    }
+};
+
+const handleProbe = async (domain: DomainItem) => {
+    probingId.value = domain.id;
+    probeDomain.value = domain.domain;
+    probeResult.value = null;
+    probeLoading.value = true;
+    probeDialogOpen.value = true;
+    try {
+        const res = await probeSingleDomain(domain.id) as ProbeResult;
+        probeResult.value = res;
+    } catch (e: any) {
+        const detail = e?.response?.data?.detail;
+        probeResult.value = {
+            domain: domain.domain,
+            status: "error",
+            expires_at: null,
+            days_remaining: null,
+            issuer: "",
+            error_message: typeof detail === "string" ? detail : "在线探测失败",
+        };
+    } finally {
+        probeLoading.value = false;
+        probingId.value = "";
     }
 };
 
@@ -137,6 +188,7 @@ const statusTagColor = (status: string) => {
         critical: "red",
         expired: "red",
         error: "default",
+        "": "default",
     };
     return map[status] || "default";
 };
@@ -145,10 +197,10 @@ const statusLabel = (status: string) => {
     const map: Record<string, string> = {
         ok: "正常",
         warning: "即将到期",
-        critical: "即将到期",
+        critical: "紧急",
         expired: "已过期",
         error: "异常",
-        "": "未检查",
+        "": "未签发",
     };
     return map[status] || status;
 };
@@ -178,7 +230,7 @@ onMounted(loadData);
 <template>
     <div class="space-y-4">
         <!-- Stats Cards -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
             <div class="bg-white rounded-xl border border-gray-100 p-5 hover:shadow-sm transition-shadow">
                 <div class="flex items-center justify-between mb-3">
                     <p class="text-xs text-gray-500 font-medium">域名总数</p>
@@ -215,6 +267,15 @@ onMounted(loadData);
                 </div>
                 <p class="text-2xl font-semibold text-red-500">{{ stats.expired }}</p>
             </div>
+            <div class="bg-white rounded-xl border border-gray-100 p-5 hover:shadow-sm transition-shadow cursor-pointer" @click="statusFilter = statusFilter === '__unchecked__' ? '' : '__unchecked__'">
+                <div class="flex items-center justify-between mb-3">
+                    <p class="text-xs text-gray-500 font-medium">未签发</p>
+                    <div class="w-9 h-9 rounded-lg flex items-center justify-center bg-gradient-to-br from-gray-400 to-gray-500 shadow-sm">
+                        <ShieldQuestion :size="18" class="text-white" />
+                    </div>
+                </div>
+                <p class="text-2xl font-semibold text-gray-500">{{ stats.unchecked }}</p>
+            </div>
         </div>
 
         <!-- Domain Certificate Table -->
@@ -241,9 +302,9 @@ onMounted(loadData);
                 <vort-select v-model="statusFilter" placeholder="状态筛选" allow-clear class="w-[140px]">
                     <vort-select-option value="ok">正常</vort-select-option>
                     <vort-select-option value="warning">即将到期</vort-select-option>
+                    <vort-select-option value="critical">紧急</vort-select-option>
                     <vort-select-option value="expired">已过期</vort-select-option>
-                    <vort-select-option value="error">异常</vort-select-option>
-                    <vort-select-option value="">未检查</vort-select-option>
+                    <vort-select-option value="__unchecked__">未签发</vort-select-option>
                 </vort-select>
             </div>
 
@@ -286,7 +347,7 @@ onMounted(loadData);
                         </span>
                     </template>
                 </vort-table-column>
-                <vort-table-column label="操作" :width="260" fixed="right">
+                <vort-table-column label="操作" :width="320" fixed="right">
                     <template #default="{ row }">
                         <div class="flex items-center gap-2 whitespace-nowrap">
                             <a class="text-sm text-blue-600 cursor-pointer" @click="handleViewCert(row)">证书</a>
@@ -295,11 +356,12 @@ onMounted(loadData);
                             <vort-divider type="vertical" />
                             <a class="text-sm text-blue-600 cursor-pointer" @click="handleViewDeployLogs(row)">日志</a>
                             <vort-divider type="vertical" />
-                            <a
-                                class="text-sm text-blue-600 cursor-pointer"
-                                @click="handleCheckSingle(row)"
-                            >
-                                {{ checkingId === row.id ? '检查中...' : '检查' }}
+                            <a class="text-sm text-blue-600 cursor-pointer" @click="handleCheckSingle(row)">
+                                {{ checkingId === row.id ? '刷新中...' : '刷新' }}
+                            </a>
+                            <vort-divider type="vertical" />
+                            <a class="text-sm text-blue-600 cursor-pointer" @click="handleProbe(row)">
+                                {{ probingId === row.id ? '探测中...' : '探测' }}
                             </a>
                             <vort-divider type="vertical" />
                             <vort-popconfirm title="确认删除该域名？关联的证书和巡检记录也将一并删除。" @confirm="handleDelete(row)">
@@ -336,6 +398,14 @@ onMounted(loadData);
             :open="deployLogsOpen"
             :domain-name="deployLogsDomainName"
             @update:open="deployLogsOpen = $event"
+        />
+
+        <ProbeResultDialog
+            :open="probeDialogOpen"
+            :domain="probeDomain"
+            :loading="probeLoading"
+            :result="probeResult"
+            @update:open="probeDialogOpen = $event"
         />
     </div>
 </template>

@@ -5,7 +5,7 @@
 - admin_schedules_router: /api/admin/schedules — 管理员管理所有任务
 """
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from openvort.web.app import require_auth
@@ -153,7 +153,7 @@ async def update_my_job(request: Request, job_id: str, req: UpdateJobRequest):
     fields = req.model_dump(exclude_none=True)
     job = await service.update_job(job_id, owner_id=member_id, **fields)
     if not job:
-        return {"success": False, "error": "任务不存在或无权限"}
+        raise HTTPException(status_code=404, detail="任务不存在或无权限")
     return {"success": True, "job": job}
 
 
@@ -173,7 +173,7 @@ async def toggle_my_job(request: Request, job_id: str):
     service = _get_service()
     job = await service.toggle_job(job_id, owner_id=member_id)
     if not job:
-        return {"success": False, "error": "任务不存在或无权限"}
+        raise HTTPException(status_code=404, detail="任务不存在或无权限")
     return {"success": True, "job": job}
 
 
@@ -185,7 +185,7 @@ async def run_my_job(request: Request, job_id: str):
     service = _get_service()
     job = await service.get_job(job_id)
     if not job or (job["owner_id"] != member_id and job.get("creator_id", "") != member_id):
-        return {"success": False, "error": "任务不存在或无权限"}
+        raise HTTPException(status_code=404, detail="任务不存在或无权限")
     result = await service.run_now(job_id)
     return result
 
@@ -247,7 +247,7 @@ async def update_any_job(request: Request, job_id: str, req: UpdateJobRequest):
     fields = req.model_dump(exclude_none=True)
     job = await service.update_job(job_id, is_admin=True, **fields)
     if not job:
-        return {"success": False, "error": "任务不存在"}
+        raise HTTPException(status_code=404, detail="任务不存在")
     return {"success": True, "job": job}
 
 
@@ -265,7 +265,7 @@ async def toggle_any_job(job_id: str):
     service = _get_service()
     job = await service.toggle_job(job_id, is_admin=True)
     if not job:
-        return {"success": False, "error": "任务不存在"}
+        raise HTTPException(status_code=404, detail="任务不存在")
     return {"success": True, "job": job}
 
 

@@ -3,6 +3,7 @@
 import os
 import shutil
 import socket
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,6 +22,52 @@ from openvort.cli import (
 DOCKER_PG_CONTAINER = "openvort-postgres"
 DOCKER_PG_IMAGE = "pgvector/pgvector:pg17"
 DOCKER_PG_VOLUME = "openvort-pgdata"
+
+
+def _project_root() -> Path:
+    """Locate the project root containing alembic.ini.
+
+    pyproject.toml 与 alembic.ini 都在仓库根目录;通过 src/openvort/cli/service.py 上溯 4 级。
+    """
+    return Path(__file__).resolve().parents[3]
+
+
+async def _run_alembic_upgrade(database_url: str, log) -> None:
+    """启动期执行 alembic upgrade head,把 schema 推到最新版本。
+
+    设计:
+    - 使用 subprocess 调用 alembic CLI(env.py 内部 asyncio.run,与本协程不冲突)。
+    - 仅当仓库根目录存在 alembic.ini 时执行;在 docker 部署等无源码场景静默跳过。
+    - 失败时打印错误并 SystemExit,避免 schema 不一致导致后续业务异常。
+    """
+    import asyncio
+
+    root = _project_root()
+    alembic_ini = root / "alembic.ini"
+    if not alembic_ini.exists():
+        return
+
+    env = os.environ.copy()
+    env["OPENVORT_DATABASE_URL"] = database_url
+
+    # 用当前 python 解释器调用 alembic,避免依赖 PATH 中的 alembic 可执行文件
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "alembic", "upgrade", "head",
+        cwd=str(root),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    output = stdout.decode().strip() if stdout else ""
+    if proc.returncode != 0:
+        log.error(f"Alembic 数据库迁移失败:\n{output}")
+        raise SystemExit(1)
+
+    if "Running upgrade" in output:
+        for line in output.splitlines():
+            if line.strip():
+                log.info(f"[alembic] {line.strip()}")
 
 
 def _port_is_open(host: str, port: int) -> bool:
@@ -239,6 +286,9 @@ async def _start_service(*, dev: bool = False):
     # 初始化数据库
     await init_db(settings.database_url)
 
+    # Alembic schema 迁移（baseline 之后的增量）
+    await _run_alembic_upgrade(settings.database_url, log)
+
     session_factory = get_session_factory()
 
     # 清理可能由历史 bug 产生的重复 admin 记录
@@ -291,14 +341,17 @@ async def _start_service(*, dev: bool = False):
         log.warning(f"TaskRunner 初始化失败: {e}")
 
     # Initialize NotificationCenter for delayed IM delivery
-    if not dev:
-        try:
-            from openvort.core.services.notification import init_notification_center
-            notif_center = init_notification_center(session_factory, registry)
+    # NotificationCenter 仅依赖 channel_registry 调 ch.send()，并不依赖 channel.start()
+    # 拉起的长连接，因此在 dev 模式下也允许初始化，方便本地测试 VortFlow IM 通知。
+    # 区别仅在于：dev 模式下不做 recover_on_startup（避免把生产堆积的 pending 任务也跑一遍）。
+    try:
+        from openvort.core.services.notification import init_notification_center
+        notif_center = init_notification_center(session_factory, registry)
+        if not dev:
             await notif_center.recover_on_startup()
-            log.info("NotificationCenter 已初始化")
-        except Exception as e:
-            log.warning(f"NotificationCenter 初始化失败: {e}")
+        log.info("NotificationCenter 已初始化" + (" [DEV: skip recover]" if dev else ""))
+    except Exception as e:
+        log.warning(f"NotificationCenter 初始化失败: {e}")
 
     # 加载 Skill（知识注入，DB 驱动）
     from openvort.skill.loader import SkillLoader
@@ -920,6 +973,8 @@ async def _start_service(*, dev: bool = False):
                         skill_loader=skill_loader, config_service=config_service,
                         schedule_service=schedule_service,
                         embedding_service=embedding_service,
+                        asr_service=asr_service,
+                        tts_service=tts_service,
                         marketplace_installer=marketplace_installer)
             install_log_handler()
 

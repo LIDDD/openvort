@@ -5,6 +5,7 @@ import {
     removeVortflowIterationStory, removeVortflowIterationTask, removeVortflowIterationBug,
 } from "@/api";
 import type { RowItem } from "@/components/vort-biz/work-item/WorkItemTable.types";
+import { resolveBugIterationPlanTime } from "../work-item/iterationPlanTime";
 
 export interface UseWorkItemFieldEditorsOptions {
     syncRecordUpdateToApi: (record: RowItem, patch: any) => Promise<void>;
@@ -13,7 +14,13 @@ export interface UseWorkItemFieldEditorsOptions {
     openCellPickerOnBackgroundClick: (record: RowItem, event: Event, openMap: Record<string, boolean>) => void;
     normalizeDateValue: (value: unknown) => string;
     apiProjects: Ref<Array<{ id: string; name: string }>>;
-    apiIterations: Ref<Array<{ id: string; name: string }>>;
+    apiIterations: Ref<Array<{ id: string; name: string; start_date?: unknown; end_date?: unknown }>>;
+    /** 已打开过计划时间编辑器的行缓存；迭代联动时需要同步，避免显示旧日期。 */
+    planTimeModel: Record<string, any>;
+    // Fallback iteration map collected from current table rows. Used when
+    // apiIterations is paginated/scoped and does not contain the row's iteration
+    // (e.g. cross-project work wall). Aligns with iteration filter data source.
+    dynamicIterationOptions?: Ref<Array<{ id: string; name: string; start_date?: unknown; end_date?: unknown }>>;
     getRepoNameById: (repoId?: string) => string;
     loadRepoOptions: () => Promise<void>;
     loadBranchOptions: (repoId?: string) => Promise<void>;
@@ -28,6 +35,8 @@ export function useWorkItemFieldEditors(options: UseWorkItemFieldEditorsOptions)
         normalizeDateValue,
         apiProjects,
         apiIterations,
+        planTimeModel,
+        dynamicIterationOptions,
         getRepoNameById,
         loadRepoOptions,
         loadBranchOptions,
@@ -125,20 +134,50 @@ export function useWorkItemFieldEditors(options: UseWorkItemFieldEditorsOptions)
     };
 
     // --- Iteration ---
-    const iterationPickerOpenMap = reactive<Record<string, boolean>>({});
-
-    const selectRowIteration = async (record: RowItem, iterationId?: string) => {
-        const key = getInteractiveCellKey(record);
+    const selectRowIteration = async (record: RowItem, iterationId?: string, option?: any) => {
         const itemId = String(record.backendId || "").trim();
         if (!itemId) return;
+        const workNo = getInteractiveCellKey(record);
         const prevIterationId = record.iterationId || "";
         const prevIteration = record.iteration || "";
+        const prevPlanStart = record.planTime?.[0] || "";
+        const prevPlanEnd = record.planTime?.[1] || "";
+        const hasCachedPlanTime = Object.prototype.hasOwnProperty.call(planTimeModel, workNo);
+        const prevCachedPlanTime = hasCachedPlanTime && Array.isArray(planTimeModel[workNo])
+            ? [...planTimeModel[workNo]]
+            : undefined;
         const nextIterationId = String(iterationId || "");
-        const nextIteration = apiIterations.value.find(i => i.id === nextIterationId)?.name || "";
+        const optionName = typeof option?.label === "string"
+            ? option.label
+            : (typeof option?.name === "string" ? option.name : "");
+        // Multi-source name lookup: apiIterations 只包含当前已加载的懒分页范围；
+        // 跨项目工作墙上的迭代也可能只存在于当前页收集的 dynamicIterationOptions。
+        // 先回退到后者，避免找不到名称时把 iteration_name 清空。
+        const nextIteration = nextIterationId
+            ? (apiIterations.value.find(i => i.id === nextIterationId)?.name
+                || dynamicIterationOptions?.value.find(i => i.id === nextIterationId)?.name
+                || optionName
+                || (nextIterationId === prevIterationId ? prevIteration : ""))
+            : "";
         record.iterationId = nextIterationId;
         record.iteration = nextIteration;
         record._prevIteration = nextIterationId;
-        iterationPickerOpenMap[key] = false;
+        const iterationPlanTime = resolveBugIterationPlanTime(
+            record.type,
+            nextIterationId,
+            [
+                ...apiIterations.value,
+                ...(dynamicIterationOptions?.value || []),
+            ],
+        );
+        if (iterationPlanTime) {
+            record.planTime = [...iterationPlanTime];
+            record.planStartDate = iterationPlanTime[0];
+            record.planEndDate = iterationPlanTime[1];
+            if (hasCachedPlanTime) {
+                planTimeModel[workNo] = [...iterationPlanTime];
+            }
+        }
         try {
             if (prevIterationId && prevIterationId !== nextIterationId) {
                 if (record.type === "需求") await removeVortflowIterationStory(prevIterationId, itemId);
@@ -150,10 +189,24 @@ export function useWorkItemFieldEditors(options: UseWorkItemFieldEditorsOptions)
                 else if (record.type === "任务") await addVortflowIterationTask(nextIterationId, { task_id: itemId });
                 else if (record.type === "缺陷") await addVortflowIterationBug(nextIterationId, { bug_id: itemId });
             }
+            if (iterationPlanTime && (prevPlanStart !== iterationPlanTime[0] || prevPlanEnd !== iterationPlanTime[1])) {
+                await syncRecordUpdateToApi(record, {
+                    plan_start: iterationPlanTime[0],
+                    deadline: iterationPlanTime[1],
+                });
+            }
         } catch (error: any) {
             record.iterationId = prevIterationId;
             record.iteration = prevIteration;
             record._prevIteration = prevIterationId;
+            record.planTime = [prevPlanStart, prevPlanEnd];
+            record.planStartDate = prevPlanStart;
+            record.planEndDate = prevPlanEnd;
+            if (hasCachedPlanTime) {
+                planTimeModel[workNo] = prevCachedPlanTime || [];
+            } else {
+                delete planTimeModel[workNo];
+            }
             message.error(error?.message || "迭代同步失败");
         }
     };
@@ -298,7 +351,6 @@ export function useWorkItemFieldEditors(options: UseWorkItemFieldEditorsOptions)
         selectRowProgress,
         projectPickerOpenMap,
         selectRowProject,
-        iterationPickerOpenMap,
         selectRowIteration,
         repoPickerOpenMap,
         openRepoPicker,

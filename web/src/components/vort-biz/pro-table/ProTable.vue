@@ -86,9 +86,13 @@ const sortState = ref<SortState>({ field: "", order: null });
 const selectedRowKeys = ref<(string | number)[]>([]);
 
 // ==================== 数据请求 ====================
+// 请求序列号：用于丢弃过期响应，避免并发请求引起的数据回退（race condition）
+let requestSeq = 0;
+
 const fetchData = async () => {
   if (!props.request) return;
 
+  const seq = ++requestSeq;
   internalLoading.value = true;
   try {
     const result = await props.request({
@@ -98,12 +102,16 @@ const fetchData = async () => {
       sortField: sortState.value.field || undefined,
       sortOrder: sortState.value.order || undefined
     });
+    if (seq !== requestSeq) return;
     internalDataSource.value = result.data || [];
     total.value = result.total || 0;
   } catch (error) {
+    if (seq !== requestSeq) return;
     console.error("[ProTable] 请求失败:", error);
   } finally {
-    internalLoading.value = false;
+    if (seq === requestSeq) {
+      internalLoading.value = false;
+    }
   }
 };
 
@@ -502,9 +510,9 @@ const isRowSelected = (record: T, index: number): boolean => {
 };
 
 // ==================== 刷新 ====================
-const handleRefresh = () => {
+const handleRefresh = async () => {
   emit("refresh");
-  fetchData();
+  await fetchData();
 };
 
 // ==================== 列顺序设置 ====================

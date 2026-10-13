@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 
@@ -61,18 +61,18 @@ async def create_work_item_link(body: WorkItemLinkCreate, request: Request):
     src_model = _LINK_TYPE_MODEL.get(body.source_type)
     tgt_model = _LINK_TYPE_MODEL.get(body.target_type)
     if not src_model or not tgt_model:
-        return {"error": "无效的工作项类型"}
+        raise HTTPException(status_code=400, detail="无效的工作项类型")
     if body.source_type == body.target_type and body.source_id == body.target_id:
-        return {"error": "不能关联自身"}
+        raise HTTPException(status_code=400, detail="不能关联自身")
 
     sf = get_session_factory()
     async with sf() as session:
         src = await session.get(src_model, body.source_id)
         if not src:
-            return {"error": "源工作项不存在"}
+            raise HTTPException(status_code=404, detail="源工作项不存在")
         tgt = await session.get(tgt_model, body.target_id)
         if not tgt:
-            return {"error": "目标工作项不存在"}
+            raise HTTPException(status_code=404, detail="目标工作项不存在")
 
         existing = await session.execute(
             select(FlowWorkItemLink).where(
@@ -89,7 +89,7 @@ async def create_work_item_link(body: WorkItemLinkCreate, request: Request):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "关联已存在"}
+            raise HTTPException(status_code=409, detail="关联已存在")
 
         link = FlowWorkItemLink(
             source_type=body.source_type,
@@ -112,7 +112,7 @@ async def delete_work_item_link(link_id: str):
     async with sf() as session:
         link = await session.get(FlowWorkItemLink, link_id)
         if not link:
-            return {"error": "关联不存在"}
+            raise HTTPException(status_code=404, detail="关联不存在")
         await _log_event(session, link.source_type, link.source_id, "link_removed",
                          {"target_type": link.target_type, "target_id": link.target_id})
         await session.delete(link)

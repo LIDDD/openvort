@@ -7,18 +7,19 @@ import VortEditor from "@/components/vort-biz/editor/VortEditor.vue";
 import WorkItemMemberPicker from "@/components/vort-biz/work-item/WorkItemMemberPicker.vue";
 import WorkItemPriority from "@/components/vort-biz/work-item/WorkItemPriority.vue";
 import WorkItemTagPicker from "@/components/vort-biz/work-item/WorkItemTagPicker.vue";
+import IterationSelect, { type IterationSelectOption } from "@/components/vort-biz/work-item/IterationSelect.vue";
 import {
     getVortflowProjects,
     getVortflowStories,
     getVortgitRepos,
     getVortgitRepoBranches,
-    getVortflowIterations,
     getVortflowVersions,
     getVortflowDescriptionTemplates,
     getVortflowTags,
     uploadVortflowFile,
 } from "@/api";
 import { useWorkItemCommon } from "./useWorkItemCommon";
+import { resolveProjectIdFromScope } from "./projectScope";
 import { formatFileSize } from "@/utils/format";
 import type { WorkItemType, Priority, DateRange, NewBugForm, RowItem, AttachmentItem } from "@/components/vort-biz/work-item/WorkItemTable.types";
 
@@ -27,6 +28,8 @@ interface Props {
     title?: string;
     useApi?: boolean;
     projectId?: string;
+    /** 多项目筛选范围；只有恰好一个项目时才自动回填。 */
+    projectIds?: string[];
     parentId?: string;
     parentRecord?: RowItem | null;
     iterationId?: string;
@@ -38,6 +41,7 @@ const props = withDefaults(defineProps<Props>(), {
     title: "新建缺陷",
     useApi: false,
     projectId: "",
+    projectIds: () => [],
     parentId: "",
     iterationId: "",
     initialDraft: null,
@@ -46,6 +50,7 @@ const props = withDefaults(defineProps<Props>(), {
 const emit = defineEmits<{
     close: [];
     success: [data: any];
+    "iteration-options": [options: IterationSelectOption[]];
 }>();
 
 const {
@@ -60,6 +65,9 @@ const {
     getMemberNameById,
     getWorkItemTypeIconClass,
     getWorkItemTypeIcon,
+    getEnrichedOwnerGroups,
+    defaultCollapsedGroups,
+    recordRecentMember,
 } = useWorkItemCommon();
 
 const FALLBACK_TEMPLATES: Record<WorkItemType, string> = {
@@ -85,19 +93,30 @@ const todayStr = (): string => {
     return `${y}-${m}-${dd}`;
 };
 
+// 工作墙带入的当前迭代只保存 ID，不依赖首屏迭代列表是否已加载。
+const resolveInitialIteration = (draftIteration?: string): string => {
+    if (props.iterationId && props.iterationId !== "__unplanned__") {
+        return props.iterationId;
+    }
+    return draftIteration || "";
+};
+
 const createInitialBugForm = (): NewBugForm => ({
     title: "",
     owner: "",
     collaborators: [],
     type: props.type,
     planTime: [],
-    project: "VortMall",
-    projectId: props.projectId || "",
-    iteration: "",
+    // API 模式下不再用演示项目或接口第一项作为隐式默认值；
+    // 单项目上下文由 projectId/projectIds 显式提供。
+    project: props.useApi ? "" : "VortMall",
+    projectId: resolveProjectIdFromScope(props.projectIds, props.projectId),
+    iteration: resolveInitialIteration(),
     version: "",
     parentId: props.parentId || "",
     storyId: "",
     priority: "" as any,
+    priorityScore: undefined,
     tags: [],
     attachments: [],
     repo: "",
@@ -108,19 +127,12 @@ const createInitialBugForm = (): NewBugForm => ({
     description: getDescriptionTemplate(props.type)
 });
 
-// Iteration prop wins over draft value, so switching sidebar iteration before
-// reopening the create drawer always reflects the current iteration context.
-const resolveInitialIteration = (draftIteration?: string): string => {
-    if (props.iterationId && props.iterationId !== "__unplanned__") {
-        return props.iterationId;
-    }
-    return draftIteration || "";
-};
-
 const mergeDraftIntoForm = (draft: NewBugForm): NewBugForm => ({
     ...createInitialBugForm(),
     ...draft,
-    projectId: props.projectId || draft.projectId || "",
+    // 显式项目/单项目上下文优先；多项目/全部项目仍保留草稿中的项目，
+    // 这样用户手动填写过的草稿不会被上下文切换抹掉。
+    projectId: resolveProjectIdFromScope(props.projectIds, props.projectId) || draft.projectId || "",
     parentId: props.parentId || draft.parentId || "",
     iteration: resolveInitialIteration(draft.iteration),
 });
@@ -216,6 +228,13 @@ const branchSelectOptions = computed(() => (props.useApi ? apiBranches.value : s
 const iterationSelectOptions = computed(() => (props.useApi ? apiIterations.value : staticIterationOptions));
 const versionSelectOptions = computed(() => (props.useApi ? apiVersions.value : staticVersionOptions));
 
+const currentIterationSelectLabel = computed(() => {
+    const id = String(createBugForm.iteration || "");
+    if (!id || id === "__unplanned__") return "";
+    // 已加载分页优先显示后端名称；尚未打开下拉时至少保留 ID，避免上下文迭代被误认为未设置。
+    return apiIterations.value.find((item) => item.id === id)?.name || id;
+});
+
 type MemberSearchMeta = {
     normalizedName: string;
     fullPinyin: string;
@@ -293,17 +312,32 @@ const currentIterationOwnerName = computed(() => {
     return getMemberNameById(iter.owner_id || "") || "";
 });
 
+const enrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const enrichedCollapsed = ref<string[]>([]);
+
+const refreshEnrichedGroups = async () => {
+    const projectId = createBugForm.projectId || props.projectId || "";
+    const groups = await getEnrichedOwnerGroups(projectId);
+    enrichedGroups.value = groups;
+    enrichedCollapsed.value = defaultCollapsedGroups(groups);
+};
+
+const activeOwnerGroups = computed(() => {
+    return enrichedGroups.value.length > 0 ? enrichedGroups.value : ownerGroups.value;
+});
+
 const prioritizedOwnerGroups = computed(() => {
+    const base = activeOwnerGroups.value;
     const suggested = currentIterationOwnerName.value;
-    if (!suggested) return ownerGroups.value;
-    const baseGroups = ownerGroups.value
+    if (!suggested) return base;
+    const allNames = new Set(base.flatMap((g) => g.members));
+    if (!allNames.has(suggested)) return base;
+    const baseGroups = base
         .map((group) => ({
             label: group.label,
             members: group.members.filter((member) => member !== suggested),
         }))
         .filter((group) => group.members.length > 0);
-    const hasSuggested = ownerGroups.value.some((group) => group.members.includes(suggested));
-    if (!hasSuggested) return ownerGroups.value;
     return [
         { label: SUGGESTED_OWNER_GROUP_LABEL, members: [suggested] },
         ...baseGroups,
@@ -370,10 +404,43 @@ const toggleCreateCollaborator = (member: string) => {
     createBugForm.collaborators = list;
 };
 
+const PRIORITY_DEFAULT_SCORES: Record<Priority, number> = {
+    urgent: 80,
+    high: 60,
+    medium: 40,
+    low: 20,
+    none: 0,
+};
+
 const selectCreateBugPriority = (value: Priority) => {
     createBugForm.priority = value;
+    // 切换等级时把精排分数重置为段起始值
+    createBugForm.priorityScore = PRIORITY_DEFAULT_SCORES[value];
     createBugPriorityDropdownOpen.value = false;
 };
+
+const handleCreateBugPriorityScoreChange = (score: number) => {
+    const normalized = Math.max(0, Math.min(100, Math.round(score)));
+    createBugForm.priorityScore = normalized;
+    // 派生等级
+    const level: Priority = normalized >= 80 ? "urgent"
+        : normalized >= 60 ? "high"
+        : normalized >= 40 ? "medium"
+        : normalized >= 20 ? "low"
+        : "none";
+    createBugForm.priority = level;
+};
+
+const createBugPriorityDisplay = computed<{ text: string; level: Priority }>(() => {
+    const level = (createBugForm.priority || "") as Priority | "";
+    if (!level) return { text: "请选择", level: "none" };
+    const defaultScore = PRIORITY_DEFAULT_SCORES[level];
+    const score = createBugForm.priorityScore;
+    if (score == null || score === defaultScore) {
+        return { text: priorityLabelMap[level], level };
+    }
+    return { text: `${priorityLabelMap[level]} ${score}`, level };
+});
 
 const toggleCreateBugPriorityMenu = () => {
     createBugPriorityDropdownOpen.value = !createBugPriorityDropdownOpen.value;
@@ -430,14 +497,18 @@ const isStoryOptionValid = (storyId?: string): boolean => {
 };
 
 const resolveSelectedProjectId = (): string => {
-    if (!apiProjects.value.length) return createBugForm.projectId || props.projectId || "";
+    const contextProjectId = resolveProjectIdFromScope(props.projectIds, props.projectId);
+    if (!apiProjects.value.length) return createBugForm.projectId || contextProjectId || "";
     const selected = String(createBugForm.project || "").trim();
     const match = apiProjects.value.find((item) => item.name === selected || item.id === selected);
     if (match) return match.id;
     if (createBugForm.projectId && apiProjects.value.some((item) => item.id === createBugForm.projectId)) {
         return createBugForm.projectId;
     }
-    return props.projectId || apiProjects.value[0]?.id || "";
+    if (contextProjectId && apiProjects.value.some((item) => item.id === contextProjectId)) {
+        return contextProjectId;
+    }
+    return "";
 };
 
 const loadApiProjects = async () => {
@@ -447,9 +518,15 @@ const loadApiProjects = async () => {
         id: String(item.id || ""),
         name: String(item.name || item.id || ""),
     })).filter((item) => item.id && item.name);
-    const initialProjectId = props.projectId || createBugForm.projectId || apiProjects.value[0]?.id || "";
-    if (!initialProjectId) return;
-    const matchedProject = apiProjects.value.find((item) => item.id === initialProjectId) || apiProjects.value[0];
+    const contextProjectId = resolveProjectIdFromScope(props.projectIds, props.projectId);
+    const initialProjectId = contextProjectId || createBugForm.projectId || "";
+    const selectedProjectName = String(createBugForm.project || "").trim();
+    const matchedProject = (initialProjectId
+        ? apiProjects.value.find((item) => item.id === initialProjectId)
+        : undefined)
+        || (selectedProjectName
+            ? apiProjects.value.find((item) => item.name === selectedProjectName || item.id === selectedProjectName)
+            : undefined);
     if (!matchedProject) return;
     createBugForm.projectId = matchedProject.id;
     createBugForm.project = matchedProject.name;
@@ -538,38 +615,31 @@ const loadBranches = async (repoId?: string) => {
     }
 };
 
-const loadIterations = async () => {
-    if (!props.useApi) return;
-    const selectedProjectId = resolveSelectedProjectId();
-    if (!selectedProjectId) {
-        apiIterations.value = [];
-        createBugForm.iteration = "";
-        return;
-    }
-    const res: any = await getVortflowIterations({
-        project_id: selectedProjectId,
-        page: 1,
-        page_size: 100,
-    });
-    apiIterations.value = ((res?.items || []) as any[])
-        .map((item) => ({
-            id: String(item.id || ""),
-            name: String(item.name || item.id || ""),
-            start_date: item.start_date || "",
-            end_date: item.end_date || "",
+const resetIterationOptions = () => {
+    apiIterations.value = [];
+};
+
+const handleIterationOptionsChange = (options: IterationSelectOption[]) => {
+    const merged = new Map(apiIterations.value.map((item) => [item.id, item]));
+    for (const item of options || []) {
+        const id = String(item?.id || "");
+        const name = String(item?.name || "");
+        if (!id || !name) continue;
+        merged.set(id, {
+            id,
+            name,
+            start_date: String(item.start_date || ""),
+            end_date: String(item.end_date || ""),
             owner_id: String(item.owner_id || ""),
             owner_name: String(item.owner_name || ""),
-        }))
-        .filter((item) => item.id && item.name);
-    if (createBugForm.iteration && !apiIterations.value.some((item) => item.id === createBugForm.iteration)) {
-        createBugForm.iteration = "";
+        });
     }
-    // Pre-select iteration from prop (skip special __unplanned__ value)
-    if (!createBugForm.iteration && props.iterationId && props.iterationId !== "__unplanned__") {
-        if (apiIterations.value.some((item) => item.id === props.iterationId)) {
-            createBugForm.iteration = props.iterationId;
-        }
+    apiIterations.value = [...merged.values()];
+    if (createBugForm.iteration) {
+        // 当前上下文迭代可能在列表懒加载前已预选；选项补齐后再尝试同步计划日期。
+        fillPlanTimeFromIteration(createBugForm.iteration);
     }
+    emit("iteration-options", options || []);
 };
 
 const loadVersions = async () => {
@@ -596,28 +666,51 @@ const loadVersions = async () => {
     }
 };
 
-const loadProjectLinkedOptions = async (resetSelections = false) => {
+const loadProjectLinkedOptions = async (resetSelections = false, preserveContextIteration = false) => {
     if (!props.useApi) return;
+    resetIterationOptions();
     if (resetSelections) {
         createBugForm.iteration = "";
         createBugForm.version = "";
         createBugForm.repo = "";
         createBugForm.branch = "";
         apiBranches.value = [];
+        if (preserveContextIteration) {
+            createBugForm.iteration = resolveInitialIteration();
+        }
     }
     await Promise.all([
         loadParentStoryOptions(),
         loadRepos(),
-        loadIterations(),
         loadVersions(),
     ]);
+};
+
+// vort-range-picker v-model 是 [Date | null, Date | null]，不支持 valueFormat。
+// 这里把 Date 对象统一格式化成 YYYY-MM-DD 字符串后再写回 form，避免后端解析失败。
+const toDateString = (value: unknown): string => {
+    if (value instanceof Date && !isNaN(value.getTime())) {
+        const y = value.getFullYear();
+        const m = String(value.getMonth() + 1).padStart(2, "0");
+        const d = String(value.getDate()).padStart(2, "0");
+        return `${y}-${m}-${d}`;
+    }
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+        const parsed = new Date(trimmed);
+        if (!Number.isNaN(parsed.getTime())) return toDateString(parsed);
+    }
+    return "";
 };
 
 const createBugPlanTimeModel = computed<any>({
     get: () => (createBugForm.planTime.length === 2 ? [...createBugForm.planTime] as DateRange : undefined),
     set: (value) => {
         if (Array.isArray(value) && value.length === 2) {
-            createBugForm.planTime = [String(value[0] || ""), String(value[1] || "")] as DateRange;
+            const start = toDateString(value[0]);
+            const end = toDateString(value[1]);
+            createBugForm.planTime = [start, end] as DateRange;
             return;
         }
         createBugForm.planTime = [];
@@ -642,14 +735,10 @@ const toggleCreateTagOption = (tag: string) => {
 
 const resetForm = () => {
     Object.assign(createBugForm, createInitialBugForm());
-    if (props.projectId) {
-        createBugForm.projectId = props.projectId;
-    }
     if (props.useApi && apiProjects.value.length > 0) {
         const matchedProject =
             apiProjects.value.find((item) => item.id === createBugForm.projectId)
-            || apiProjects.value.find((item) => item.name === createBugForm.project)
-            || apiProjects.value[0];
+            || apiProjects.value.find((item) => item.name === createBugForm.project);
         if (matchedProject) {
             createBugForm.projectId = matchedProject.id;
             createBugForm.project = matchedProject.name;
@@ -662,9 +751,8 @@ const resetForm = () => {
         }
     }
     if (props.iterationId && props.iterationId !== "__unplanned__") {
-        if (apiIterations.value.some((item) => item.id === props.iterationId)) {
-            createBugForm.iteration = props.iterationId;
-        }
+        // 迭代选项改为用户打开下拉后懒加载，不能再依赖已加载列表决定是否保留上下文 ID。
+        createBugForm.iteration = props.iterationId;
     }
 };
 
@@ -688,8 +776,18 @@ const submitForm = (): NewBugForm | null => {
         message.warning("请填写标题");
         return null;
     }
+    // 选项变更的 watcher 可能尚未刷新时，提交也要把当前项目名称解析成
+    // ID，避免界面已选项目但请求仍携带旧的空 projectId。
+    const selectedProjectId = resolveSelectedProjectId();
+    // 需求后端必须归属项目；多项目/全部项目范围下不自动猜测首个项目，
+    // 由用户在表单中明确选择后再提交，避免生成无项目的需求数据。
+    if (props.useApi && currentCreateType.value === "需求" && !selectedProjectId) {
+        message.warning("请先选择关联项目");
+        return null;
+    }
     return {
         ...createBugForm,
+        projectId: selectedProjectId || createBugForm.projectId || "",
         collaborators: [...createBugForm.collaborators],
         planTime: resolvePlanTime(),
         tags: [...createBugForm.tags],
@@ -738,6 +836,7 @@ onMounted(async () => {
     } catch { /* use fallback */ }
 
     await loadMemberOptions();
+    refreshEnrichedGroups();
     await loadTagDefinitions();
     if (props.useApi) {
         await loadApiProjects();
@@ -755,21 +854,44 @@ watch(() => props.parentId, (value) => {
     }
 });
 
-watch(() => props.projectId, async (value) => {
-    if (!value) return;
-    createBugForm.projectId = value;
-    const match = apiProjects.value.find((item) => item.id === value);
-    if (match && createBugForm.project !== match.name) {
-        createBugForm.project = match.name;
+watch(() => props.iterationId, (value, oldValue) => {
+    const next = value && value !== "__unplanned__" ? value : "";
+    // 仅同步仍跟随旧上下文（或尚未填写）的表单，避免用户在抽屉内手动选择后
+    // 切换工作墙迭代时被覆盖；下一次打开时仍能带入新的当前迭代。
+    if (!createBugForm.iteration || createBugForm.iteration === oldValue) {
+        createBugForm.iteration = next;
     }
-    await loadProjectLinkedOptions(true);
 });
+
+watch(
+    () => `${props.projectId || ""}|${(props.projectIds || []).filter(Boolean).join(",")}`,
+    async () => {
+        const contextProjectId = resolveProjectIdFromScope(props.projectIds, props.projectId);
+        if (contextProjectId) {
+            createBugForm.projectId = contextProjectId;
+            const match = apiProjects.value.find((item) => item.id === contextProjectId);
+            if (match && createBugForm.project !== match.name) {
+                createBugForm.project = match.name;
+            }
+        } else {
+            // 多项目/全部项目没有唯一默认项目；仅当没有草稿项目时清理旧上下文。
+            const draftHasProject = Boolean(props.initialDraft?.projectId || props.initialDraft?.project);
+            if (!draftHasProject) {
+                createBugForm.projectId = "";
+                if (props.useApi) createBugForm.project = "";
+            }
+        }
+        refreshEnrichedGroups();
+        await loadProjectLinkedOptions(true, true);
+    },
+);
 
 watch(() => createBugForm.project, async (_value, oldValue) => {
     if (!props.useApi) return;
     const previousProjectId = createBugForm.projectId;
     createBugForm.projectId = resolveSelectedProjectId();
     const projectChanged = oldValue !== undefined && previousProjectId !== createBugForm.projectId;
+    if (projectChanged) resetIterationOptions();
     await loadProjectLinkedOptions(projectChanged);
 });
 
@@ -853,8 +975,9 @@ watch(() => createBugForm.repo, async (value, oldValue) => {
                             :get-avatar-url="getMemberAvatarUrl"
                             :filter-score="getMemberKeywordScore"
                             @update:open="(open) => { createAssigneeDropdownOpen = open; if (!open) createAssigneeKeyword = ''; }"
-                            @update:owner="(value) => { createBugForm.owner = value; }"
-                            @update:collaborators="(value) => { createBugForm.collaborators = value; }"
+                            :default-collapsed="enrichedCollapsed"
+                            @update:owner="(value) => { createBugForm.owner = value; if (value) recordRecentMember(value); }"
+                            @update:collaborators="(value) => { createBugForm.collaborators = value; value.forEach(recordRecentMember); }"
                         >
                             <template #trigger="{ open }">
                                 <div
@@ -955,7 +1078,6 @@ watch(() => createBugForm.repo, async (value, oldValue) => {
                     <label class="create-bug-label">计划时间</label>
                     <vort-range-picker
                         v-model="createBugPlanTimeModel"
-                        value-format="YYYY-MM-DD"
                         format="YYYY-MM-DD"
                         separator="~"
                         :placeholder="['未设置', '未设置']"
@@ -972,7 +1094,16 @@ watch(() => createBugForm.repo, async (value, oldValue) => {
             <div class="create-bug-row">
                 <div class="create-bug-field">
                     <label class="create-bug-label">迭代</label>
-                    <vort-select v-model="createBugForm.iteration" placeholder="选择迭代" allow-clear>
+                    <IterationSelect
+                        v-if="props.useApi"
+                        v-model="createBugForm.iteration"
+                        :project-id="resolveSelectedProjectId()"
+                        :selected-label="currentIterationSelectLabel"
+                        placeholder="选择迭代"
+                        allow-clear
+                        @options-change="handleIterationOptionsChange"
+                    />
+                    <vort-select v-else v-model="createBugForm.iteration" placeholder="选择迭代" allow-clear>
                         <vort-select-option v-for="item in iterationSelectOptions" :key="item.id" :value="item.id">{{ item.name }}</vort-select-option>
                     </vort-select>
                 </div>
@@ -997,9 +1128,12 @@ watch(() => createBugForm.repo, async (value, oldValue) => {
                 <label class="create-bug-label">优先级</label>
                 <WorkItemPriority
                     :model-value="(createBugForm.priority || 'none') as Priority"
+                    :score="createBugForm.priorityScore"
+                    :enable-score-slider="true"
                     :open="createBugPriorityDropdownOpen"
                     @update:open="(open) => { createBugPriorityDropdownOpen = open; }"
                     @change="selectCreateBugPriority"
+                    @change-score="handleCreateBugPriorityScoreChange"
                 >
                     <template #default>
                         <div
@@ -1011,9 +1145,9 @@ watch(() => createBugForm.repo, async (value, oldValue) => {
                             <span
                                 v-if="createBugForm.priority"
                                 class="priority-pill"
-                                :class="priorityClassMap[createBugForm.priority]"
+                                :class="priorityClassMap[createBugPriorityDisplay.level]"
                             >
-                                {{ priorityLabelMap[createBugForm.priority] }}
+                                {{ createBugPriorityDisplay.text }}
                             </span>
                             <span v-else class="text-[var(--vort-text-quaternary,rgba(0,0,0,0.25))]">请选择</span>
                             <span class="vort-select-arrow ml-auto" :class="{ 'vort-select-arrow-open': createBugPriorityDropdownOpen }">

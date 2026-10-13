@@ -209,7 +209,10 @@ const handleMouseUp = () => { isDragging.value = false; };
 
 const handleKeydown = (e: KeyboardEvent) => {
     if (!previewVisible.value) return;
-    if (e.key === "Escape") closePreview();
+    if (e.key === "Escape") {
+        e.stopImmediatePropagation();
+        closePreview();
+    }
     else if (e.key === "ArrowLeft") prevImage();
     else if (e.key === "ArrowRight") nextImage();
 };
@@ -219,13 +222,13 @@ const teleportTo = computed(() => getVortTeleportTo());
 watch(html, () => { nextTick(() => { collectImages(); renderMermaid(); scrollToHash(); }); });
 onMounted(() => {
     nextTick(() => { collectImages(); renderMermaid(); scrollToHash(); });
-    document.addEventListener("keydown", handleKeydown);
+    document.addEventListener("keydown", handleKeydown, true);
     document.addEventListener("mousemove", handleMouseMove);
     document.addEventListener("mouseup", handleMouseUp);
     window.addEventListener("hashchange", handleHashChange);
 });
 onUnmounted(() => {
-    document.removeEventListener("keydown", handleKeydown);
+    document.removeEventListener("keydown", handleKeydown, true);
     document.removeEventListener("mousemove", handleMouseMove);
     document.removeEventListener("mouseup", handleMouseUp);
     window.removeEventListener("hashchange", handleHashChange);

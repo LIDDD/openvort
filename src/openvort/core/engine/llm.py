@@ -443,7 +443,10 @@ class OpenAICompatibleProvider(LLMProvider):
                 args = {}
             content.append(ToolUseBlock(id=tc.get("id", ""), name=fn.get("name", ""), input=args))
         stop = choice.get("finish_reason", "stop")
-        stop_reason = "tool_use" if stop == "tool_calls" else "end_turn"
+        if stop == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "tool_use" if stop == "tool_calls" else "end_turn"
         usage_data = data.get("usage", {})
         cached = (usage_data.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         usage = Usage(
@@ -464,6 +467,7 @@ class OpenAIStreamWrapper:
         self._response = None
         self._final_content: list = []
         self._final_usage = Usage()
+        self._truncated = False
 
     async def __aenter__(self):
         self._response = self._http.stream("POST", self._url, json=self._body)
@@ -505,6 +509,8 @@ class OpenAIStreamWrapper:
                 if chunk.get("usage"):
                     self._final_usage = self._parse_stream_usage(chunk["usage"])
                 continue
+            if choices[0].get("finish_reason") == "length":
+                self._truncated = True
             delta = choices[0].get("delta", {})
             if delta.get("content"):
                 current_text += delta["content"]
@@ -546,7 +552,10 @@ class OpenAIStreamWrapper:
         )
 
     async def get_final_message(self) -> LLMResponse:
-        stop = "tool_use" if any(isinstance(b, ToolUseBlock) for b in self._final_content) else "end_turn"
+        if self._truncated:
+            stop = "max_tokens"
+        else:
+            stop = "tool_use" if any(isinstance(b, ToolUseBlock) for b in self._final_content) else "end_turn"
         return LLMResponse(content=self._final_content, stop_reason=stop, usage=self._final_usage)
 
 
@@ -694,6 +703,7 @@ class OpenAIResponsesStreamWrapper:
         self._response = None
         self._final_content: list = []
         self._final_usage = Usage()
+        self._truncated = False
 
     async def __aenter__(self):
         self._response = self._http.stream("POST", self._url, json=self._body)
@@ -761,8 +771,12 @@ class OpenAIResponsesStreamWrapper:
                         delta=InputJsonDelta(partial_json=delta_args)
                     )
 
-            elif ev_type == "response.completed":
+            elif ev_type in ("response.completed", "response.incomplete"):
                 resp_data = ev.get("response", {})
+                if ev_type == "response.incomplete":
+                    reason = (resp_data.get("incomplete_details") or {}).get("reason", "")
+                    if reason == "max_output_tokens":
+                        self._truncated = True
                 usage_data = resp_data.get("usage", {})
                 cached = (
                     (usage_data.get("input_tokens_details") or {})
@@ -789,7 +803,10 @@ class OpenAIResponsesStreamWrapper:
 
     async def get_final_message(self) -> LLMResponse:
         has_tool_use = any(isinstance(b, ToolUseBlock) for b in self._final_content)
-        stop = "tool_use" if has_tool_use else "end_turn"
+        if self._truncated:
+            stop = "max_tokens"
+        else:
+            stop = "tool_use" if has_tool_use else "end_turn"
         return LLMResponse(
             content=self._final_content, stop_reason=stop, usage=self._final_usage,
         )

@@ -4,7 +4,7 @@ import asyncio
 import time
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from openvort.utils.logging import get_logger
@@ -90,7 +90,7 @@ async def update_model(model_id: str, req: ModelUpdateRequest):
             target = item
             break
     if not target:
-        return {"success": False, "error": "模型不存在"}
+        raise HTTPException(status_code=404, detail="模型不存在")
 
     updates = req.model_dump(exclude_unset=True)
     if "api_key" in updates and (updates["api_key"] is None or "***" in str(updates["api_key"])):
@@ -107,16 +107,16 @@ async def delete_model(model_id: str):
     config_service = get_config_service()
     primary_model_id, fallback_model_ids = await config_service.get_llm_model_selection()
     if model_id == primary_model_id or model_id in fallback_model_ids:
-        return {"success": False, "error": "模型正在被主模型或备选模型引用，请先在系统设置中解绑"}
+        raise HTTPException(status_code=409, detail="模型正在被主模型或备选模型引用，请先在系统设置中解绑")
 
     cli_cfg = await config_service.get_cli_config()
     if model_id == cli_cfg["cli_primary_model_id"] or model_id in cli_cfg["cli_fallback_model_ids"]:
-        return {"success": False, "error": "模型正在被 AI 编码配置引用，请先在系统设置中解绑"}
+        raise HTTPException(status_code=409, detail="模型正在被 AI 编码配置引用，请先在系统设置中解绑")
 
     models = await config_service.get_llm_models()
     new_models = [item for item in models if item.get("id") != model_id]
     if len(new_models) == len(models):
-        return {"success": False, "error": "模型不存在"}
+        raise HTTPException(status_code=404, detail="模型不存在")
     await config_service.save_llm_models(new_models)
     return {"success": True}
 

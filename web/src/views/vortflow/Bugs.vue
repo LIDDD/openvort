@@ -14,7 +14,7 @@ const { activeViewFilters } = useVortFlowViews("缺陷");
         create-button-text="+ 新建缺陷"
         create-drawer-title="新建缺陷"
         detail-drawer-title="缺陷详情"
-        :project-id="store.selectedProjectId"
+        :project-ids="store.selectedProjectIds"
         :view-filters="activeViewFilters"
         use-api
     />

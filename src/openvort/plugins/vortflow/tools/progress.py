@@ -18,10 +18,15 @@ class UpdateProgressTool(BaseTool):
     name = "vortflow_update_progress"
     description = (
         "推进 VortFlow 中需求/任务/缺陷的状态。"
-        "需求状态流: submitted → intake → review → pm_refine → design → design_done → breakdown → dev_assign → in_progress → testing → done。"
-        "submitted 可直接到 rejected。review 可驳回到 rejected，rejected 可回到 submitted。testing 可进入 bugfix 循环。"
-        "任务状态: todo → in_progress → done → closed。"
-        "缺陷状态: open → confirmed → fixing → resolved → verified → closed。"
+        "合法状态枚举（按实体类型）："
+        "需求 = submitted | intake | review | rejected | pm_refine | design | design_done | "
+        "pending_dev | breakdown | dev_assign | in_progress | dev_done | pending_test | "
+        "testing | bugfix | test_done | regression | pending_release | released | done；"
+        "任务 = todo | in_progress | done | closed；"
+        "缺陷 = open | confirmed | fixing | resolved | verified | closed | reopened | "
+        "not_reproducible | by_design | deferred | suspended。"
+        "状态机会自动校验合法转换，非法转换会返回 allowed 列表（当前状态可推进到的目标状态），"
+        "按返回的 allowed 选下一步即可，无需事先记忆完整流转图。"
     )
     required_permission = "vortflow.story"
 

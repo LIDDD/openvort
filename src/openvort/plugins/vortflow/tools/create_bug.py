@@ -182,6 +182,8 @@ class CreateBugTool(BaseTool):
                 description=description,
                 severity=severity,
                 assignee_id=assignee_id,
+                # developer_id 与 assignee_id 双轨；统一以 assignee_id 为权威，新建时同步覆盖避免分叉。
+                developer_id=assignee_id,
                 reporter_id=member_id or None,
             )
             session.add(b)

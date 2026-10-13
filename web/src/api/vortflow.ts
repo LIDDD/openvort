@@ -1,9 +1,70 @@
 import request from "@/utils/request";
+import { fetchAllPages, type PaginatedItems } from "./iterationOptions";
 
 // ---- Dashboard ----
 
-export function getVortflowStats(project_id?: string) {
-    return request.get("/vortflow/dashboard/stats", { params: project_id ? { project_id } : {} });
+export function getVortflowStats(project_id?: string, project_ids?: string) {
+    const params: Record<string, string> = {};
+    if (project_ids) params.project_ids = project_ids;
+    else if (project_id) params.project_id = project_id;
+    return request.get("/vortflow/dashboard/stats", { params });
+}
+
+/** 单成员工作量聚合（成员关注面板用）。后端 dashboard.py members_workload */
+export interface MemberWorkloadItem {
+    member_id: string;
+    /** 在手未完成总数 */
+    pending_total: number;
+    /** 按工作项类型拆分的在手数 */
+    by_type: { story: number; task: number; bug: number };
+    /** 逾期数（需求仅统计待测试前；任务/缺陷统计未完成，且 deadline < 今日 0 点） */
+    overdue: number;
+    /** 即将到期数（今日 0 点 <= deadline < 今日 0 点 + due_soon_days+1 天） */
+    due_soon: number;
+    /** 紧急/严重数（需求 priority∈1,2，缺陷 severity∈1,2） */
+    urgent: number;
+
+    /** 最近 velocity_days 天完成数（按 end_at 落地） */
+    completed_recent: number;
+    /** 上一个 velocity_days 天完成数（同比基线） */
+    completed_prev: number;
+    /** 个人平均流转天数（end_at - start_at） */
+    avg_lead_time_days: number;
+    /** 本批成员的团队均值流转天数（同窗口、同过滤） */
+    team_avg_lead_time_days: number;
+
+    /**
+     * 在手项中超过 stale_days 没有 Event/Comment 且 **未逾期** 的数量。
+     * 注意：与 overdue 互斥，已逾期项不会重复计入此处。
+     */
+    stale_count: number;
+
+    /** 长度 history_days 的活动数组（旧→新），FlowEvent + FlowComment 每日总数 */
+    activity_7d: number[];
+    /** 长度 history_days 的在手数估算（旧→新） */
+    pending_history_7d: number[];
+    /** 长度 history_days 的每日完成数（旧→新） */
+    daily_completed?: number[];
+    /** 长度 history_days 的每日新增数（旧→新） */
+    daily_created?: number[];
+    /** 长度 forecast_days 的未来每日到期数（明天→远期） */
+    future_due?: number[];
+    /** 长度 forecast_days 的未来每日累计逾期数（含当前已逾期，明天→远期） */
+    future_overdue_cumulative?: number[];
+}
+
+export function getVortflowMembersWorkload(params: {
+    member_ids: string;
+    project_id?: string;
+    project_ids?: string;
+    iteration_id?: string;
+    due_soon_days?: number;
+    history_days?: number;
+    forecast_days?: number;
+    velocity_days?: number;
+    stale_days?: number;
+}): Promise<MemberWorkloadItem[]> {
+    return request.get("/vortflow/members/workload", { params });
 }
 
 // ---- Projects ----
@@ -18,7 +79,7 @@ export function getVortflowProject(id: string) {
 
 export function createVortflowProject(data: {
     name: string; code?: string; color?: string; description?: string;
-    product?: string; start_date?: string; end_date?: string;
+    start_date?: string; end_date?: string;
     owner_id?: string; member_ids?: string[]; repo_ids?: string[];
 }) {
     return request.post("/vortflow/projects", data);
@@ -26,7 +87,7 @@ export function createVortflowProject(data: {
 
 export function updateVortflowProject(id: string, data: {
     name?: string; code?: string; color?: string; description?: string;
-    product?: string; start_date?: string; end_date?: string;
+    start_date?: string; end_date?: string;
     owner_id?: string;
 }) {
     return request.put(`/vortflow/projects/${id}`, data);
@@ -34,6 +95,14 @@ export function updateVortflowProject(id: string, data: {
 
 export function deleteVortflowProject(id: string) {
     return request.delete(`/vortflow/projects/${id}`);
+}
+
+export function starVortflowProject(id: string) {
+    return request.put(`/vortflow/projects/${id}/star`);
+}
+
+export function unstarVortflowProject(id: string) {
+    return request.delete(`/vortflow/projects/${id}/star`);
 }
 
 export function getVortflowProjectMembers(projectId: string) {
@@ -54,7 +123,7 @@ export function removeVortflowProjectMember(projectId: string, memberId: string)
 
 // ---- Stories ----
 
-export function getVortflowStories(params: { project_id?: string; state?: string; keyword?: string; priority?: number; parent_id?: string; submitter_id?: string; assignee_id?: string; pm_id?: string; participant_id?: string; iteration_id?: string; archived?: boolean; sort_by?: string; sort_order?: string; page?: number; page_size?: number }) {
+export function getVortflowStories(params: { project_id?: string; project_ids?: string; state?: string; keyword?: string; priority?: number; parent_id?: string; submitter_id?: string; assignee_id?: string; pm_id?: string; participant_id?: string; iteration_id?: string; archived?: boolean; include_archived?: boolean; sort_by?: string; sort_order?: string; page?: number; page_size?: number }) {
     return request.get("/vortflow/stories", { params });
 }
 
@@ -62,7 +131,7 @@ export function getVortflowStory(id: string) {
     return request.get(`/vortflow/stories/${id}`);
 }
 
-export function createVortflowStory(data: { project_id: string; title: string; description?: string; priority?: number; parent_id?: string; assignee_id?: string; tags?: string[]; collaborators?: string[]; attachments?: { name: string; url: string; size: number }[]; plan_start?: string; deadline?: string; test_time?: string; draft_time?: string; release_time?: string }) {
+export function createVortflowStory(data: { project_id: string; title: string; description?: string; priority?: number; priority_score?: number; parent_id?: string; assignee_id?: string; tags?: string[]; collaborators?: string[]; attachments?: { name: string; url: string; size: number }[]; plan_start?: string; deadline?: string; start_at?: string; end_at?: string; test_time?: string; draft_time?: string; release_time?: string; repo_id?: string; branch?: string }) {
     return request.post("/vortflow/stories", data);
 }
 
@@ -71,6 +140,7 @@ export function updateVortflowStory(id: string, data: {
     description?: string;
     state?: string;
     priority?: number;
+    priority_score?: number;
     parent_id?: string | null;
     assignee_id?: string | null;
     tags?: string[];
@@ -104,13 +174,58 @@ export function transitionVortflowStory(id: string, target_state: string) {
     return request.post(`/vortflow/stories/${id}/transition`, { target_state });
 }
 
+/**
+ * 拖拽排序：支持同 parent 内调序，或跨 parent（含挪到顶层，传 parent_id=null）。
+ * 参数语义：
+ * - before_id: source 落到该需求之前
+ * - after_id:  source 落到该需求之后
+ * - parent_id: 显式指定父节点；和锚点同时传时以锚点的 parent 为准
+ */
+export function reorderVortflowStory(id: string, data: {
+    parent_id?: string | null;
+    before_id?: string;
+    after_id?: string;
+}) {
+    return request.post(`/vortflow/stories/${id}/reorder`, data);
+}
+
+/**
+ * 任务拖拽排序：支持同 parent 内调序、跨 story 移动、嵌入到需求/任务下。
+ * - 拖到任务 same parent 同级 → 仅排序
+ * - 拖到任务 inside → 成为该任务的子任务（同 story）
+ * - 拖到需求 inside → story_id 改为该需求，parent_id 清空
+ */
+export function reorderVortflowTask(id: string, data: {
+    story_id?: string | null;
+    parent_id?: string | null;
+    before_id?: string;
+    after_id?: string;
+}) {
+    return request.post(`/vortflow/tasks/${id}/reorder`, data);
+}
+
+/**
+ * 缺陷拖拽排序：缺陷之间没有父子关系，但可嵌入到需求/任务下。
+ * - 拖到缺陷 same parent 同级 → 仅排序
+ * - 拖到需求 inside → story_id 改为该需求，task_id 清空
+ * - 拖到任务 inside → task_id 改为该任务，story_id 继承自任务
+ */
+export function reorderVortflowBug(id: string, data: {
+    story_id?: string | null;
+    task_id?: string | null;
+    before_id?: string;
+    after_id?: string;
+}) {
+    return request.post(`/vortflow/bugs/${id}/reorder`, data);
+}
+
 export function getVortflowStoryTransitions(id: string) {
     return request.get(`/vortflow/stories/${id}/transitions`);
 }
 
 // ---- Tasks ----
 
-export function getVortflowTasks(params: { story_id?: string; parent_id?: string; state?: string; task_type?: string; assignee_id?: string; keyword?: string; project_id?: string; creator_id?: string; participant_id?: string; iteration_id?: string; archived?: boolean; sort_by?: string; sort_order?: string; page?: number; page_size?: number }) {
+export function getVortflowTasks(params: { story_id?: string; parent_id?: string; state?: string; task_type?: string; assignee_id?: string; keyword?: string; project_id?: string; project_ids?: string; creator_id?: string; participant_id?: string; iteration_id?: string; archived?: boolean; include_archived?: boolean; sort_by?: string; sort_order?: string; page?: number; page_size?: number }) {
     return request.get("/vortflow/tasks", { params });
 }
 
@@ -118,7 +233,7 @@ export function getVortflowTask(id: string) {
     return request.get(`/vortflow/tasks/${id}`);
 }
 
-export function createVortflowTask(data: { project_id?: string; story_id?: string; parent_id?: string; title: string; description?: string; task_type?: string; assignee_id?: string; tags?: string[]; collaborators?: string[]; attachments?: { name: string; url: string; size: number }[]; estimate_hours?: number; plan_start?: string; deadline?: string }) {
+export function createVortflowTask(data: { project_id?: string; story_id?: string; parent_id?: string; title: string; description?: string; task_type?: string; assignee_id?: string; tags?: string[]; collaborators?: string[]; attachments?: { name: string; url: string; size: number }[]; estimate_hours?: number; priority_score?: number; plan_start?: string; deadline?: string; start_at?: string; end_at?: string; repo_id?: string; branch?: string }) {
     return request.post("/vortflow/tasks", data);
 }
 
@@ -141,6 +256,7 @@ export function updateVortflowTask(id: string, data: {
     repo_id?: string | null;
     branch?: string;
     progress?: number;
+    priority_score?: number;
 }) {
     return request.put(`/vortflow/tasks/${id}`, data);
 }
@@ -163,7 +279,7 @@ export function getVortflowTaskTransitions(id: string) {
 
 // ---- Bugs ----
 
-export function getVortflowBugs(params: { story_id?: string; state?: string; severity?: number; assignee_id?: string; keyword?: string; project_id?: string; reporter_id?: string; participant_id?: string; iteration_id?: string; archived?: boolean; sort_by?: string; sort_order?: string; page?: number; page_size?: number }) {
+export function getVortflowBugs(params: { story_id?: string; state?: string; severity?: number; assignee_id?: string; keyword?: string; project_id?: string; project_ids?: string; reporter_id?: string; participant_id?: string; iteration_id?: string; archived?: boolean; include_archived?: boolean; sort_by?: string; sort_order?: string; page?: number; page_size?: number }) {
     return request.get("/vortflow/bugs", { params });
 }
 
@@ -171,7 +287,7 @@ export function getVortflowBug(id: string) {
     return request.get(`/vortflow/bugs/${id}`);
 }
 
-export function createVortflowBug(data: { project_id?: string; story_id?: string; task_id?: string; title: string; description?: string; severity?: number; assignee_id?: string; tags?: string[]; collaborators?: string[]; attachments?: { name: string; url: string; size: number }[]; plan_start?: string; deadline?: string }) {
+export function createVortflowBug(data: { project_id?: string; story_id?: string; task_id?: string; title: string; description?: string; severity?: number; priority_score?: number; assignee_id?: string; tags?: string[]; collaborators?: string[]; attachments?: { name: string; url: string; size: number }[]; plan_start?: string; deadline?: string; start_at?: string; end_at?: string; repo_id?: string; branch?: string }) {
     return request.post("/vortflow/bugs", data);
 }
 
@@ -182,6 +298,7 @@ export function updateVortflowBug(id: string, data: {
     severity?: number;
     state?: string;
     assignee_id?: string;
+    developer_id?: string;
     tags?: string[];
     collaborators?: string[];
     attachments?: { name: string; url: string; size: number }[];
@@ -193,6 +310,7 @@ export function updateVortflowBug(id: string, data: {
     end_at?: string;
     repo_id?: string | null;
     branch?: string;
+    priority_score?: number;
 }) {
     return request.put(`/vortflow/bugs/${id}`, data);
 }
@@ -217,6 +335,30 @@ export function getVortflowBugTransitions(id: string) {
 
 export function batchArchiveWorkItems(data: { ids: string[]; type: string; archived: boolean }) {
     return request.post("/vortflow/work-items/batch-archive", data);
+}
+
+// ---- Work Wall (跨类型聚合查询) ----
+
+export function getVortflowWorkItems(params: {
+    types?: string;
+    project_id?: string;
+    project_ids?: string;
+    iteration_id?: string;
+    state?: string;
+    keyword?: string;
+    assignee_id?: string;
+    creator_id?: string;
+    participant_id?: string;
+    archived?: boolean;
+    include_archived?: boolean;
+    sort_by?: string;
+    sort_order?: string;
+    page?: number;
+    page_size?: number;
+    /** 「当日已完成」过滤起点（ISO datetime）：仅对 done 类型 state 强制 end_at>=该时间 */
+    completed_after?: string;
+}) {
+    return request.get("/vortflow/work-items", { params });
 }
 
 // ---- Work Item Links ----
@@ -247,12 +389,46 @@ export function generateVortflowDescriptionPrompt(entityType: string, projectNam
 
 // ---- Iterations ----
 
-export function getVortflowIterations(params: { project_id?: string; status?: string; keyword?: string; owner_id?: string; page?: number; page_size?: number }) {
+export interface VortflowIterationListParams {
+    project_id?: string;
+    project_ids?: string;
+    status?: string;
+    keyword?: string;
+    owner_id?: string;
+    page?: number;
+    page_size?: number;
+}
+
+export function getVortflowIterations(params: VortflowIterationListParams = {}) {
     return request.get("/vortflow/iterations", { params });
+}
+
+/**
+ * 获取需要完整迭代列表的展示/导航场景数据。
+ *
+ * `/iterations` 是分页接口，不能把第一页误当成完整选项列表；这里按返回的
+ * total 自动继续请求后续页，同时遵守服务端 page_size 上限。
+ */
+export async function getAllVortflowIterations(
+    params: Omit<VortflowIterationListParams, "page"> = {},
+) {
+    const { page_size: requestedPageSize, ...filters } = params;
+    return fetchAllPages<any>(
+        (page, pageSize) => getVortflowIterations({
+            ...filters,
+            page,
+            page_size: pageSize,
+        }) as Promise<PaginatedItems<any>>,
+        { pageSize: requestedPageSize ?? 200, maxPageSize: 200 },
+    );
 }
 
 export function getVortflowIteration(id: string) {
     return request.get(`/vortflow/iterations/${id}`);
+}
+
+export function getVortflowIterationHealth(id: string) {
+    return request.get(`/vortflow/iterations/${id}/health`);
 }
 
 export function createVortflowIteration(data: {
@@ -318,7 +494,7 @@ export function removeVortflowIterationBug(iterationId: string, bugId: string) {
 
 // ---- Versions ----
 
-export function getVortflowVersions(params: { project_id?: string; status?: string; keyword?: string; owner_id?: string; page?: number; page_size?: number }) {
+export function getVortflowVersions(params: { project_id?: string; project_ids?: string; status?: string; keyword?: string; owner_id?: string; page?: number; page_size?: number }) {
     return request.get("/vortflow/versions", { params });
 }
 
@@ -511,6 +687,7 @@ export function reorderVortflowTestModule(data: { module_id: string; parent_id?:
 
 export function getVortflowTestCases(params?: {
     project_id?: string;
+    project_ids?: string;
     module_id?: string;
     keyword?: string;
     case_type?: string;
@@ -585,6 +762,7 @@ export function deleteVortflowTestCaseLink(linkId: string) {
 
 export function getVortflowTestPlans(params: {
     project_id?: string;
+    project_ids?: string;
     status?: string;
     keyword?: string;
     page?: number;
@@ -759,6 +937,23 @@ export function sendVortflowNotify(data: {
     message?: string;
 }) {
     return request.post("/vortflow/notify", data);
+}
+
+/**
+ * 给"成员关注面板"卡片上的某个成员发送一条工作量提醒/催办。
+ * 不绑定具体工作项；后端会把传入的计数（在手 / 逾期 / 即将到期 / 停滞）拼到 IM 文案里。
+ */
+export function sendVortflowMemberNotify(data: {
+    recipient_id: string;
+    notify_type: "remind" | "urge";
+    message?: string;
+    project_id?: string;
+    pending_total?: number;
+    overdue?: number;
+    due_soon?: number;
+    stale_count?: number;
+}) {
+    return request.post("/vortflow/notify/member", data);
 }
 
 // ---- Document Links ----

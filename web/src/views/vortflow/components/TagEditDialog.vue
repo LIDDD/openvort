@@ -3,6 +3,12 @@ import { ref, watch } from "vue";
 import { createVortflowTag, updateVortflowTag } from "@/api";
 import { message } from "@openvort/vort-ui";
 
+interface SavedTag {
+    id: string;
+    name: string;
+    color: string;
+}
+
 interface Props {
     open: boolean;
     mode?: "add" | "edit";
@@ -16,7 +22,7 @@ const props = withDefaults(defineProps<Props>(), {
 
 const emit = defineEmits<{
     "update:open": [val: boolean];
-    saved: [];
+    saved: [tag: SavedTag];
 }>();
 
 const COLOR_PRESETS = [
@@ -51,22 +57,33 @@ const handleSubmit = async () => {
     }
     loading.value = true;
     try {
+        let saved: SavedTag | null = null;
         if (props.mode === "edit" && props.data?.id) {
             const res: any = await updateVortflowTag(props.data.id, { name, color: formColor.value });
             if (res?.error) {
                 message.error(res.error);
                 return;
             }
+            saved = {
+                id: String(res?.id || props.data.id),
+                name: String(res?.name || name),
+                color: String(res?.color || formColor.value),
+            };
         } else {
             const res: any = await createVortflowTag({ name, color: formColor.value });
             if (res?.error) {
                 message.error(res.error);
                 return;
             }
+            saved = {
+                id: String(res?.id || ""),
+                name: String(res?.name || name),
+                color: String(res?.color || formColor.value),
+            };
         }
         message.success(props.mode === "edit" ? "标签已更新" : "标签已创建");
         emit("update:open", false);
-        emit("saved");
+        if (saved) emit("saved", saved);
     } catch (e: any) {
         message.error(e?.message || "操作失败");
     } finally {

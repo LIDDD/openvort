@@ -1,6 +1,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { message } from "@openvort/vort-ui";
 import { useVortFlowStore } from "@/stores";
+import { normalizeVirtualStatusValues } from "@/views/vortflow/work-item/useWorkItemCommon";
 import { SYSTEM_VIEWS } from "./useVortFlowViews";
 import type { ColumnFilterValue } from "@/components/vort-biz/pro-table/ColumnFilterPopover.vue";
 import type { ColumnSettingItem } from "../components/ColumnSettingsDialog.vue";
@@ -183,7 +184,10 @@ export function useWorkItemViewState(options: UseWorkItemViewStateOptions) {
             if (f.keyword) keyword.value = f.keyword;
             if (f.owner) owner.value = Array.isArray(f.owner) ? f.owner : (f.owner ? [f.owner] : []);
             if (f.status) {
-                status.value = Array.isArray(f.status) ? f.status : [f.status];
+                // 兼容旧视图里保存的合并值「逾期/停滞」，展开为「已逾期」+「停滞」
+                status.value = normalizeVirtualStatusValues(
+                    Array.isArray(f.status) ? f.status : [f.status]
+                );
             }
             if (f.sortField) columnSortField.value = f.sortField;
             if (f.sortOrder) columnSortOrder.value = f.sortOrder;

@@ -8,7 +8,7 @@
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from openvort.web.app import require_auth
@@ -221,14 +221,14 @@ async def update_assignment(
         assignment = result.scalar_one_or_none()
 
         if not assignment:
-            return {"success": False, "error": "工作安排不存在"}
+            raise HTTPException(status_code=404, detail="工作安排不存在")
 
         # 只有委托人或者 AI 员工本人可以更新
         if (
             assignment.requested_by_member_id != member_id
             and assignment.assignee_member_id != member_id
         ):
-            return {"success": False, "error": "无权限更新"}
+            raise HTTPException(status_code=403, detail="无权限更新")
 
         # 更新字段
         if req.title is not None:
@@ -307,13 +307,13 @@ async def delete_assignment(request: Request, assignment_id: int):
         assignment = result.scalar_one_or_none()
 
         if not assignment:
-            return {"success": False, "error": "工作安排不存在"}
+            raise HTTPException(status_code=404, detail="工作安排不存在")
 
         if (
             assignment.requested_by_member_id != member_id
             and assignment.assignee_member_id != member_id
         ):
-            return {"success": False, "error": "无权限删除"}
+            raise HTTPException(status_code=403, detail="无权限删除")
 
         related_schedule_id = assignment.related_schedule_id
         await db.delete(assignment)
@@ -344,13 +344,13 @@ async def update_assignment_status(
         assignment = result.scalar_one_or_none()
 
         if not assignment:
-            return {"success": False, "error": "工作安排不存在"}
+            raise HTTPException(status_code=404, detail="工作安排不存在")
 
         if (
             assignment.requested_by_member_id != member_id
             and assignment.assignee_member_id != member_id
         ):
-            return {"success": False, "error": "无权限更新"}
+            raise HTTPException(status_code=403, detail="无权限更新")
 
         old_status = assignment.status
         assignment.status = status

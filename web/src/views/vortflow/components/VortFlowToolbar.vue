@@ -16,8 +16,10 @@ const shouldHideToolbar = computed(() =>
     <div v-if="!shouldHideToolbar" class="bg-white rounded-xl px-4 py-3 flex items-center gap-4">
         <ProjectSelector
             :projects="store.projects"
-            :selected-id="store.selectedProjectId"
-            @update:selected-id="store.setProjectId"
+            :selected-ids="store.selectedProjectIds"
+            @update:selected-ids="store.setSelectedProjectIds"
+            @toggle-star="store.toggleStar"
+            @select-starred="store.selectStarredProjects"
         />
     </div>
 </template>

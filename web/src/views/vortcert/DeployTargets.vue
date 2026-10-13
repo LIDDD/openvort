@@ -41,7 +41,12 @@ const getConfigSummary = (item: TargetItem) => {
     try {
         const config = JSON.parse(item.config || "{}");
         if (item.target_type === "aliyun_cdn") return config.cdn_domain || "-";
-        if (item.target_type === "baota") return `${config.site_name || "-"} @ ${config.panel_url || "-"}`;
+        if (item.target_type === "baota") {
+            const target = config.match_mode === "pattern"
+                ? `${config.domain_pattern || "*"}（通配）`
+                : config.site_name || "-";
+            return `${target} @ ${config.panel_url || "-"}`;
+        }
     } catch { /* ignore */ }
     return "-";
 };

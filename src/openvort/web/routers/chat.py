@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -16,6 +16,7 @@ from openvort.web.app import require_auth
 from openvort.web.deps import get_agent, get_session_store, get_build_context_fn
 from openvort.web.upload_utils import get_upload_url
 from openvort.utils.logging import get_logger
+from openvort.utils.time import naive_local_to_epoch
 
 log = get_logger("web.chat")
 
@@ -199,15 +200,15 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     """Upload a file for chat. Returns metadata including extracted text for supported types."""
     require_auth(request)
     if not file.filename:
-        return {"error": "No file provided"}, 400
+        raise HTTPException(status_code=400, detail="No file provided")
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
     if ext not in ALLOWED_FILE_EXTS:
-        return {"error": f"Unsupported file type: .{ext}"}
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: .{ext}")
 
     file_bytes = await file.read()
     if len(file_bytes) > MAX_FILE_SIZE:
-        return {"error": "File too large (max 20MB)"}
+        raise HTTPException(status_code=413, detail="File too large (max 20MB)")
 
     upload_dir = _get_chat_upload_dir()
     file_id = uuid.uuid4().hex
@@ -262,20 +263,20 @@ async def abort_message(req: AbortRequest, request: Request):
     pending = _pending_messages.get(req.message_id)
     if pending:
         if pending.get("member_id") != member_id:
-            return {"success": False, "error": "无权限中断该消息"}
+            raise HTTPException(status_code=403, detail="无权限中断该消息")
         _pending_messages.pop(req.message_id, None)
         return {"success": True, "status": "aborted_pending"}
 
     running = _running_messages.get(req.message_id)
     if running:
         if running.member_id != member_id:
-            return {"success": False, "error": "无权限中断该消息"}
+            raise HTTPException(status_code=403, detail="无权限中断该消息")
         running.cancel_event.set()
         if running.stream_task and not running.stream_task.done():
             running.stream_task.cancel()
         return {"success": True, "status": "aborting"}
 
-    return {"success": False, "error": "消息不存在或已结束"}
+    raise HTTPException(status_code=404, detail="消息不存在或已结束")
 
 
 @router.get("/stream/{message_id}")
@@ -580,7 +581,7 @@ async def set_thinking(req: ThinkingRequest, request: Request):
     member_id = payload.get("sub", "")
 
     if req.level not in ("off", "low", "medium", "high"):
-        return {"success": False, "error": "无效的 thinking 级别"}
+        raise HTTPException(status_code=400, detail="无效的 thinking 级别")
 
     session_store = get_session_store()
     session_store.set_thinking_level("web", member_id, "" if req.level == "off" else req.level, req.session_id)
@@ -603,14 +604,14 @@ async def compact_session(req: CompactRequest, request: Request):
     old_count = info.get("message_count", 0)
 
     if old_count < 4:
-        return {"success": False, "error": "消息太少，无需压缩"}
+        raise HTTPException(status_code=400, detail="消息太少，无需压缩")
 
     try:
         await session_store.compact("web", member_id, session_id=req.session_id)
         new_info = session_store.get_session_info("web", member_id, req.session_id)
         return {"success": True, "old_count": old_count, "new_count": new_info.get("message_count", 0)}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/members")
@@ -769,11 +770,11 @@ async def delete_message(req: DeleteMessageRequest, request: Request):
     messages = await session_store.get_messages("web", member_id, req.session_id)
 
     if req.msg_index < 0 or req.msg_index >= len(messages):
-        return {"success": False, "error": "invalid index"}
+        raise HTTPException(status_code=400, detail="invalid index")
 
     raw = messages[req.msg_index]
     if req.role and raw.get("role") != req.role:
-        return {"success": False, "error": "role mismatch"}
+        raise HTTPException(status_code=400, detail="role mismatch")
 
     indices: set[int] = {req.msg_index}
 
@@ -953,7 +954,7 @@ async def cancel_task(task_id: str, request: Request):
     from openvort.core.task_runner import get_task_runner
     runner = get_task_runner()
     if not runner:
-        return {"success": False, "error": "TaskRunner not initialized"}
+        raise HTTPException(status_code=503, detail="TaskRunner not initialized")
     ok = await runner.cancel_task(task_id)
     return {"success": ok}
 
@@ -969,7 +970,7 @@ async def inject_task_message(task_id: str, req: InjectMessageRequest, request: 
     from openvort.core.task_runner import get_task_runner
     runner = get_task_runner()
     if not runner:
-        return {"success": False, "error": "TaskRunner not initialized"}
+        raise HTTPException(status_code=503, detail="TaskRunner not initialized")
     ok = await runner.inject_message(task_id, req.content)
     return {"success": ok}
 
@@ -1112,10 +1113,10 @@ async def list_contacts(request: Request):
             preview = _extract_last_message(row.messages)
             if preview:
                 ai_last_message = preview
-                ai_last_time = row.updated_at.timestamp() if row.updated_at else 0
+                ai_last_time = naive_local_to_epoch(row.updated_at)
                 break
         if not ai_last_time and ai_rows:
-            ai_last_time = ai_rows[0].updated_at.timestamp() if ai_rows[0].updated_at else 0
+            ai_last_time = naive_local_to_epoch(ai_rows[0].updated_at)
 
         ai_total_unread = sum(getattr(r, "unread_count", 0) or 0 for r in ai_rows)
         contacts.append({
@@ -1184,7 +1185,7 @@ async def list_contacts(request: Request):
                 "avatar_url": m_info.get("avatar_url", ""),
                 "position": m_info.get("position", ""),
                 "last_message": _extract_last_message(row.messages),
-                "last_message_time": row.updated_at.timestamp() if row.updated_at else 0,
+                "last_message_time": naive_local_to_epoch(row.updated_at),
                 "unread": getattr(row, "unread_count", 0) or 0,
                 "session_id": row.session_id,
                 "pinned": row.pinned,

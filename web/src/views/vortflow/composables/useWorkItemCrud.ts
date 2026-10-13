@@ -1,5 +1,6 @@
 import { computed, reactive, ref, unref, type ComputedRef, type Ref } from "vue";
 import { message } from "@openvort/vort-ui";
+import { resolveCollaboratorIds } from "../work-item/workItemMembers";
 import {
     createVortflowStory, createVortflowTask, createVortflowBug,
     copyVortflowStory, copyVortflowTask, copyVortflowBug,
@@ -93,7 +94,8 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
         collaborators: [],
         type: (propType ?? "缺陷") as WorkItemType,
         planTime: [],
-        project: "VortMall",
+        // 关联项目由创建抽屉根据项目上下文/用户选择决定，不能用首个项目兜底。
+        project: "",
         projectId: "",
         iteration: "",
         version: "",
@@ -116,11 +118,11 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
     };
 
     const resolveCreateProjectId = (): string => {
-        if (!apiProjects.value.length) return "";
+        if (!apiProjects.value.length) return createBugForm.projectId || "";
         const selected = createBugForm.project?.trim();
-        if (!selected) return apiProjects.value[0]?.id || "";
+        if (!selected) return createBugForm.projectId || "";
         const match = apiProjects.value.find((x) => x.name === selected || x.id === selected);
-        return match?.id || apiProjects.value[0]?.id || "";
+        return match?.id || createBugForm.projectId || "";
     };
 
     const createParentRecord = computed<RowItem | null>(() => findItemRowById(createParentItemId.value));
@@ -145,6 +147,15 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
 
     const getRecordBackendId = (record: RowItem): string => String(record.backendId || "").trim();
 
+    // 后端在 200 响应里用 {"error": "..."} 表示业务失败时，前端要主动识别并抛出，
+    // 否则乐观更新会以为成功，下次刷新才发现没改。
+    const ensureNoBusinessError = (res: any) => {
+        const err = res && typeof res === "object" ? (res as any).error : null;
+        if (typeof err === "string" && err) {
+            throw new Error(err);
+        }
+    };
+
     const syncRecordUpdateToApi = async (
         record: RowItem,
         patch: {
@@ -152,6 +163,7 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
             description?: string;
             state?: string;
             priority?: number;
+            priority_score?: number;
             severity?: number;
             assignee_id?: string | null;
             estimate_hours?: number;
@@ -160,6 +172,7 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
             plan_start?: string;
             deadline?: string;
             pm_id?: string | null;
+            developer_id?: string | null;
             project_id?: string | null;
             actual_hours?: number;
             start_at?: string;
@@ -177,11 +190,12 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
         const id = getRecordBackendId(record);
         if (!id) return;
         if (record.type === "需求") {
-            await updateVortflowStory(id, {
+            const res = await updateVortflowStory(id, {
                 title: patch.title,
                 description: patch.description,
                 state: patch.state,
                 priority: patch.priority,
+                priority_score: patch.priority_score,
                 assignee_id: patch.assignee_id === undefined ? undefined : (patch.assignee_id || undefined),
                 tags: patch.tags,
                 collaborators: patch.collaborators,
@@ -199,16 +213,18 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
                 progress: patch.progress,
                 attachments: patch.attachments,
             });
+            ensureNoBusinessError(res);
             record.updatedAt = formatCnTime(new Date());
             return;
         }
         if (record.type === "任务") {
-            await updateVortflowTask(id, {
+            const res = await updateVortflowTask(id, {
                 title: patch.title,
                 description: patch.description,
                 state: patch.state,
                 assignee_id: patch.assignee_id === undefined ? undefined : (patch.assignee_id || undefined),
                 estimate_hours: patch.estimate_hours,
+                priority_score: patch.priority_score,
                 tags: patch.tags,
                 collaborators: patch.collaborators,
                 plan_start: patch.plan_start,
@@ -222,15 +238,18 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
                 progress: patch.progress,
                 attachments: patch.attachments,
             });
+            ensureNoBusinessError(res);
             record.updatedAt = formatCnTime(new Date());
             return;
         }
-        await updateVortflowBug(id, {
+        const res = await updateVortflowBug(id, {
             title: patch.title,
             description: patch.description,
             severity: patch.severity,
+            priority_score: patch.priority_score,
             state: patch.state,
             assignee_id: patch.assignee_id === undefined ? undefined : (patch.assignee_id || undefined),
+            developer_id: patch.developer_id === undefined ? undefined : (patch.developer_id || undefined),
             estimate_hours: patch.estimate_hours,
             actual_hours: patch.actual_hours,
             tags: patch.tags,
@@ -244,6 +263,7 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
             project_id: patch.project_id,
             attachments: patch.attachments,
         });
+        ensureNoBusinessError(res);
         record.updatedAt = formatCnTime(new Date());
     };
 
@@ -251,7 +271,9 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
         if (!unref(useApi)) return;
         const targetStates = getBackendStatesByDisplayStatus(record.type, displayStatus) || [];
         if (!targetStates.length) {
-            throw new Error("当前状态不支持同步到后端");
+            // command 为空的状态（如「测试中」/「开发完成」/「待发布」等）目前没有对应的后端 state，
+            // 不能强制同步，以免写入非法 state 后续无法切换。
+            throw new Error(`「${displayStatus}」暂未配置后端状态映射，无法同步`);
         }
         await syncRecordUpdateToApi(record, { state: targetStates[0] });
     };
@@ -285,12 +307,21 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
     const _batchArchive = async (archived: boolean) => {
         if (!selectedRows.value.length) return;
         const rows = [...selectedRows.value];
-        const backendType = _TYPE_TO_BACKEND[propType] || "story";
-        const ids = rows.map((r) => r.backendId).filter(Boolean) as string[];
-        if (!ids.length) return;
+        // 按 record.type 分组（兼容工作墙跨类型批量操作）
+        const groups: Record<string, string[]> = { story: [], task: [], bug: [] };
+        for (const row of rows) {
+            const backendType = _TYPE_TO_BACKEND[propType] || _TYPE_TO_BACKEND[row.type] || "";
+            if (!backendType || !row.backendId) continue;
+            groups[backendType]!.push(row.backendId);
+        }
+        const groupEntries = Object.entries(groups).filter(([, ids]) => ids.length > 0);
+        if (!groupEntries.length) return;
         try {
-            await batchArchiveWorkItems({ ids, type: backendType, archived });
-            message.success(archived ? `已归档 ${ids.length} 条` : `已取消归档 ${ids.length} 条`);
+            await Promise.all(
+                groupEntries.map(([type, ids]) => batchArchiveWorkItems({ ids, type, archived }))
+            );
+            const total = groupEntries.reduce((sum, [, ids]) => sum + ids.length, 0);
+            message.success(archived ? `已归档 ${total} 条` : `已取消归档 ${total} 条`);
         } catch {
             message.error(archived ? "批量归档失败" : "批量取消归档失败");
         }
@@ -319,26 +350,55 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
                 const ownerId = getMemberIdByName(formData.owner) || undefined;
                 if (type === "需求") {
                     const defaultProject = formData.projectId || createProjectId.value || resolveCreateProjectId();
+                    const priorityLevel = formData.priority === "urgent" ? 1
+                        : formData.priority === "high" ? 2
+                        : formData.priority === "medium" ? 3
+                        : formData.priority === "low" ? 4
+                        : 4;
+                    // 表单若提供 priority_score 则优先使用；否则按等级派生段起始值
+                    const formScore = (formData as any).priorityScore;
+                    const priorityScore = (formScore != null && Number.isFinite(Number(formScore)))
+                        ? Math.max(0, Math.min(100, Math.round(Number(formScore))))
+                        : ({ 1: 80, 2: 60, 3: 40, 4: 20 } as Record<number, number>)[priorityLevel];
                     createdItem = await createVortflowStory({
                         project_id: defaultProject,
                         title,
                         description: formData.description || getDescriptionTemplate("需求"),
-                        priority: formData.priority === "urgent" ? 1 : formData.priority === "high" ? 2 : formData.priority === "medium" ? 3 : 4,
+                        priority: priorityLevel,
+                        priority_score: priorityScore,
                         parent_id: formData.parentId || undefined,
                         tags: [...formData.tags],
                         collaborators: [...formData.collaborators],
                         attachments: [...(formData.attachments || [])],
                         plan_start: formData.planTime?.[0] || undefined,
                         deadline: formData.planTime?.[1] || undefined,
+                        start_at: formData.startAt || undefined,
+                        end_at: formData.endAt || undefined,
+                        repo_id: formData.repo || undefined,
+                        branch: formData.branch || undefined,
                     });
                     if (createdItem?.id && ownerId) {
+                        // 创建需求时由 createVortflowStory 不接受 assignee_id（兼容旧 schema），改用 update 同步写入。
+                        // pm_id 同步覆盖，确保老字段不残留导致 owner 双源不一致。
                         try {
-                            createdItem = await updateVortflowStory(String(createdItem.id), { pm_id: ownerId });
+                            createdItem = await updateVortflowStory(String(createdItem.id), {
+                                assignee_id: ownerId,
+                                pm_id: ownerId,
+                            });
                         } catch {
-                            createdItem = { ...createdItem, pm_id: ownerId };
+                            createdItem = { ...createdItem, assignee_id: ownerId, pm_id: ownerId };
                         }
                     }
                 } else if (type === "任务") {
+                    const priorityLevel = formData.priority === "urgent" ? 1
+                        : formData.priority === "high" ? 2
+                        : formData.priority === "medium" ? 3
+                        : formData.priority === "low" ? 4
+                        : 4;
+                    const formScore = (formData as any).priorityScore;
+                    const priorityScore = (formScore != null && Number.isFinite(Number(formScore)))
+                        ? Math.max(0, Math.min(100, Math.round(Number(formScore))))
+                        : ({ 1: 80, 2: 60, 3: 40, 4: 20 } as Record<number, number>)[priorityLevel];
                     createdItem = await createVortflowTask({
                         project_id: formData.projectId || createProjectId.value || resolveCreateProjectId() || undefined,
                         story_id: formData.storyId || undefined,
@@ -352,21 +412,51 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
                         attachments: [...(formData.attachments || [])],
                         plan_start: formData.planTime?.[0] || undefined,
                         deadline: formData.planTime?.[1] || undefined,
+                        start_at: formData.startAt || undefined,
+                        end_at: formData.endAt || undefined,
+                        repo_id: formData.repo || undefined,
+                        branch: formData.branch || undefined,
+                        priority_score: priorityScore,
                     });
                 } else {
+                    const priorityLevel = formData.priority === "urgent" ? 1
+                        : formData.priority === "high" ? 2
+                        : formData.priority === "medium" ? 3
+                        : 4;
+                    const formScore = (formData as any).priorityScore;
+                    const priorityScore = (formScore != null && Number.isFinite(Number(formScore)))
+                        ? Math.max(0, Math.min(100, Math.round(Number(formScore))))
+                        : ({ 1: 80, 2: 60, 3: 40, 4: 20 } as Record<number, number>)[priorityLevel];
                     createdItem = await createVortflowBug({
                         project_id: formData.projectId || createProjectId.value || resolveCreateProjectId() || undefined,
                         story_id: formData.storyId || undefined,
                         title,
                         description: formData.description || getDescriptionTemplate("缺陷"),
-                        severity: formData.priority === "urgent" ? 1 : formData.priority === "high" ? 2 : formData.priority === "medium" ? 3 : 4,
+                        severity: priorityLevel,
+                        priority_score: priorityScore,
                         assignee_id: ownerId,
                         tags: [...formData.tags],
                         collaborators: [...formData.collaborators],
                         attachments: [...(formData.attachments || [])],
                         plan_start: formData.planTime?.[0] || undefined,
                         deadline: formData.planTime?.[1] || undefined,
+                        start_at: formData.startAt || undefined,
+                        end_at: formData.endAt || undefined,
+                        repo_id: formData.repo || undefined,
+                        branch: formData.branch || undefined,
                     });
+                    if (createdItem?.id && ownerId) {
+                        // createVortflowBug 历史上不接受 developer_id；用 update 同步覆盖，
+                        // 与 pm/assignee 同源策略一致，避免新缺陷又出现 assignee_id ≠ developer_id 的双轨。
+                        try {
+                            createdItem = await updateVortflowBug(String(createdItem.id), {
+                                assignee_id: ownerId,
+                                developer_id: ownerId,
+                            });
+                        } catch {
+                            createdItem = { ...createdItem, assignee_id: ownerId, developer_id: ownerId };
+                        }
+                    }
                 }
                 if (createdItem) {
                     const createdId = String(createdItem.id || "");
@@ -477,30 +567,72 @@ export function useWorkItemCrud(options: UseWorkItemCrudOptions) {
             await syncRecordUpdateToApi(record, { title: data.title });
         }
         if (data.priority !== undefined) {
-            const pMap: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4, none: 4 };
+            const pMap: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4, none: 0 };
             const level = pMap[data.priority] ?? 4;
+            const detailScore = (data as any).priorityScore;
+            const scoreFromDetail = (detailScore != null && Number.isFinite(Number(detailScore)))
+                ? Math.max(0, Math.min(100, Math.round(Number(detailScore))))
+                : ({ 1: 80, 2: 60, 3: 40, 4: 20, 0: 0 } as Record<number, number>)[level] ?? 20;
             if (record.type === "缺陷") {
-                await syncRecordUpdateToApi(record, { severity: level });
+                await syncRecordUpdateToApi(record, {
+                    severity: level === 0 ? 4 : level,
+                    priority_score: scoreFromDetail,
+                });
+            } else if (record.type === "需求") {
+                await syncRecordUpdateToApi(record, { priority_score: scoreFromDetail });
             } else {
-                await syncRecordUpdateToApi(record, { priority: level });
+                await syncRecordUpdateToApi(record, { priority_score: scoreFromDetail });
+            }
+        }
+        if ((data as any).priorityScore !== undefined && data.priority === undefined) {
+            const score = Math.max(0, Math.min(100, Math.round(Number((data as any).priorityScore))));
+            if (record.type === "需求" || record.type === "任务" || record.type === "缺陷") {
+                await syncRecordUpdateToApi(record, { priority_score: score });
             }
         }
         if (data.status !== undefined) {
             await syncRecordStatusToApi(record, data.status);
         }
         if (data.owner !== undefined || data.collaborators !== undefined) {
-            const ownerId = data.owner ? getMemberIdByName(data.owner) || data.owner : undefined;
-            const collabIds = data.collaborators?.map(n => getMemberIdByName(n) || n);
+            // 姓名/已知 ID 统一解析；协作者允许保留已有历史 ID，不能把未知姓名原样写入。
+            let ownerId: string | null | undefined;
+            if (data.owner === undefined) {
+                ownerId = undefined;
+            } else if (!data.owner) {
+                ownerId = null;
+            } else {
+                ownerId = getMemberIdByName(data.owner) || null;
+                if (ownerId === null) {
+                    message.warning(`未识别的负责人「${data.owner}」，请重新选择`);
+                    return;
+                }
+            }
+            let collabIds: string[] | undefined;
+            if (data.collaborators !== undefined) {
+                const { ids, unresolved } = resolveCollaboratorIds(
+                    data.collaborators || [], getMemberIdByName, record.collaboratorIds,
+                );
+                if (unresolved.length > 0) {
+                    message.warning(`未识别的协作人：${unresolved.join("、")}，请重新选择`);
+                    return;
+                }
+                collabIds = ids;
+            }
             const patch: any = {};
             if (data.owner !== undefined) {
                 record.ownerId = ownerId || "";
             }
             if (ownerId !== undefined) {
-                if (record.type === "需求") patch.pm_id = ownerId || null;
-                else patch.assignee_id = ownerId || null;
+                patch.assignee_id = ownerId;
+                if (record.type === "需求") {
+                    patch.pm_id = ownerId;
+                } else if (record.type === "缺陷") {
+                    patch.developer_id = ownerId;
+                }
             }
-            if (collabIds) patch.collaborators = collabIds;
+            if (collabIds !== undefined) patch.collaborators = collabIds;
             await syncRecordUpdateToApi(record, patch);
+            if (collabIds !== undefined) record.collaboratorIds = [...collabIds];
         }
         if (data.description !== undefined) {
             await syncRecordUpdateToApi(record, { description: data.description });

@@ -12,27 +12,31 @@ const route = useRoute();
 
 const sidebarPinned = ref(false);
 
-const WORK_ITEM_ROUTES: Record<string, WorkItemType> = {
+// 工作墙也可应用系统视图（我负责的/我创建的等），独立持久化于 viewIdByType["wall"]
+type SidebarTypeKey = WorkItemType | "wall";
+
+const SIDEBAR_ROUTES: Record<string, SidebarTypeKey> = {
     "vortflow-stories": "需求",
     "vortflow-tasks": "任务",
     "vortflow-bugs": "缺陷",
+    "vortflow-wall": "wall",
 };
 
-const currentWorkItemType = computed<WorkItemType | null>(() => {
+const currentSidebarTypeKey = computed<SidebarTypeKey | null>(() => {
     const name = route.name as string;
-    return WORK_ITEM_ROUTES[name] ?? null;
+    return SIDEBAR_ROUTES[name] ?? null;
 });
 
-const showSidebar = computed(() => sidebarPinned.value && currentWorkItemType.value !== null);
+const showSidebar = computed(() => sidebarPinned.value && currentSidebarTypeKey.value !== null);
 
 const currentViewId = computed(() => {
-    if (!currentWorkItemType.value) return "all";
-    return store.getViewId(currentWorkItemType.value);
+    if (!currentSidebarTypeKey.value) return "all";
+    return store.getViewId(currentSidebarTypeKey.value);
 });
 
 const onSidebarSelect = (viewId: string) => {
-    if (currentWorkItemType.value) {
-        store.setViewId(currentWorkItemType.value, viewId);
+    if (currentSidebarTypeKey.value) {
+        store.setViewId(currentSidebarTypeKey.value, viewId);
     }
 };
 

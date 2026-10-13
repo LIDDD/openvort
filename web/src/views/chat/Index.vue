@@ -112,6 +112,8 @@ const thinkingOpen = ref(false);
 const compacting = ref(false);
 const memberProfileOpen = ref(false);
 
+const embeddedOverlayClass = computed(() => props.embedded ? 'ai-float-overlay' : undefined);
+
 // ---- Message search ----
 const searchOpen = ref(false);
 const searchQuery = ref("");
@@ -776,7 +778,7 @@ defineExpose({ currentSessionId, inputText, handleReset, switchSession, handleNe
                             <h2 :class="[embedded ? 'text-xs' : 'text-base', 'min-w-0 truncate font-medium text-gray-800']">{{ activeContact?.name }}</h2>
                             <span v-if="activeContact?.position" :class="[embedded ? 'ml-1.5 text-[10px]' : 'ml-2 text-xs', 'min-w-0 truncate text-gray-400']">{{ activeContact.position }}</span>
                             <AiEmployeeBadge v-if="activeContact?.is_virtual" :class="[embedded ? 'ml-1 scale-90' : 'ml-1.5', 'flex-shrink-0']" />
-                            <VortTooltip v-if="activeContact?.remote_node_id" :title="['online', 'running'].includes(activeContact.remote_node_status) ? '工作节点在线' : ['offline', 'stopped', 'error'].includes(activeContact.remote_node_status) ? '工作节点离线' : '工作节点状态未知'">
+                            <VortTooltip v-if="activeContact?.remote_node_id" :overlay-class-name="embeddedOverlayClass" :title="['online', 'running'].includes(activeContact.remote_node_status) ? '工作节点在线' : ['offline', 'stopped', 'error'].includes(activeContact.remote_node_status) ? '工作节点离线' : '工作节点状态未知'">
                                 <span class="inline-block w-2 h-2 rounded-full ml-1.5 flex-shrink-0"
                                     :class="['online', 'running'].includes(activeContact.remote_node_status) ? 'bg-green-500' : ['offline', 'stopped', 'error'].includes(activeContact.remote_node_status) ? 'bg-red-400' : 'bg-gray-300'" />
                             </VortTooltip>
@@ -855,21 +857,21 @@ defineExpose({ currentSessionId, inputText, handleReset, switchSession, handleNe
                             </button>
                         </VortTooltip>
                     </template>
-                    <VortTooltip title="重置上下文">
+                    <VortTooltip title="重置上下文" :overlay-class-name="embeddedOverlayClass">
                         <button class="p-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer"
                             @click="handleReset">
                             <RotateCcw :size="16" />
                         </button>
                     </VortTooltip>
                     <template v-if="embedded">
-                        <VortTooltip :title="embeddedExpanded ? '缩小窗口' : '展开半屏'">
+                        <VortTooltip :title="embeddedExpanded ? '缩小窗口' : '展开半屏'" :overlay-class-name="embeddedOverlayClass">
                             <button class="p-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer"
                                 @click="emit('embedded-maximize')">
                                 <Minimize2 v-if="embeddedExpanded" :size="14" />
                                 <Maximize2 v-else :size="14" />
                             </button>
                         </VortTooltip>
-                        <VortTooltip title="关闭">
+                        <VortTooltip title="关闭" :overlay-class-name="embeddedOverlayClass">
                             <button class="p-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer"
                                 @click="emit('embedded-close')">
                                 <X :size="14" />
@@ -1128,20 +1130,20 @@ defineExpose({ currentSessionId, inputText, handleReset, switchSession, handleNe
                             <div v-if="!msg.streaming && msg.content"
                                 class="flex mt-1 gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                                 :class="msg.role === 'user' ? 'justify-end' : 'justify-start'">
-                                <vort-tooltip title="复制">
+                                <vort-tooltip title="复制" :overlay-class-name="embeddedOverlayClass">
                                     <button @click="copyMessageContent(msg)"
                                         class="p-1 rounded text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors cursor-pointer">
                                         <Copy :size="14" />
                                     </button>
                                 </vort-tooltip>
-                                <vort-tooltip v-if="msg.role === 'user'" title="重新发送">
+                                <vort-tooltip v-if="msg.role === 'user'" title="重新发送" :overlay-class-name="embeddedOverlayClass">
                                     <button @click="resendMessage(msg)"
                                         class="p-1 rounded text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors cursor-pointer"
                                         :disabled="loading">
                                         <RefreshCw :size="14" />
                                     </button>
                                 </vort-tooltip>
-                                <vort-tooltip title="删除">
+                                <vort-tooltip title="删除" :overlay-class-name="embeddedOverlayClass">
                                     <button @click="removeMessage(msg)"
                                         class="p-1 rounded text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors cursor-pointer">
                                         <Trash2 :size="14" />
@@ -1371,7 +1373,7 @@ defineExpose({ currentSessionId, inputText, handleReset, switchSession, handleNe
                     />
                     <div :class="embedded ? 'flex items-center justify-between px-3 py-1.5' : 'flex items-center justify-between px-4 py-2'">
                         <div class="flex items-center gap-1">
-                            <VortPopover placement="top" :arrow="true">
+                            <VortPopover placement="top" :arrow="true" :overlay-class-name="embeddedOverlayClass">
                                 <button @click="triggerFileInput"
                                     :class="embedded ? 'p-1 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer' : 'p-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer'">
                                     <FileText :size="embedded ? 16 : 18" />
@@ -1380,7 +1382,7 @@ defineExpose({ currentSessionId, inputText, handleReset, switchSession, handleNe
                                     <span class="text-xs text-gray-500 whitespace-nowrap">.jpg,.jpeg,.png,.txt,.rar,.zip,.doc,.docx,.xls,.7z</span>
                                 </template>
                             </VortPopover>
-                            <VortPopover placement="top" :arrow="true">
+                            <VortPopover placement="top" :arrow="true" :overlay-class-name="embeddedOverlayClass">
                                 <button @click="triggerVideoInput"
                                     :class="embedded ? 'p-1 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer' : 'p-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer'">
                                     <MonitorPlay :size="embedded ? 16 : 18" />
@@ -1389,7 +1391,7 @@ defineExpose({ currentSessionId, inputText, handleReset, switchSession, handleNe
                                     <span class="text-xs text-gray-500 whitespace-nowrap">.mp4,.mov,.avi,.wmv,.flv,.mkv</span>
                                 </template>
                             </VortPopover>
-                            <VortPopover v-model:open="emojiOpen" trigger="click" placement="topLeft" :arrow="false" :overlay-style="{ maxWidth: '424px' }">
+                            <VortPopover v-model:open="emojiOpen" trigger="click" placement="topLeft" :arrow="false" :overlay-class-name="embeddedOverlayClass" :overlay-style="{ maxWidth: '424px' }">
                                 <button :class="embedded ? 'p-1 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer' : 'p-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer'">
                                     <Smile :size="embedded ? 16 : 18" />
                                 </button>

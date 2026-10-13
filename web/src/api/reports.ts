@@ -75,3 +75,39 @@ export function markReportRead(id: string) {
 export function markAllReportsRead(params?: Record<string, any>) {
     return request.post("/reports/read-all", null, { params });
 }
+
+// ---- Comments ----
+
+export function getReportComments(reportId: string) {
+    return request.get(`/reports/${reportId}/comments`);
+}
+
+export function createReportComment(reportId: string, data: { content: string; parent_id?: number | null; mentions?: string[] }) {
+    return request.post(`/reports/${reportId}/comments`, data);
+}
+
+export function updateReportComment(commentId: number, data: { content: string; mentions?: string[] }) {
+    return request.put(`/reports/comments/${commentId}`, data);
+}
+
+export function deleteReportComment(commentId: number) {
+    return request.delete(`/reports/comments/${commentId}`);
+}
+
+// ---- Reaction Phrases (admin) ----
+
+export function getReactionPhrases(params?: { enabled_only?: boolean }) {
+    return request.get("/reports/reaction-phrases", { params });
+}
+
+export function createReactionPhrase(data: { code: string; label: string; emoji?: string; sort_order?: number; enabled?: boolean }) {
+    return request.post("/reports/reaction-phrases", data);
+}
+
+export function updateReactionPhrase(id: string, data: { label?: string; emoji?: string; sort_order?: number; enabled?: boolean }) {
+    return request.put(`/reports/reaction-phrases/${id}`, data);
+}
+
+export function deleteReactionPhrase(id: string) {
+    return request.delete(`/reports/reaction-phrases/${id}`);
+}

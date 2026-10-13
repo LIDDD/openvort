@@ -16,8 +16,9 @@ class CreateProjectTool(BaseTool):
     name = "vortflow_create_project"
     description = (
         "在 VortFlow 中创建一个新项目。"
-        "需要提供项目名称，可选描述、产品线、迭代、版本、起止时间。"
+        "需要提供项目名称，可选描述、起止时间。"
         "创建后当前用户自动成为项目 owner。"
+        "如需关联迭代/版本，创建项目后再用 vortflow_manage_iteration / vortflow_manage_version 维护。"
     )
     required_permission = "vortflow.admin"
 
@@ -30,9 +31,6 @@ class CreateProjectTool(BaseTool):
             "properties": {
                 "name": {"type": "string", "description": "项目名称"},
                 "description": {"type": "string", "description": "项目描述", "default": ""},
-                "product": {"type": "string", "description": "产品线名称", "default": ""},
-                "iteration": {"type": "string", "description": "迭代名称（如 Sprint 1）", "default": ""},
-                "version": {"type": "string", "description": "版本号（如 v1.0）", "default": ""},
                 "start_date": {"type": "string", "description": "开始时间 (YYYY-MM-DD)，可选", "default": ""},
                 "end_date": {"type": "string", "description": "结束时间 (YYYY-MM-DD)，可选", "default": ""},
             },
@@ -63,9 +61,6 @@ class CreateProjectTool(BaseTool):
                 id=project_id,
                 name=name,
                 description=params.get("description", ""),
-                product=params.get("product", ""),
-                iteration=params.get("iteration", ""),
-                version=params.get("version", ""),
                 owner_id=member_id or None,
                 start_date=start_date,
                 end_date=end_date,

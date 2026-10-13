@@ -247,12 +247,12 @@ async def upload_avatar(request: Request, file: UploadFile = File(...)):
     # 校验文件类型
     allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     if file.content_type not in allowed:
-        return {"error": "仅支持 jpg/png/gif/webp 格式"}
+        raise HTTPException(status_code=400, detail="仅支持 jpg/png/gif/webp 格式")
 
     # 读取并保存
     content = await file.read()
     if len(content) > 5 * 1024 * 1024:
-        return {"error": "文件大小不能超过 5MB"}
+        raise HTTPException(status_code=413, detail="文件大小不能超过 5MB")
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     ext = file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "png"
@@ -272,7 +272,7 @@ async def upload_avatar(request: Request, file: UploadFile = File(...)):
         result = await session.execute(stmt)
         member = result.scalar_one_or_none()
         if not member:
-            return {"error": "用户不存在"}
+            raise HTTPException(status_code=404, detail="用户不存在")
         member.avatar_url = avatar_url
         member.avatar_source = "manual"
         await session.commit()

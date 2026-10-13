@@ -108,6 +108,7 @@ const props = defineProps<{
     entityId: string;
     title: string;
     projectId: string;
+    currentMemberId: string;
     ownerId: string;
     ownerName: string;
     collaboratorNames: string[];
@@ -135,8 +136,9 @@ const hasCollaborators = computed(() => props.collaboratorNames.length > 0);
 const candidateMembers = computed<CandidateMember[]>(() => {
     const members: CandidateMember[] = [];
     const seen = new Set<string>();
+    const self = props.currentMemberId;
 
-    if (props.ownerId && props.ownerName) {
+    if (props.ownerId && props.ownerName && props.ownerId !== self) {
         members.push({
             id: props.ownerId,
             name: props.ownerName,
@@ -148,7 +150,7 @@ const candidateMembers = computed<CandidateMember[]>(() => {
 
     for (const name of props.collaboratorNames) {
         const id = props.getMemberIdByName(name);
-        if (id && !seen.has(id)) {
+        if (id && !seen.has(id) && id !== self) {
             members.push({
                 id,
                 name,
@@ -204,7 +206,7 @@ async function handleSubmit() {
     }
     submitting.value = true;
     try {
-        await sendVortflowNotify({
+        const res = await sendVortflowNotify({
             entity_type: props.entityType,
             entity_id: props.entityId,
             title: props.title,
@@ -213,6 +215,11 @@ async function handleSubmit() {
             recipient_ids: form.value.recipientIds,
             message: form.value.message || undefined,
         });
+        if (res.data?.success === false) {
+            const err = res.data.error;
+            message.warning(err === "cannot_notify_self" ? "不能给自己发送通知" : err || "发送通知失败");
+            return;
+        }
         message.success("通知已发送");
         emit("sent");
         emit("update:open", false);

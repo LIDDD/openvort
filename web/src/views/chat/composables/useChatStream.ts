@@ -186,6 +186,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             const messageId = res?.message_id;
             if (!messageId) {
                 assistantMsg.content = "发送失败，请重试。";
+                assistantMsg.streaming = false;
                 loading.value = false;
                 return;
             }
@@ -462,6 +463,7 @@ export function useChatStream(options: UseChatStreamOptions) {
                 errorMsg = "网络连接失败，请检查网络";
             }
             assistantMsg.content = errorMsg;
+            assistantMsg.streaming = false;
             loading.value = false;
             aborting.value = false;
         }

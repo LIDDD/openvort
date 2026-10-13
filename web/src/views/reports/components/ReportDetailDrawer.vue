@@ -5,6 +5,7 @@ import { Clock, Pencil, Undo2 } from "lucide-vue-next";
 import { message } from "@openvort/vort-ui";
 import { MarkdownView, VortEditor } from "@/components/vort-biz/editor";
 import { useUserStore } from "@/stores";
+import CommentList from "./CommentList.vue";
 
 const props = defineProps<{
     open: boolean;
@@ -180,9 +181,22 @@ async function saveEdit() {
                             <vort-button size="small" variant="primary" :loading="saving" @click="saveEdit">保存</vort-button>
                         </div>
                     </div>
+
+                    <!-- Comments (with quick phrase chips above input) -->
+                    <div v-if="!editing && report.status === 'submitted'" class="report-detail-comments">
+                        <CommentList :report-id="report.id" />
+                    </div>
                 </div>
             </template>
             <div v-else-if="!loading" class="text-gray-400 text-sm text-center py-16">汇报不存在</div>
         </vort-spin>
     </vort-drawer>
 </template>
+
+<style scoped>
+.report-detail-comments {
+    padding-top: 16px;
+    margin-top: 4px;
+    border-top: 1px solid #f3f4f6;
+}
+</style>

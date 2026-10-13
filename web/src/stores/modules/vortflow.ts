@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import {
     getVortflowProjects,
+    starVortflowProject, unstarVortflowProject,
     getVortflowViews, createVortflowView, updateVortflowView, deleteVortflowView,
     getVortflowColumnSettings, saveVortflowColumnSettings,
 } from "@/api";
@@ -15,6 +16,7 @@ export interface VortFlowProject {
     story_count?: number;
     task_count?: number;
     bug_count?: number;
+    is_starred?: boolean;
 }
 
 export interface CustomView {
@@ -38,8 +40,14 @@ export interface PersistedColumnSetting {
 export const useVortFlowStore = defineStore(
     "vortflow",
     () => {
-        const selectedProjectId = ref<string>("");
+        // 多选筛选范围（浏览/统计场景），空数组 = 全部项目
+        const selectedProjectIds = ref<string[]>([]);
+        // 单项目上下文（新建默认项目、迭代/版本归属、项目详情等强单项目场景）
+        const activeProjectId = ref<string>("");
         const viewIdByType = ref<Record<string, string>>({});
+        // 按项目记忆工作墙的迭代选择；key 为 projectId（""=全部项目时用 "__all__"）
+        // value: ""=全部 / "__active__"=当前迭代(默认) / "__unplanned__"=未排期 / 具体迭代 id
+        const iterationIdByProject = ref<Record<string, string>>({});
         const projects = ref<VortFlowProject[]>([]);
         const projectsLoaded = ref(false);
         const customViews = ref<CustomView[]>([]);
@@ -51,13 +59,54 @@ export const useVortFlowStore = defineStore(
         const ganttZoomLevel = ref<"day" | "week" | "month" | "quarter">("day");
         const ganttDividerRatio = ref(0.5);
 
-        const selectedProject = computed(() => {
-            if (!selectedProjectId.value) return null;
-            return projects.value.find(p => p.id === selectedProjectId.value) ?? null;
+        // 兼容别名：旧代码大量读取/写入 selectedProjectId，映射到 activeProjectId
+        const selectedProjectId = computed<string>({
+            get: () => activeProjectId.value,
+            set: (id: string) => setProjectId(id),
         });
 
+        const selectedProject = computed(() => {
+            if (!activeProjectId.value) return null;
+            return projects.value.find(p => p.id === activeProjectId.value) ?? null;
+        });
+
+        // 多选选中的项目对象列表（保持 projects 中的顺序）
+        const selectedProjects = computed(() => {
+            if (!selectedProjectIds.value.length) return [];
+            const set = new Set(selectedProjectIds.value);
+            return projects.value.filter(p => set.has(p.id));
+        });
+
+        const starredProjects = computed(() => projects.value.filter(p => p.is_starred));
+
+        // 单项目选择：同时收敛多选范围（id 为空表示全部项目）
         const setProjectId = (id: string) => {
-            selectedProjectId.value = id;
+            activeProjectId.value = id;
+            selectedProjectIds.value = id ? [id] : [];
+        };
+
+        // 多选设置：同步 activeProjectId，保证单项目场景始终有合理默认值
+        const setSelectedProjectIds = (ids: string[]) => {
+            const next = Array.from(new Set(ids.filter(Boolean)));
+            selectedProjectIds.value = next;
+            if (next.length === 1) {
+                activeProjectId.value = next[0]!;
+            } else if (next.length === 0) {
+                activeProjectId.value = "";
+            } else if (!next.includes(activeProjectId.value)) {
+                activeProjectId.value = next[0]!;
+            }
+        };
+
+        const toggleProjectId = (id: string) => {
+            if (!id) {
+                setSelectedProjectIds([]);
+                return;
+            }
+            const cur = selectedProjectIds.value;
+            setSelectedProjectIds(
+                cur.includes(id) ? cur.filter(x => x !== id) : [...cur, id]
+            );
         };
 
         const getViewId = (type: string): string => {
@@ -66,6 +115,19 @@ export const useVortFlowStore = defineStore(
 
         const setViewId = (type: string, viewId: string) => {
             viewIdByType.value = { ...viewIdByType.value, [type]: viewId };
+        };
+
+        const _iterKey = (projectId: string) => projectId || "__all__";
+
+        const getIterationId = (projectId: string): string => {
+            return iterationIdByProject.value[_iterKey(projectId)] ?? "__active__";
+        };
+
+        const setIterationId = (projectId: string, iterId: string) => {
+            iterationIdByProject.value = {
+                ...iterationIdByProject.value,
+                [_iterKey(projectId)]: iterId,
+            };
         };
 
         // ---- Views (API-backed) ----
@@ -203,6 +265,7 @@ export const useVortFlowStore = defineStore(
                     story_count: p.story_count ?? 0,
                     task_count: p.task_count ?? 0,
                     bug_count: p.bug_count ?? 0,
+                    is_starred: p.is_starred ?? false,
                 }));
                 projectsLoaded.value = true;
             } catch {
@@ -210,12 +273,34 @@ export const useVortFlowStore = defineStore(
             }
         };
 
+        // 星标 toggle（乐观更新 + 失败回滚）
+        const toggleStar = async (id: string) => {
+            const p = projects.value.find(x => x.id === id);
+            if (!p) return;
+            const next = !p.is_starred;
+            p.is_starred = next;
+            try {
+                if (next) await starVortflowProject(id);
+                else await unstarVortflowProject(id);
+            } catch {
+                p.is_starred = !next;
+            }
+        };
+
+        // 选中我关注的全部项目作为多选范围
+        const selectStarredProjects = () => {
+            setSelectedProjectIds(projects.value.filter(p => p.is_starred).map(p => p.id));
+        };
+
         return {
-            selectedProjectId, viewIdByType, projects, projectsLoaded,
+            selectedProjectId, selectedProjectIds, activeProjectId,
+            viewIdByType, iterationIdByProject, projects, projectsLoaded,
             customViews, viewsLoaded, columnSettingsByType, columnSettingsLoaded, tablePageSize,
             viewMode, ganttZoomLevel, ganttDividerRatio,
-            selectedProject,
-            setProjectId, getViewId, setViewId, loadProjects,
+            selectedProject, selectedProjects, starredProjects,
+            setProjectId, setSelectedProjectIds, toggleProjectId,
+            toggleStar, selectStarredProjects,
+            getViewId, setViewId, getIterationId, setIterationId, loadProjects,
             loadViews, addCustomView,
             updateCustomView: updateCustomViewApi,
             deleteCustomView: deleteCustomViewApi,
@@ -225,7 +310,7 @@ export const useVortFlowStore = defineStore(
     },
     {
         persist: {
-            pick: ["selectedProjectId", "viewIdByType", "columnSettingsByType", "customViews", "tablePageSize", "viewMode", "ganttZoomLevel", "ganttDividerRatio"],
+            pick: ["selectedProjectIds", "activeProjectId", "viewIdByType", "iterationIdByProject", "columnSettingsByType", "customViews", "tablePageSize", "viewMode", "ganttZoomLevel", "ganttDividerRatio"],
         },
     }
 );

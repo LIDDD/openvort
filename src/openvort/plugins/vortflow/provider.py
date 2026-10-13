@@ -96,7 +96,7 @@ class VortFlowProjectProvider:
         since: datetime | None = None,
         until: datetime | None = None,
     ) -> TasksSummary:
-        from openvort.plugins.vortflow.engine import BUG_CLOSED_STATES
+        from openvort.plugins.vortflow.engine import BUG_CLOSED_STATES, TASK_DONE_STATES
         from openvort.plugins.vortflow.models import FlowBug, FlowTask
 
         sf = self._sf()
@@ -108,7 +108,7 @@ class VortFlowProjectProvider:
                 task_q = task_q.where(FlowTask.project_id == project_id)
                 bug_q = bug_q.where(FlowBug.project_id == project_id)
 
-            task_done_q = task_q.where(FlowTask.state == "done")
+            task_done_q = task_q.where(FlowTask.state.in_(TASK_DONE_STATES))
             bug_fixed_q = bug_q.where(FlowBug.state.in_(BUG_CLOSED_STATES))
 
             if member_id:
@@ -156,7 +156,9 @@ class VortFlowProjectProvider:
         """
         import json as _json
 
-        from openvort.plugins.vortflow.engine import BUG_CLOSED_STATES
+        from openvort.plugins.vortflow.engine import (
+            BUG_CLOSED_STATES, StoryState, TaskState,
+        )
         from openvort.plugins.vortflow.models import (
             FlowBug, FlowEvent, FlowProject, FlowStory, FlowTask,
         )
@@ -235,14 +237,18 @@ class VortFlowProjectProvider:
             tasks_doing = (await session.execute(
                 select(FlowTask).where(
                     *task_where,
-                    FlowTask.state.in_(("doing", "in_progress")),
+                    FlowTask.state == TaskState.IN_PROGRESS.value,
                 )
             )).scalars().all()
 
             stories = (await session.execute(
                 select(FlowStory).where(
                     *story_where,
-                    FlowStory.state.in_(("developing", "reviewing", "testing")),
+                    FlowStory.state.in_((
+                        StoryState.IN_PROGRESS.value,
+                        StoryState.REVIEW.value,
+                        StoryState.TESTING.value,
+                    )),
                 )
             )).scalars().all()
 

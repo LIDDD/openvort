@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, onMounted, watch, type Ref } from "vue";
 import { useCrudPage } from "@/hooks";
 import { Plus } from "lucide-vue-next";
 import { DownOutlined } from "@openvort/vort-ui";
@@ -33,6 +33,9 @@ const vortFlowStore = useVortFlowStore();
 const projectName = computed(() =>
     vortFlowStore.projects.find(p => p.id === vortFlowStore.selectedProjectId)?.name || ""
 );
+// 跨多项目（含全部项目）时展示「所属项目」列
+const showProjectColumn = computed(() => (vortFlowStore.selectedProjectIds?.length || 0) !== 1);
+const projectNameById = (id: string) => vortFlowStore.projects.find(p => p.id === id)?.name || id;
 const activeTab = ref("version-list");
 const filterOwnerDropdownOpen = ref(false);
 const filterOwnerKeyword = ref("");
@@ -48,7 +51,21 @@ const {
     loadMemberOptions,
     getMemberIdByName,
     getMemberNameById,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
+
+const verEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const verEnrichedCollapsed = ref<string[]>([]);
+const verActiveGroups = computed(() =>
+    verEnrichedGroups.value.length > 0 ? verEnrichedGroups.value : ownerGroups.value,
+);
+const refreshVerEnrichedGroups = () => {
+    const pid = vortFlowStore.selectedProjectId || "";
+    getEnrichedOwnerGroups(pid).then((groups) => {
+        verEnrichedGroups.value = groups;
+        verEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+    });
+};
 
 const statusOptions = [
     { label: "全部", value: "" },
@@ -61,10 +78,10 @@ const statusLabels: Record<string, string> = { planning: "规划中", released: 
 const stageLabelMap: Record<string, string> = { planning: "开发环境", released: "已发布", archived: "已归档" };
 
 const fetchList = async (params: FilterParams) => {
-    const projectId = vortFlowStore.selectedProjectId || undefined;
+    const projectIds = vortFlowStore.selectedProjectIds || [];
     const res = await getVortflowVersions({
         keyword: params.keyword, status: params.status, owner_id: params.owner_id,
-        project_id: projectId,
+        project_ids: projectIds.length ? projectIds.join(",") : undefined,
         page: params.page, page_size: params.size,
     });
     return { records: (res as any).items || [], total: (res as any).total || 0 };
@@ -76,9 +93,10 @@ const { listData, loading, total, filterParams, showPagination, loadData, onSear
         defaultParams: { page: 1, size: 20, keyword: "", status: "", owner_id: "" },
     });
 
-watch(() => vortFlowStore.selectedProjectId, () => {
+watch(() => vortFlowStore.selectedProjectIds, () => {
     loadData();
-});
+    refreshVerEnrichedGroups();
+}, { deep: true });
 
 const getVersionOwnerId = (item: VersionItem) => String(item.owner_id || "").trim();
 const getVersionOwnerName = (item: VersionItem) => getMemberNameById(getVersionOwnerId(item)) || "未指派";
@@ -233,6 +251,7 @@ const handleFilterOwnerSelect = (name: string) => {
     filterParams.owner_id = getMemberIdByName(name);
     filterOwnerDropdownOpen.value = false;
     filterOwnerKeyword.value = "";
+    if (name) recordRecentMember(name);
     onSearchSubmit();
 };
 
@@ -240,10 +259,12 @@ const handleFormOwnerSelect = (name: string) => {
     createVersionForm.value.owner_id = getMemberIdByName(name);
     formOwnerDropdownOpen.value = false;
     formOwnerKeyword.value = "";
+    if (name) recordRecentMember(name);
 };
 
 onMounted(async () => {
     await Promise.all([loadMemberOptions(), loadData()]);
+    refreshVerEnrichedGroups();
 });
 </script>
 
@@ -291,7 +312,8 @@ onMounted(async () => {
                     <WorkItemMemberPicker
                         mode="owner"
                         :owner="getMemberNameById(filterParams.owner_id)"
-                        :groups="ownerGroups"
+                        :groups="verActiveGroups"
+                        :default-collapsed="verEnrichedCollapsed"
                         :open="filterOwnerDropdownOpen"
                         v-model:keyword="filterOwnerKeyword"
                         :show-all-option="true"
@@ -342,6 +364,12 @@ onMounted(async () => {
                 <vort-table-column label="版本名称" :min-width="220">
                     <template #default="{ row }">
                         <span class="text-sm text-gray-800">{{ row.description || "-" }}</span>
+                    </template>
+                </vort-table-column>
+
+                <vort-table-column v-if="showProjectColumn" label="所属项目" :width="160">
+                    <template #default="{ row }">
+                        <span class="text-sm text-gray-600">{{ row.project_name || projectNameById(row.project_id) }}</span>
                     </template>
                 </vort-table-column>
 
@@ -480,7 +508,8 @@ onMounted(async () => {
                         <WorkItemMemberPicker
                             mode="owner"
                             :owner="getMemberNameById(createVersionForm.owner_id)"
-                            :groups="ownerGroups"
+                            :groups="verActiveGroups"
+                            :default-collapsed="verEnrichedCollapsed"
                             :open="formOwnerDropdownOpen"
                             v-model:keyword="formOwnerKeyword"
                             :dropdown-max-height="420"

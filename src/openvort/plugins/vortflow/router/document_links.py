@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
@@ -137,7 +137,7 @@ async def create_document_link(body: DocLinkCreate, request: Request):
     async with sf() as session:
         doc = await session.get(KBDocument, body.document_id)
         if not doc:
-            return {"error": "文档不存在"}
+            raise HTTPException(status_code=404, detail="文档不存在")
 
         existing = await session.execute(
             select(FlowDocumentLink).where(
@@ -147,7 +147,7 @@ async def create_document_link(body: DocLinkCreate, request: Request):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "该文档已关联"}
+            raise HTTPException(status_code=409, detail="该文档已关联")
 
         sort_order = await _next_sort_order(session, body.entity_type, body.entity_id)
         link = FlowDocumentLink(
@@ -232,7 +232,7 @@ async def upload_doc_and_link(
     file_name = file.filename or "unknown"
     ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "txt"
     if ext not in ("pdf", "docx", "doc", "md", "markdown", "txt", "text"):
-        return {"error": f"不支持的文件类型: {ext}"}
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
 
     file_bytes = await file.read()
     file_size = len(file_bytes)
@@ -240,10 +240,10 @@ async def upload_doc_and_link(
     try:
         content = parse_document(file_bytes, ext, file_name)
     except Exception as e:
-        return {"error": f"文档解析失败: {e}"}
+        raise HTTPException(status_code=400, detail=f"文档解析失败: {e}")
 
     if not content or not content.strip():
-        return {"error": "文档内容为空"}
+        raise HTTPException(status_code=400, detail="文档内容为空")
 
     doc_title = title or file_name.rsplit(".", 1)[0]
     normalized_ext = ext if ext not in ("markdown", "text") else ("md" if ext == "markdown" else "txt")
@@ -305,7 +305,7 @@ async def delete_document_link(link_id: str):
     async with sf() as session:
         link = await session.get(FlowDocumentLink, link_id)
         if not link:
-            return {"error": "关联不存在"}
+            raise HTTPException(status_code=404, detail="关联不存在")
         await _log_event(session, link.entity_type, link.entity_id, "doc_unlinked",
                          {"document_id": link.document_id})
         await session.delete(link)

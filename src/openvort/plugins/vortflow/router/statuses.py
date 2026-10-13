@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import func, select
 
 from openvort.db.engine import get_session_factory
@@ -40,7 +40,7 @@ async def create_status(body: StatusCreate):
             select(FlowStatus).where(FlowStatus.name == body.name)
         )
         if existing.scalar_one_or_none():
-            return {"error": "状态名称已存在"}
+            raise HTTPException(status_code=409, detail="状态名称已存在")
         max_order = await session.execute(
             select(func.coalesce(func.max(FlowStatus.sort_order), 0))
         )
@@ -65,13 +65,13 @@ async def update_status(status_id: str, body: StatusUpdate):
     async with sf() as session:
         status = await session.get(FlowStatus, status_id)
         if not status:
-            return {"error": "状态不存在"}
+            raise HTTPException(status_code=404, detail="状态不存在")
         if body.name is not None and body.name != status.name:
             dup = await session.execute(
                 select(FlowStatus).where(FlowStatus.name == body.name, FlowStatus.id != status_id)
             )
             if dup.scalar_one_or_none():
-                return {"error": "状态名称已存在"}
+                raise HTTPException(status_code=409, detail="状态名称已存在")
             status.name = body.name
         if body.icon is not None:
             status.icon = body.icon
@@ -92,7 +92,7 @@ async def delete_status(status_id: str):
     async with sf() as session:
         status = await session.get(FlowStatus, status_id)
         if not status:
-            return {"error": "状态不存在"}
+            raise HTTPException(status_code=404, detail="状态不存在")
         await session.delete(status)
         await session.commit()
     return {"ok": True}

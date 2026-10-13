@@ -19,7 +19,9 @@ services:
       - ./web/dist:/app/web/dist:ro
       - ./alembic:/app/alembic:ro
       - openvort_data:/root/.openvort
+      - acme_data:/root/.acme.sh
     restart: unless-stopped
 
 volumes:
   openvort_data:
+  acme_data:

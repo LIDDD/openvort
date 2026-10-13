@@ -21,10 +21,12 @@ from openvort.utils.logging import get_logger
 from openvort.web.app import require_auth
 
 from .helpers import (
+    _attach_project_names,
     _build_module_path,
     _get_descendant_module_ids,
     _resolve_member_name,
     _test_plan_dict,
+    resolve_project_ids,
 )
 
 log = get_logger("plugins.vortflow.test_plans")
@@ -184,7 +186,8 @@ async def _enrich_plan(session, plan: FlowTestPlan) -> dict:
 
 @sub_router.get("/test-plans")
 async def list_test_plans(
-    project_id: str = Query(""),
+    project_id: str = Query("", description="按项目过滤（单个）"),
+    project_ids: str = Query("", description="按项目过滤（逗号分隔多选，优先于 project_id）"),
     status: str = Query(""),
     keyword: str = Query(""),
     page: int = Query(1, ge=1),
@@ -194,9 +197,10 @@ async def list_test_plans(
     async with sf() as session:
         stmt = select(FlowTestPlan).order_by(FlowTestPlan.created_at.desc())
         count_stmt = select(func.count()).select_from(FlowTestPlan)
-        if project_id:
-            stmt = stmt.where(FlowTestPlan.project_id == project_id)
-            count_stmt = count_stmt.where(FlowTestPlan.project_id == project_id)
+        pids = resolve_project_ids(project_id, project_ids)
+        if pids:
+            stmt = stmt.where(FlowTestPlan.project_id.in_(pids))
+            count_stmt = count_stmt.where(FlowTestPlan.project_id.in_(pids))
         if status:
             stmt = stmt.where(FlowTestPlan.status == status)
             count_stmt = count_stmt.where(FlowTestPlan.status == status)
@@ -212,6 +216,7 @@ async def list_test_plans(
         items = []
         for plan in rows:
             items.append(await _enrich_plan(session, plan))
+        await _attach_project_names(session, items)
     return {"total": total, "items": items}
 
 
@@ -221,7 +226,7 @@ async def get_test_plan(plan_id: str):
     async with sf() as session:
         plan = await session.get(FlowTestPlan, plan_id)
         if not plan:
-            return {"error": "测试计划不存在"}
+            raise HTTPException(status_code=404, detail="测试计划不存在")
         return await _enrich_plan(session, plan)
 
 
@@ -255,7 +260,7 @@ async def update_test_plan(plan_id: str, body: TestPlanUpdate):
     async with sf() as session:
         plan = await session.get(FlowTestPlan, plan_id)
         if not plan:
-            return {"error": "测试计划不存在"}
+            raise HTTPException(status_code=404, detail="测试计划不存在")
         for field in ["title", "description", "status", "owner_id", "start_date", "end_date"]:
             val = getattr(body, field)
             if val is not None:
@@ -275,7 +280,7 @@ async def delete_test_plan(plan_id: str):
     async with sf() as session:
         plan = await session.get(FlowTestPlan, plan_id)
         if not plan:
-            return {"error": "测试计划不存在"}
+            raise HTTPException(status_code=404, detail="测试计划不存在")
         # Cascade: executions -> plan_cases -> reviews -> plan
         case_ids_result = await session.execute(
             select(FlowTestPlanCase.id).where(FlowTestPlanCase.plan_id == plan_id)
@@ -314,7 +319,7 @@ async def copy_test_plan(plan_id: str, request: Request):
     async with sf() as session:
         src = await session.get(FlowTestPlan, plan_id)
         if not src:
-            return {"error": "测试计划不存在"}
+            raise HTTPException(status_code=404, detail="测试计划不存在")
         new_plan = FlowTestPlan(
             project_id=src.project_id,
             title=f"{src.title} (副本)",
@@ -513,7 +518,7 @@ async def add_plan_cases(plan_id: str, body: TestPlanAddCasesBody, request: Requ
     async with sf() as session:
         plan = await session.get(FlowTestPlan, plan_id)
         if not plan:
-            return {"error": "测试计划不存在"}
+            raise HTTPException(status_code=404, detail="测试计划不存在")
 
         existing = (await session.execute(
             select(FlowTestPlanCase.test_case_id)
@@ -568,7 +573,7 @@ async def add_execution(plan_id: str, plan_case_id: str, body: TestPlanExecution
     async with sf() as session:
         pc = await session.get(FlowTestPlanCase, plan_case_id)
         if not pc or pc.plan_id != plan_id:
-            return {"error": "计划用例不存在"}
+            raise HTTPException(status_code=404, detail="计划用例不存在")
         ex = FlowTestPlanExecution(
             plan_case_id=plan_case_id,
             result=body.result,
@@ -596,7 +601,7 @@ async def list_executions(plan_id: str, plan_case_id: str):
     async with sf() as session:
         pc = await session.get(FlowTestPlanCase, plan_case_id)
         if not pc or pc.plan_id != plan_id:
-            return {"error": "计划用例不存在"}
+            raise HTTPException(status_code=404, detail="计划用例不存在")
         rows = (await session.execute(
             select(FlowTestPlanExecution)
             .where(FlowTestPlanExecution.plan_case_id == plan_case_id)
@@ -689,7 +694,7 @@ async def add_plan_reviews(plan_id: str, body: TestPlanAddReviewsBody, request: 
     async with sf() as session:
         plan = await session.get(FlowTestPlan, plan_id)
         if not plan:
-            return {"error": "测试计划不存在"}
+            raise HTTPException(status_code=404, detail="测试计划不存在")
 
         existing = (await session.execute(
             select(FlowTestPlanReview.repo_id, FlowTestPlanReview.pr_number)
@@ -728,7 +733,7 @@ async def update_plan_review(plan_id: str, review_id: str, body: TestPlanUpdateR
     async with sf() as session:
         review = await session.get(FlowTestPlanReview, review_id)
         if not review or review.plan_id != plan_id:
-            return {"error": "评审项不存在"}
+            raise HTTPException(status_code=404, detail="评审项不存在")
 
         old_status = review.review_status
 
@@ -768,7 +773,7 @@ async def remove_plan_review(plan_id: str, review_id: str):
     async with sf() as session:
         review = await session.get(FlowTestPlanReview, review_id)
         if not review or review.plan_id != plan_id:
-            return {"error": "评审项不存在"}
+            raise HTTPException(status_code=404, detail="评审项不存在")
         await session.execute(
             sa_delete(FlowTestPlanReviewHistory)
             .where(FlowTestPlanReviewHistory.review_id == review_id)
@@ -824,7 +829,7 @@ async def list_review_history(plan_id: str, review_id: str):
     async with sf() as session:
         review = await session.get(FlowTestPlanReview, review_id)
         if not review or review.plan_id != plan_id:
-            return {"error": "评审项不存在"}
+            raise HTTPException(status_code=404, detail="评审项不存在")
         rows = (await session.execute(
             select(FlowTestPlanReviewHistory)
             .where(FlowTestPlanReviewHistory.review_id == review_id)
@@ -877,13 +882,13 @@ async def ai_review(plan_id: str, review_id: str, request: Request):
     async with sf() as session:
         review = await session.get(FlowTestPlanReview, review_id)
         if not review or review.plan_id != plan_id:
-            return {"error": "评审项不存在"}
+            raise HTTPException(status_code=404, detail="评审项不存在")
         repo = await session.get(GitRepo, review.repo_id)
         if not repo:
-            return {"error": "仓库不存在"}
+            raise HTTPException(status_code=404, detail="仓库不存在")
         provider = await session.get(GitProvider, repo.provider_id)
         if not provider:
-            return {"error": "Git 平台配置不存在"}
+            raise HTTPException(status_code=404, detail="Git 平台配置不存在")
 
     client = _create_git_client(provider)
     try:
@@ -971,4 +976,4 @@ async def ai_review(plan_id: str, review_id: str, request: Request):
             from openvort.plugins.vortgit.models import GitRepo as GR
             repo_obj = await session.get(GR, review.repo_id)
             return _review_to_dict(review, reviewer_name=reviewer_name, repo_name=repo_obj.name if repo_obj else "")
-    return {"error": "评审项不存在"}
+    raise HTTPException(status_code=404, detail="评审项不存在")

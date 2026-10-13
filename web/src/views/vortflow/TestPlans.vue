@@ -42,6 +42,9 @@ type FilterParams = { page: number; size: number; keyword: string; status: strin
 
 const router = useRouter();
 const vortFlowStore = useVortFlowStore();
+// 跨多项目（含全部项目）时展示「所属项目」列
+const showProjectColumn = computed(() => (vortFlowStore.selectedProjectIds?.length || 0) !== 1);
+const projectNameById = (id: string) => vortFlowStore.projects.find(p => p.id === id)?.name || id;
 
 const {
     getAvatarBg,
@@ -70,11 +73,11 @@ const statusLabels: Record<string, string> = {
 };
 
 const fetchList = async (params: FilterParams) => {
-    const projectId = vortFlowStore.selectedProjectId || undefined;
+    const projectIds = vortFlowStore.selectedProjectIds || [];
     const res = await getVortflowTestPlans({
         keyword: params.keyword,
         status: params.status,
-        project_id: projectId,
+        project_ids: projectIds.length ? projectIds.join(",") : undefined,
         page: params.page,
         page_size: params.size,
     });
@@ -87,9 +90,9 @@ const { listData, loading, total, filterParams, showPagination, loadData, onSear
         defaultParams: { page: 1, size: 20, keyword: "", status: "" },
     });
 
-watch(() => vortFlowStore.selectedProjectId, () => {
+watch(() => vortFlowStore.selectedProjectIds, () => {
     loadData();
-});
+}, { deep: true });
 
 // Result distribution bar
 const resultBarStyle = (item: TestPlanItem) => {
@@ -201,6 +204,12 @@ onMounted(async () => {
                         >
                             {{ row.title }}
                         </a>
+                    </template>
+                </vort-table-column>
+
+                <vort-table-column v-if="showProjectColumn" label="所属项目" :width="160">
+                    <template #default="{ row }">
+                        <span class="text-sm text-gray-600">{{ row.project_name || projectNameById(row.project_id) }}</span>
                     </template>
                 </vort-table-column>
 

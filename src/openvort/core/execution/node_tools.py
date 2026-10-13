@@ -56,6 +56,83 @@ def _truncate_output(output: str, max_lines: int = 50) -> str:
     )
 
 
+_BRACKET_PAIRS = {")": "(", "]": "[", "}": "{"}
+_BRACKET_CHECK_EXTS = {".java", ".kt", ".go", ".cs"}
+
+
+def _check_brackets(content: str, ext: str) -> str:
+    """Check bracket balance for C-like sources, skipping strings, chars and comments."""
+    stack: list[tuple[str, int]] = []
+    i, n, line = 0, len(content), 1
+    while i < n:
+        c = content[i]
+        if c == "\n":
+            line += 1
+            i += 1
+        elif content.startswith("//", i):
+            end = content.find("\n", i)
+            i = n if end < 0 else end
+        elif content.startswith("/*", i):
+            end = content.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            line += content.count("\n", i, end)
+            i = end
+        elif content.startswith('"""', i):
+            end = content.find('"""', i + 3)
+            end = n if end < 0 else end + 3
+            line += content.count("\n", i, end)
+            i = end
+        elif c == "`" and ext == ".go":
+            end = content.find("`", i + 1)
+            end = n if end < 0 else end + 1
+            line += content.count("\n", i, end)
+            i = end
+        elif c in "\"'":
+            j = i + 1
+            while j < n and content[j] != c and content[j] != "\n":
+                j += 2 if content[j] == "\\" else 1
+            i = j + 1 if j < n and content[j] == c else j
+        elif c in "([{":
+            stack.append((c, line))
+            i += 1
+        elif c in ")]}":
+            if not stack or stack[-1][0] != _BRACKET_PAIRS[c]:
+                return f"第 {line} 行出现不匹配的 '{c}'"
+            stack.pop()
+            i += 1
+        else:
+            i += 1
+    if stack:
+        ch, ln = stack[-1]
+        return f"第 {ln} 行的 '{ch}' 未闭合"
+    return ""
+
+
+def _validate_content(path: str, content: str) -> str:
+    """Syntax-check written content by file extension. Returns an error message or ''."""
+    ext = ("." + path.rsplit(".", 1)[-1].lower()) if "." in path.rsplit("/", 1)[-1] else ""
+    try:
+        if ext == ".json":
+            json.loads(content)
+        elif ext == ".py":
+            compile(content, path, "exec")
+        elif ext == ".toml":
+            import tomllib
+            tomllib.loads(content)
+        elif ext == ".xml":
+            import xml.etree.ElementTree as ET
+            ET.fromstring(content)
+        elif ext in _BRACKET_CHECK_EXTS:
+            err = _check_brackets(content, ext)
+            if err:
+                return f"括号不平衡：{err}"
+    except SyntaxError as e:
+        return f"语法错误：第 {e.lineno} 行 {e.msg}"
+    except Exception as e:
+        return f"语法错误：{e}"
+    return ""
+
+
 async def _update_workspace_state(container_id: str, tool_name: str, params: dict) -> None:
     """Best-effort update of /workspace/.workspace_state.json after tool execution."""
     try:
@@ -462,6 +539,31 @@ class NodeFileWriteTool(BaseTool):
 
         asyncio.ensure_future(_update_workspace_state(container_id, "node_file_write", params))
 
+        problems: list[str] = []
+        if not append:
+            # Read back the size to confirm the bytes landed intact
+            expected = len(content.encode("utf-8"))
+            try:
+                size_result = await DockerExecutor._exec_streaming(
+                    container_id, f"wc -c < {shlex.quote(path)}", timeout=5,
+                )
+                actual = int(size_result["stdout"].strip())
+                if actual != expected:
+                    problems.append(f"回读大小不一致：期望 {expected} 字节，实际 {actual} 字节")
+            except Exception:
+                pass
+            syntax_error = _validate_content(path, content)
+            if syntax_error:
+                problems.append(syntax_error)
+
+        if problems:
+            log.warning(f"node_file_write 校验失败: {path}: {'; '.join(problems)}")
+            return (
+                f"文件已{action}: {path} ({line_count} 行)\n"
+                f"[校验失败] {'; '.join(problems)}\n"
+                "写入的内容与你提交的参数完全一致，问题出在提交的内容本身，"
+                "请读取该文件定位并修正。"
+            )
         return f"文件已{action}: {path} ({line_count} 行)"
 
 

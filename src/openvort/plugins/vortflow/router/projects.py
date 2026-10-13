@@ -1,7 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import func, select, delete as sa_delete, update as sa_update, or_
 
 from openvort.db.engine import get_session_factory
+from openvort.web.app import require_auth
 from openvort.plugins.vortflow.router.helpers import (
     _parse_dt,
     _project_dict,
@@ -15,10 +16,32 @@ from openvort.plugins.vortflow.router.schemas import (
 from openvort.plugins.vortflow.models import (
     FlowProject,
     FlowProjectMember,
+    FlowProjectStar,
     FlowStory,
     FlowTask,
     FlowBug,
+    FlowIteration,
+    FlowVersion,
+    FlowIterationStory,
+    FlowVersionStory,
+    FlowIterationTask,
+    FlowIterationBug,
+    FlowVersionBug,
+    FlowWorkItemLink,
+    FlowComment,
+    FlowDocumentLink,
+    FlowTestModule,
+    FlowTestCase,
+    FlowTestCaseWorkItem,
+    FlowTestPlan,
+    FlowTestPlanCase,
+    FlowTestPlanExecution,
+    FlowTestPlanReview,
+    FlowTestPlanReviewHistory,
+    FlowTestReport,
+    FlowReminderSettings,
 )
+from openvort.contacts.models import Member
 from openvort.plugins.vortgit.models import GitRepo
 
 sub_router = APIRouter()
@@ -27,11 +50,19 @@ sub_router = APIRouter()
 # ============ Project CRUD ============
 
 @sub_router.get("/projects")
-async def list_projects():
+async def list_projects(request: Request):
+    payload = require_auth(request)
+    member_id = payload.get("sub", "")
     sf = get_session_factory()
     async with sf() as session:
         result = await session.execute(select(FlowProject).order_by(FlowProject.created_at.desc()))
         rows = result.scalars().all()
+
+        starred_ids: set[str] = set()
+        if member_id:
+            starred_ids = set((await session.execute(
+                select(FlowProjectStar.project_id).where(FlowProjectStar.member_id == member_id)
+            )).scalars().all())
 
         items = []
         for r in rows:
@@ -58,8 +89,53 @@ async def list_projects():
                 "story_count": story_count,
                 "task_count": task_count,
                 "bug_count": bug_count,
+                "is_starred": r.id in starred_ids,
             })
+
+    # Starred projects float to the top; original created_at desc order kept within groups.
+    items.sort(key=lambda it: 0 if it.get("is_starred") else 1)
     return {"items": items}
+
+
+@sub_router.put("/projects/{project_id}/star")
+async def star_project(project_id: str, request: Request):
+    payload = require_auth(request)
+    member_id = payload.get("sub", "")
+    if not member_id:
+        raise HTTPException(status_code=401, detail="未认证")
+    sf = get_session_factory()
+    async with sf() as session:
+        p = await session.get(FlowProject, project_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="项目不存在")
+        existing = (await session.execute(
+            select(FlowProjectStar).where(
+                FlowProjectStar.member_id == member_id,
+                FlowProjectStar.project_id == project_id,
+            )
+        )).scalar_one_or_none()
+        if not existing:
+            session.add(FlowProjectStar(member_id=member_id, project_id=project_id))
+            await session.commit()
+    return {"ok": True, "is_starred": True}
+
+
+@sub_router.delete("/projects/{project_id}/star")
+async def unstar_project(project_id: str, request: Request):
+    payload = require_auth(request)
+    member_id = payload.get("sub", "")
+    if not member_id:
+        raise HTTPException(status_code=401, detail="未认证")
+    sf = get_session_factory()
+    async with sf() as session:
+        await session.execute(
+            sa_delete(FlowProjectStar).where(
+                FlowProjectStar.member_id == member_id,
+                FlowProjectStar.project_id == project_id,
+            )
+        )
+        await session.commit()
+    return {"ok": True, "is_starred": False}
 
 @sub_router.get("/projects/{project_id}")
 async def get_project(project_id: str):
@@ -67,7 +143,7 @@ async def get_project(project_id: str):
     async with sf() as session:
         r = await session.get(FlowProject, project_id)
         if not r:
-            return {"error": "项目不存在"}, 404
+            raise HTTPException(status_code=404, detail="项目不存在")
         members_stmt = select(FlowProjectMember).where(FlowProjectMember.project_id == project_id)
         members = (await session.execute(members_stmt)).scalars().all()
     return {
@@ -83,7 +159,6 @@ async def create_project(body: ProjectCreate):
         p = FlowProject(
             name=body.name, code=body.code, color=body.color,
             description=body.description,
-            product=body.product, iteration=body.iteration, version=body.version,
             owner_id=body.owner_id or None,
             start_date=_parse_dt(body.start_date), end_date=_parse_dt(body.end_date),
         )
@@ -118,9 +193,9 @@ async def update_project(project_id: str, body: ProjectUpdate):
     async with sf() as session:
         p = await session.get(FlowProject, project_id)
         if not p:
-            return {"error": "项目不存在"}
+            raise HTTPException(status_code=404, detail="项目不存在")
         changes = {}
-        for field in ["name", "code", "color", "description", "product", "iteration", "version"]:
+        for field in ["name", "code", "color", "description"]:
             val = getattr(body, field)
             if val is not None:
                 old_val = getattr(p, field)
@@ -174,8 +249,127 @@ async def delete_project(project_id: str):
     async with sf() as session:
         p = await session.get(FlowProject, project_id)
         if not p:
-            return {"error": "项目不存在"}
+            raise HTTPException(status_code=404, detail="项目不存在")
+
+        # Collect all work item ids belonging to the project. Tasks/bugs may have a
+        # NULL project_id but still hang off a project story (or task), so include
+        # them via story_id/task_id to avoid dangling FK references.
+        story_ids = list(
+            (await session.execute(select(FlowStory.id).where(FlowStory.project_id == project_id))).scalars().all()
+        )
+        task_where = FlowTask.project_id == project_id
+        if story_ids:
+            task_where = or_(task_where, FlowTask.story_id.in_(story_ids))
+        task_ids = list((await session.execute(select(FlowTask.id).where(task_where))).scalars().all())
+        bug_where = FlowBug.project_id == project_id
+        if story_ids:
+            bug_where = or_(bug_where, FlowBug.story_id.in_(story_ids))
+        if task_ids:
+            bug_where = or_(bug_where, FlowBug.task_id.in_(task_ids))
+        bug_ids = list((await session.execute(select(FlowBug.id).where(bug_where))).scalars().all())
+
+        iteration_ids = list(
+            (await session.execute(select(FlowIteration.id).where(FlowIteration.project_id == project_id))).scalars().all()
+        )
+        version_ids = list(
+            (await session.execute(select(FlowVersion.id).where(FlowVersion.project_id == project_id))).scalars().all()
+        )
+        plan_ids = list(
+            (await session.execute(select(FlowTestPlan.id).where(FlowTestPlan.project_id == project_id))).scalars().all()
+        )
+        case_ids = list(
+            (await session.execute(select(FlowTestCase.id).where(FlowTestCase.project_id == project_id))).scalars().all()
+        )
+
+        entity_ids = [*story_ids, *task_ids, *bug_ids]
+
+        # ---- Test management (children -> parents) ----
+        if plan_ids:
+            review_ids = list(
+                (await session.execute(select(FlowTestPlanReview.id).where(FlowTestPlanReview.plan_id.in_(plan_ids)))).scalars().all()
+            )
+            plan_case_ids = list(
+                (await session.execute(select(FlowTestPlanCase.id).where(FlowTestPlanCase.plan_id.in_(plan_ids)))).scalars().all()
+            )
+            if review_ids:
+                await session.execute(sa_delete(FlowTestPlanReviewHistory).where(FlowTestPlanReviewHistory.review_id.in_(review_ids)))
+            await session.execute(sa_delete(FlowTestPlanReview).where(FlowTestPlanReview.plan_id.in_(plan_ids)))
+            if plan_case_ids:
+                await session.execute(sa_delete(FlowTestPlanExecution).where(FlowTestPlanExecution.plan_case_id.in_(plan_case_ids)))
+            await session.execute(sa_delete(FlowTestPlanCase).where(FlowTestPlanCase.plan_id.in_(plan_ids)))
+        # test reports reference plans, delete before plans
+        await session.execute(sa_delete(FlowTestReport).where(FlowTestReport.project_id == project_id))
+        await session.execute(sa_delete(FlowTestPlan).where(FlowTestPlan.project_id == project_id))
+        if case_ids:
+            await session.execute(sa_delete(FlowTestCaseWorkItem).where(FlowTestCaseWorkItem.test_case_id.in_(case_ids)))
+        await session.execute(sa_delete(FlowTestCase).where(FlowTestCase.project_id == project_id))
+        await session.execute(sa_delete(FlowTestModule).where(FlowTestModule.project_id == project_id))
+
+        # ---- Iteration / version associations ----
+        if story_ids or iteration_ids:
+            conds = []
+            if story_ids:
+                conds.append(FlowIterationStory.story_id.in_(story_ids))
+            if iteration_ids:
+                conds.append(FlowIterationStory.iteration_id.in_(iteration_ids))
+            await session.execute(sa_delete(FlowIterationStory).where(or_(*conds)))
+        if story_ids or version_ids:
+            conds = []
+            if story_ids:
+                conds.append(FlowVersionStory.story_id.in_(story_ids))
+            if version_ids:
+                conds.append(FlowVersionStory.version_id.in_(version_ids))
+            await session.execute(sa_delete(FlowVersionStory).where(or_(*conds)))
+        if task_ids or iteration_ids:
+            conds = []
+            if task_ids:
+                conds.append(FlowIterationTask.task_id.in_(task_ids))
+            if iteration_ids:
+                conds.append(FlowIterationTask.iteration_id.in_(iteration_ids))
+            await session.execute(sa_delete(FlowIterationTask).where(or_(*conds)))
+        if bug_ids or iteration_ids:
+            conds = []
+            if bug_ids:
+                conds.append(FlowIterationBug.bug_id.in_(bug_ids))
+            if iteration_ids:
+                conds.append(FlowIterationBug.iteration_id.in_(iteration_ids))
+            await session.execute(sa_delete(FlowIterationBug).where(or_(*conds)))
+        if bug_ids or version_ids:
+            conds = []
+            if bug_ids:
+                conds.append(FlowVersionBug.bug_id.in_(bug_ids))
+            if version_ids:
+                conds.append(FlowVersionBug.version_id.in_(version_ids))
+            await session.execute(sa_delete(FlowVersionBug).where(or_(*conds)))
+
+        # ---- Links / comments / document links keyed by work item ids ----
+        if entity_ids:
+            await session.execute(sa_delete(FlowWorkItemLink).where(
+                or_(FlowWorkItemLink.source_id.in_(entity_ids), FlowWorkItemLink.target_id.in_(entity_ids))
+            ))
+            await session.execute(sa_delete(FlowComment).where(
+                FlowComment.entity_type.in_(["story", "task", "bug"]),
+                FlowComment.entity_id.in_(entity_ids),
+            ))
+            await session.execute(sa_delete(FlowDocumentLink).where(
+                FlowDocumentLink.entity_type.in_(["story", "task", "bug"]),
+                FlowDocumentLink.entity_id.in_(entity_ids),
+            ))
+
+        # ---- Work items (bugs -> tasks -> stories) ----
+        if bug_ids:
+            await session.execute(sa_delete(FlowBug).where(FlowBug.id.in_(bug_ids)))
+        if task_ids:
+            await session.execute(sa_delete(FlowTask).where(FlowTask.id.in_(task_ids)))
+        await session.execute(sa_delete(FlowStory).where(FlowStory.project_id == project_id))
+
+        # ---- Project-scoped resources ----
+        await session.execute(sa_delete(FlowIteration).where(FlowIteration.project_id == project_id))
+        await session.execute(sa_delete(FlowVersion).where(FlowVersion.project_id == project_id))
+        await session.execute(sa_delete(FlowReminderSettings).where(FlowReminderSettings.project_id == project_id))
         await session.execute(sa_delete(FlowProjectMember).where(FlowProjectMember.project_id == project_id))
+        await session.execute(sa_delete(FlowProjectStar).where(FlowProjectStar.project_id == project_id))
+
         await session.delete(p)
         await _log_event(session, "project", project_id, "deleted", {"name": p.name})
         await session.commit()
@@ -187,10 +381,16 @@ async def delete_project(project_id: str):
 async def list_project_members(project_id: str):
     sf = get_session_factory()
     async with sf() as session:
-        stmt = select(FlowProjectMember).where(FlowProjectMember.project_id == project_id)
-        rows = (await session.execute(stmt)).scalars().all()
-    return {"items": [{"id": m.id, "member_id": m.member_id, "role": m.role,
-                        "joined_at": m.joined_at.isoformat() if m.joined_at else None} for m in rows]}
+        stmt = (
+            select(FlowProjectMember, Member.name, Member.avatar_url, Member.status)
+            .outerjoin(Member, FlowProjectMember.member_id == Member.id)
+            .where(FlowProjectMember.project_id == project_id)
+        )
+        rows = (await session.execute(stmt)).all()
+    return {"items": [{"id": row[0].id, "member_id": row[0].member_id, "role": row[0].role,
+                        "name": row[1] or "", "avatar_url": row[2] or "",
+                        "member_status": row[3] or "active",
+                        "joined_at": row[0].joined_at.isoformat() if row[0].joined_at else None} for row in rows]}
 
 @sub_router.post("/projects/{project_id}/members")
 async def add_project_member(project_id: str, body: ProjectMemberBody):
@@ -203,7 +403,7 @@ async def add_project_member(project_id: str, body: ProjectMemberBody):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "成员已存在"}
+            raise HTTPException(status_code=409, detail="成员已存在")
         m = FlowProjectMember(project_id=project_id, member_id=body.member_id, role=body.role)
         session.add(m)
 
@@ -237,7 +437,7 @@ async def update_project_member_role(project_id: str, member_id: str, body: Proj
             )
         )).scalar_one_or_none()
         if not row:
-            return {"error": "成员不存在"}, 404
+            raise HTTPException(status_code=404, detail="成员不存在")
         old_role = row.role
         row.role = body.role
         await _log_event(session, "project", project_id, "member_role_changed",
