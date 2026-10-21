@@ -12,7 +12,7 @@ Report — 汇报实例
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from openvort.db.engine import Base
@@ -162,3 +162,45 @@ class Report(Base):
 
     def __repr__(self) -> str:
         return f"<Report {self.report_type} {self.report_date} by={self.reporter_id[:8]} status={self.status}>"
+
+
+class ReportReactionPhrase(Base):
+    """可配置的快速点评文案。
+
+    管理员可在前端「点评文案设置」中维护。code 作为业务标识在
+    `ReportReaction.phrase` 中引用，label 是展示文案，emoji 可选。
+    """
+
+    __tablename__ = "report_reaction_phrases"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(32))
+    emoji: Mapped[str] = mapped_column(String(8), default="")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return f"<ReportReactionPhrase {self.code}={self.label}>"
+
+
+class ReportComment(Base):
+    """汇报评论 — 支持 1 层嵌套回复（parent_id 仅允许指向 root comment）。"""
+
+    __tablename__ = "report_comments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    report_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("reports.id", ondelete="CASCADE"), index=True
+    )
+    author_id: Mapped[str] = mapped_column(String(32), ForeignKey("members.id"), index=True)
+    parent_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    mentions_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return f"<ReportComment #{self.id} report={self.report_id[:8]}>"

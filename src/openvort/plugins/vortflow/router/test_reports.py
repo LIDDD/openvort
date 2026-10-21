@@ -3,7 +3,7 @@
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
@@ -412,7 +412,7 @@ async def get_test_report(report_id: str):
     async with sf() as session:
         report = await session.get(FlowTestReport, report_id)
         if not report:
-            return {"error": "测试报告不存在"}
+            raise HTTPException(status_code=404, detail="测试报告不存在")
         creator_name = await _resolve_member_name(session, report.creator_id)
         snapshot = json.loads(report.snapshot_json) if report.snapshot_json else {}
         return {
@@ -437,7 +437,7 @@ async def create_test_report(body: TestReportCreate, request: Request):
     async with sf() as session:
         plan = await session.get(FlowTestPlan, body.plan_id)
         if not plan:
-            return {"error": "测试计划不存在"}
+            raise HTTPException(status_code=404, detail="测试计划不存在")
 
         snapshot = await _build_report_snapshot(session, plan)
         title = body.title or f"{plan.title}测试报告"
@@ -484,7 +484,7 @@ async def update_test_report(report_id: str, body: TestReportUpdate):
     async with sf() as session:
         report = await session.get(FlowTestReport, report_id)
         if not report:
-            return {"error": "测试报告不存在"}
+            raise HTTPException(status_code=404, detail="测试报告不存在")
         if body.title is not None:
             report.title = body.title
         if body.summary is not None:
@@ -513,7 +513,7 @@ async def delete_test_report(report_id: str):
     async with sf() as session:
         report = await session.get(FlowTestReport, report_id)
         if not report:
-            return {"error": "测试报告不存在"}
+            raise HTTPException(status_code=404, detail="测试报告不存在")
         await session.delete(report)
         await session.commit()
     return {"ok": True}

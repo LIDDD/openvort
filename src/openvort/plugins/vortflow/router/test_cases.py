@@ -1,20 +1,20 @@
 import json
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import delete as sa_delete, func, select
 
 from openvort.contacts.models import Member
 from openvort.db.engine import get_session_factory
 from openvort.plugins.vortflow.models import (
-    FlowBug, FlowStory, FlowTask,
+    FlowBug, FlowProject, FlowStory, FlowTask,
     FlowTestCase, FlowTestCaseWorkItem, FlowTestModule,
 )
 from openvort.web.app import require_auth
 
 from .helpers import (
     _build_module_path, _get_descendant_module_ids, _resolve_linked_entity,
-    _resolve_member_name, _test_case_dict, _test_module_dict,
+    _resolve_member_name, _test_case_dict, _test_module_dict, resolve_project_ids,
 )
 
 sub_router = APIRouter()
@@ -127,7 +127,7 @@ async def update_test_module(module_id: str, body: TestModuleUpdate):
     async with sf() as session:
         module = await session.get(FlowTestModule, module_id)
         if not module:
-            return {"error": "模块不存在"}
+            raise HTTPException(status_code=404, detail="模块不存在")
         if body.name is not None:
             module.name = body.name
         if body.parent_id is not None:
@@ -145,12 +145,12 @@ async def delete_test_module(module_id: str):
     async with sf() as session:
         module = await session.get(FlowTestModule, module_id)
         if not module:
-            return {"error": "模块不存在"}
+            raise HTTPException(status_code=404, detail="模块不存在")
         children = await session.execute(
             select(FlowTestModule).where(FlowTestModule.parent_id == module_id)
         )
         if children.scalars().first():
-            return {"error": "请先删除子模块"}
+            raise HTTPException(status_code=409, detail="请先删除子模块")
         await session.execute(
             select(FlowTestCase).where(FlowTestCase.module_id == module_id)
         )
@@ -170,14 +170,14 @@ async def reorder_test_module(body: TestModuleReorder):
     async with sf() as session:
         module = await session.get(FlowTestModule, body.module_id)
         if not module:
-            return {"error": "模块不存在"}
+            raise HTTPException(status_code=404, detail="模块不存在")
 
         new_parent_id = body.parent_id if body.parent_id else None
 
         if new_parent_id:
             descendant_ids = await _get_descendant_module_ids(session, body.module_id)
             if new_parent_id in descendant_ids:
-                return {"error": "不能将模块移动到其子模块下"}
+                raise HTTPException(status_code=400, detail="不能将模块移动到其子模块下")
 
         module.parent_id = new_parent_id
 
@@ -211,6 +211,7 @@ async def reorder_test_module(body: TestModuleReorder):
 @sub_router.get("/test-cases")
 async def list_test_cases(
     project_id: str = Query("", alias="project_id"),
+    project_ids: str = Query("", description="按项目过滤（逗号分隔多选，优先于 project_id）"),
     module_id: str = Query("", alias="module_id"),
     keyword: str = Query("", alias="keyword"),
     case_type: str = Query("", alias="case_type"),
@@ -225,8 +226,9 @@ async def list_test_cases(
     async with sf() as session:
         query = select(FlowTestCase)
 
-        if project_id:
-            query = query.where(FlowTestCase.project_id == project_id)
+        pids = resolve_project_ids(project_id, project_ids)
+        if pids:
+            query = query.where(FlowTestCase.project_id.in_(pids))
         if module_id:
             all_module_ids = await _get_descendant_module_ids(session, module_id)
             all_module_ids.append(module_id)
@@ -264,14 +266,24 @@ async def list_test_cases(
             for mod in mr.scalars().all():
                 modules_map[mod.id] = mod
 
+        project_id_set = list({tc.project_id for tc in cases if tc.project_id})
+        projects_name_map: dict[str, str] = {}
+        if project_id_set:
+            pr = await session.execute(
+                select(FlowProject.id, FlowProject.name).where(FlowProject.id.in_(project_id_set))
+            )
+            projects_name_map = {pid: (name or "") for pid, name in pr.all()}
+
     items = []
     for tc in cases:
         mod = modules_map.get(tc.module_id) if tc.module_id else None
-        items.append(_test_case_dict(
+        d = _test_case_dict(
             tc,
             maintainer_name=members_map.get(tc.maintainer_id, "") if tc.maintainer_id else "",
             module_name=mod.name if mod else "",
-        ))
+        )
+        d["project_name"] = projects_name_map.get(tc.project_id, "") if tc.project_id else ""
+        items.append(d)
     return {"items": items, "total": total}
 
 
@@ -282,7 +294,7 @@ async def get_test_case(case_id: str):
     async with sf() as session:
         tc = await session.get(FlowTestCase, case_id)
         if not tc:
-            return {"error": "用例不存在"}
+            raise HTTPException(status_code=404, detail="用例不存在")
         maintainer_name = ""
         if tc.maintainer_id:
             member = await session.get(Member, tc.maintainer_id)
@@ -334,7 +346,7 @@ async def update_test_case(case_id: str, body: TestCaseUpdate):
     async with sf() as session:
         tc = await session.get(FlowTestCase, case_id)
         if not tc:
-            return {"error": "用例不存在"}
+            raise HTTPException(status_code=404, detail="用例不存在")
         if body.module_id is not None:
             tc.module_id = body.module_id if body.module_id else None
         if body.title is not None:
@@ -364,7 +376,7 @@ async def delete_test_case(case_id: str):
     async with sf() as session:
         tc = await session.get(FlowTestCase, case_id)
         if not tc:
-            return {"error": "用例不存在"}
+            raise HTTPException(status_code=404, detail="用例不存在")
         await session.execute(
             sa_delete(FlowTestCaseWorkItem).where(FlowTestCaseWorkItem.test_case_id == case_id)
         )
@@ -421,7 +433,7 @@ async def create_test_case_link(body: TestCaseWorkItemBody, request: Request):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "已存在相同关联"}
+            raise HTTPException(status_code=409, detail="已存在相同关联")
         link = FlowTestCaseWorkItem(
             test_case_id=body.test_case_id,
             entity_type=body.entity_type,
@@ -440,7 +452,7 @@ async def delete_test_case_link(link_id: str):
     async with sf() as session:
         link = await session.get(FlowTestCaseWorkItem, link_id)
         if not link:
-            return {"error": "关联不存在"}
+            raise HTTPException(status_code=404, detail="关联不存在")
         await session.delete(link)
         await session.commit()
     return {"ok": True}

@@ -251,7 +251,12 @@ def create_app() -> FastAPI:
     app.include_router(agents_router, prefix="/api/admin/agents", tags=["admin-agents"], dependencies=[Depends(require_admin)])
     app.include_router(models_router, prefix="/api/admin/models", tags=["admin-models"], dependencies=[Depends(require_admin)])
     app.include_router(voice_providers_router, prefix="/api/admin/voice-providers", tags=["admin-voice-providers"], dependencies=[Depends(require_admin)])
-    app.include_router(embedding_providers_router, prefix="/api/admin/embedding-providers", tags=["admin-embedding-providers"], dependencies=[Depends(require_admin)])
+    app.include_router(
+        embedding_providers_router,
+        prefix="/api/admin/embedding-providers",
+        tags=["admin-embedding-providers"],
+        dependencies=[Depends(require_admin)],
+    )
     app.include_router(upgrade_router, prefix="/api/admin/upgrade", tags=["admin-upgrade"], dependencies=[Depends(require_admin)])
     app.include_router(remote_nodes_router, prefix="/api/admin/remote-nodes", tags=["admin-remote-nodes"], dependencies=[Depends(require_admin)])
     app.include_router(marketplace_router, prefix="/api/admin/marketplace", tags=["admin-marketplace"], dependencies=[Depends(require_admin)])

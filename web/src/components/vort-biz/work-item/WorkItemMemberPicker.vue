@@ -26,6 +26,7 @@ interface Props {
   unassignedLabel?: string;
   unassignedValue?: string;
   collapsible?: boolean;
+  defaultCollapsed?: string[];
   bordered?: boolean;
   getAvatarBg?: (name: string) => string;
   getAvatarLabel?: (name: string) => string;
@@ -50,6 +51,7 @@ const props = withDefaults(defineProps<Props>(), {
   unassignedLabel: "未指派",
   unassignedValue: "未指派",
   collapsible: true,
+  defaultCollapsed: () => [],
   bordered: true,
   getAvatarBg: undefined,
   getAvatarLabel: undefined,
@@ -68,18 +70,42 @@ const keyword = defineModel<string>("keyword", { default: "" });
 
 const groupOpen = reactive<Record<string, boolean>>({});
 
+// 历史成员可能已离职或删除，仍要提供取消选择的入口。
+const unavailableCollaborators = computed(() => {
+  if (props.mode === "owner") return [];
+  const available = new Set(props.groups.flatMap((group) => group.members));
+  return [...new Set(props.collaborators)].filter((member) => member && !available.has(member));
+});
+const memberGroups = computed(() => unavailableCollaborators.value.length
+  ? [{ label: "已选协作者", members: unavailableCollaborators.value }, ...props.groups]
+  : props.groups);
+
 const ensureGroupOpen = () => {
-  props.groups.forEach((group) => {
+  const collapsed = new Set(props.defaultCollapsed);
+  memberGroups.value.forEach((group) => {
     if (groupOpen[group.label] === undefined) {
-      groupOpen[group.label] = true;
+      groupOpen[group.label] = !collapsed.has(group.label);
     }
   });
 };
 
 watch(
-  () => props.groups,
+  memberGroups,
   () => ensureGroupOpen(),
   { immediate: true, deep: true },
+);
+
+watch(
+  () => props.defaultCollapsed,
+  (labels) => {
+    if (!labels.length) return;
+    const collapsed = new Set(labels);
+    for (const label of labels) {
+      if (groupOpen[label] !== undefined) {
+        groupOpen[label] = !collapsed.has(label);
+      }
+    }
+  },
 );
 
 const avatarBgPalette = [
@@ -122,9 +148,9 @@ const getDefaultFilterScore = (member: string, search: string): number => {
 
 const filteredGroups = computed(() => {
   const kw = keyword.value.trim();
-  if (!kw) return props.groups;
+  if (!kw) return memberGroups.value;
 
-  return props.groups
+  return memberGroups.value
     .map((group) => ({
       ...group,
       members: group.members
@@ -358,6 +384,7 @@ const visibleMembers = (group: MemberGroup) => {
 
             <div class="member-picker-row-actions">
               <button
+                v-if="!unavailableCollaborators.includes(member)"
                 type="button"
                 class="member-picker-role-btn owner"
                 :class="{ 'is-active': isOwner(member) }"
@@ -417,7 +444,7 @@ const visibleMembers = (group: MemberGroup) => {
 }
 
 .member-picker-content {
-  padding: 0px 8px;
+  padding: 0 8px 8px;
 }
 
 .member-picker-group + .member-picker-group {
@@ -534,5 +561,19 @@ const visibleMembers = (group: MemberGroup) => {
   background: #10b981;
   color: #fff;
   border-color: #10b981;
+}
+
+.status-arrow-simple {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 4px solid #94a3b8;
+  transition: transform 0.2s;
+}
+
+.status-arrow-simple.open {
+  transform: rotate(180deg);
 }
 </style>

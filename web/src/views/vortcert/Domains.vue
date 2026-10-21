@@ -1,11 +1,18 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
-import { getCertDomains, deleteCertDomain, getCertDnsProviders, checkSingleDomain } from "@/api";
+import {
+    getCertDomains,
+    deleteCertDomain,
+    getCertDnsProviders,
+    checkSingleDomain,
+    probeSingleDomain,
+} from "@/api";
 import { useCrudPage } from "@/hooks";
 import { message } from "@openvort/vort-ui";
-import { Plus, Upload, RefreshCw } from "lucide-vue-next";
+import { Plus, Upload } from "lucide-vue-next";
 import DomainEditDialog from "./DomainEditDialog.vue";
 import ImportDomainsDialog from "./ImportDomainsDialog.vue";
+import ProbeResultDialog from "./ProbeResultDialog.vue";
 import dayjs from "dayjs";
 
 interface DomainItem {
@@ -30,11 +37,27 @@ interface FilterParams {
     status: string;
 }
 
+interface ProbeResult {
+    domain: string;
+    status: string;
+    expires_at: string | null;
+    days_remaining: number | null;
+    issuer: string;
+    error_message: string;
+    san_list?: string[];
+    probe_target?: string;
+}
+
 const dnsProviders = ref<any[]>([]);
 const editDialogOpen = ref(false);
 const importDialogOpen = ref(false);
 const editData = ref<any>(null);
 const checkingId = ref("");
+const probingId = ref("");
+const probeDialogOpen = ref(false);
+const probeDomain = ref("");
+const probeLoading = ref(false);
+const probeResult = ref<ProbeResult | null>(null);
 
 const fetchList = async (params: FilterParams) => {
     const res = await getCertDomains({
@@ -92,12 +115,37 @@ const handleCheck = async (row: DomainItem) => {
     checkingId.value = row.id;
     try {
         await checkSingleDomain(row.id);
-        message.success(`${row.domain} 检查完成`);
+        message.success(`${row.domain} 已刷新`);
         loadData();
     } catch {
-        message.error("检查失败");
+        message.error("刷新失败");
     } finally {
         checkingId.value = "";
+    }
+};
+
+const handleProbe = async (row: DomainItem) => {
+    probingId.value = row.id;
+    probeDomain.value = row.domain;
+    probeResult.value = null;
+    probeLoading.value = true;
+    probeDialogOpen.value = true;
+    try {
+        const res = await probeSingleDomain(row.id) as ProbeResult;
+        probeResult.value = res;
+    } catch (e: any) {
+        const detail = e?.response?.data?.detail;
+        probeResult.value = {
+            domain: row.domain,
+            status: "error",
+            expires_at: null,
+            days_remaining: null,
+            issuer: "",
+            error_message: typeof detail === "string" ? detail : "在线探测失败",
+        };
+    } finally {
+        probeLoading.value = false;
+        probingId.value = "";
     }
 };
 
@@ -112,12 +160,26 @@ const handleImportSuccess = () => {
 };
 
 const statusTagColor = (status: string) => {
-    const map: Record<string, string> = { ok: "green", warning: "orange", critical: "red", expired: "red", error: "default" };
+    const map: Record<string, string> = {
+        ok: "green",
+        warning: "orange",
+        critical: "red",
+        expired: "red",
+        error: "default",
+        "": "default",
+    };
     return map[status] || "default";
 };
 
 const statusLabel = (status: string) => {
-    const map: Record<string, string> = { ok: "正常", warning: "即将到期", critical: "即将到期", expired: "已过期", error: "异常", "": "未检查" };
+    const map: Record<string, string> = {
+        ok: "正常",
+        warning: "即将到期",
+        critical: "紧急",
+        expired: "已过期",
+        error: "异常",
+        "": "未签发",
+    };
     return map[status] || status;
 };
 
@@ -152,8 +214,9 @@ onMounted(() => {
                     <vort-select v-model="filterParams.status" placeholder="全部" allow-clear class="w-[130px]" @change="onSearchSubmit">
                         <vort-select-option value="ok">正常</vort-select-option>
                         <vort-select-option value="warning">即将到期</vort-select-option>
+                        <vort-select-option value="critical">紧急</vort-select-option>
                         <vort-select-option value="expired">已过期</vort-select-option>
-                        <vort-select-option value="error">异常</vort-select-option>
+                        <vort-select-option value="">未签发</vort-select-option>
                     </vort-select>
                 </div>
                 <div class="flex items-center gap-2">
@@ -201,11 +264,15 @@ onMounted(() => {
                         <span class="text-sm text-gray-600">{{ row.expires_at ? dayjs(row.expires_at).format("YYYY-MM-DD") : '-' }}</span>
                     </template>
                 </vort-table-column>
-                <vort-table-column label="操作" :width="180" fixed="right">
+                <vort-table-column label="操作" :width="240" fixed="right">
                     <template #default="{ row }">
                         <div class="flex items-center gap-2 whitespace-nowrap">
                             <a class="text-sm text-blue-600 cursor-pointer" @click="handleCheck(row)">
-                                {{ checkingId === row.id ? '检查中...' : '检查' }}
+                                {{ checkingId === row.id ? '刷新中...' : '刷新状态' }}
+                            </a>
+                            <vort-divider type="vertical" />
+                            <a class="text-sm text-blue-600 cursor-pointer" @click="handleProbe(row)">
+                                {{ probingId === row.id ? '探测中...' : '在线探测' }}
                             </a>
                             <vort-divider type="vertical" />
                             <a class="text-sm text-blue-600 cursor-pointer" @click="handleEdit(row)">编辑</a>
@@ -233,6 +300,14 @@ onMounted(() => {
             :open="importDialogOpen"
             @update:open="importDialogOpen = $event"
             @success="handleImportSuccess"
+        />
+
+        <ProbeResultDialog
+            :open="probeDialogOpen"
+            :domain="probeDomain"
+            :loading="probeLoading"
+            :result="probeResult"
+            @update:open="probeDialogOpen = $event"
         />
     </div>
 </template>

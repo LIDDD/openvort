@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { watch, onBeforeUnmount } from "vue";
+import { ref, watch, onBeforeUnmount } from "vue";
 import { useEditor, EditorContent } from "@tiptap/vue-3";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import BaseImage from "@tiptap/extension-image";
+import BaseMention from "@tiptap/extension-mention";
 import { Markdown } from "tiptap-markdown";
 import MarkdownIt from "markdown-it";
+import { pinyin } from "pinyin-pro";
 
 const mdIt = MarkdownIt();
 const MD_PATTERN = /^#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>/m;
@@ -40,26 +42,121 @@ const Image = BaseImage.extend({
         };
     },
 });
+
+const MentionExt = BaseMention.extend({
+    addStorage() {
+        return {
+            ...this.parent?.(),
+            markdown: {
+                serialize(state: any, node: any) {
+                    state.write(`@${node.attrs.label || node.attrs.id}`);
+                },
+                parse: {},
+            },
+        };
+    },
+});
+
 import {
     Bold, Italic, Strikethrough, Code, Heading1, Heading2, Heading3,
     List, ListOrdered, Quote, Minus, Undo2, Redo2, CodeSquare,
 } from "lucide-vue-next";
+
+export interface MentionMember {
+    id: string;
+    name: string;
+    avatarUrl?: string;
+}
 
 const props = withDefaults(defineProps<{
     modelValue?: string;
     placeholder?: string;
     minHeight?: string;
     readonly?: boolean;
+    mentionMembers?: MentionMember[];
 }>(), {
     modelValue: "",
     placeholder: "请输入内容...",
     minHeight: "160px",
     readonly: false,
+    mentionMembers: undefined,
 });
 
 const emit = defineEmits<{
     "update:modelValue": [value: string];
+    "mentionChange": [mentionIds: string[]];
 }>();
+
+// ---- Mention suggestion popup state ----
+const showMentionPopup = ref(false);
+const mentionPopupItems = ref<MentionMember[]>([]);
+const mentionPopupPos = ref({ bottom: 0, left: 0 });
+const selectedMentionIdx = ref(0);
+let mentionCmd: ((attrs: { id: string; label: string }) => void) | null = null;
+
+const AVATAR_PALETTE = ["#2f80ed", "#5b8ff9", "#9b59b6", "#27ae60", "#f39c12", "#e67e22", "#16a085", "#8b44ad"];
+const mentionAvatarBg = (name: string): string => {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+    return AVATAR_PALETTE[hash % AVATAR_PALETTE.length]!;
+};
+
+const selectMentionItem = (index: number) => {
+    const item = mentionPopupItems.value[index];
+    if (item && mentionCmd) {
+        mentionCmd({ id: item.id, label: item.name });
+    }
+};
+
+// ---- Pinyin search ----
+type MemberSearchMeta = { normalizedName: string; fullPinyin: string; initialsCombos: string[] };
+const memberSearchMetaCache = new Map<string, MemberSearchMeta>();
+
+const getMemberSearchMeta = (name: string): MemberSearchMeta => {
+    const cached = memberSearchMetaCache.get(name);
+    if (cached) return cached;
+
+    const initialsArr = pinyin(name, { pattern: "first", type: "array", multiple: true });
+    const initialsCombos = initialsArr.reduce<string[]>((acc, cur) => {
+        const options = String(cur).split(" ").map((s) => s.toLowerCase()).filter(Boolean);
+        if (acc.length === 0) return options;
+        const result: string[] = [];
+        for (const prefix of acc) for (const opt of options) result.push(prefix + opt);
+        return result;
+    }, []);
+
+    const meta: MemberSearchMeta = {
+        normalizedName: name.toLowerCase(),
+        fullPinyin: pinyin(name, { toneType: "none", type: "array" }).join("").toLowerCase(),
+        initialsCombos,
+    };
+    memberSearchMetaCache.set(name, meta);
+    return meta;
+};
+
+const matchMember = (name: string, kw: string): number => {
+    if (!kw) return 1;
+    const meta = getMemberSearchMeta(name);
+    const match = (src: string, exact: number, prefix: number, inc: number) =>
+        src === kw ? exact : src.startsWith(kw) ? prefix : src.includes(kw) ? inc : 0;
+    const d = match(meta.normalizedName, 120, 110, 80);
+    if (d > 0) return d;
+    const p = match(meta.fullPinyin, 100, 95, 60);
+    if (p > 0) return p;
+    let best = 0;
+    for (const c of meta.initialsCombos) best = Math.max(best, match(c, 90, 85, 50));
+    return best;
+};
+
+const extractMentionIds = (e: any): string[] => {
+    const ids: string[] = [];
+    e.state.doc.descendants((node: any) => {
+        if (node.type.name === "mention" && node.attrs.id) {
+            if (!ids.includes(node.attrs.id)) ids.push(node.attrs.id);
+        }
+    });
+    return ids;
+};
 
 const insertImageFromFile = async (file: File) => {
     if (!file.type.startsWith("image/")) return;
@@ -102,6 +199,67 @@ const editor = useEditor({
             transformCopiedText: true,
         }),
         Placeholder.configure({ placeholder: props.placeholder }),
+        MentionExt.configure({
+            HTMLAttributes: { class: "mention-tag" },
+            suggestion: {
+                items: ({ query }: { query: string }) => {
+                    if (!props.mentionMembers?.length) return [];
+                    const kw = query.trim().toLowerCase();
+                    return props.mentionMembers
+                        .map((m) => ({ member: m, score: matchMember(m.name, kw) }))
+                        .filter((r) => r.score > 0)
+                        .sort((a, b) => b.score - a.score)
+                        .slice(0, 10)
+                        .map((r) => r.member);
+                },
+                render: () => {
+                    const updatePos = (renderProps: any) => {
+                        mentionPopupItems.value = renderProps.items;
+                        selectedMentionIdx.value = 0;
+                        mentionCmd = (attrs) => renderProps.command(attrs);
+                        const rect = renderProps.clientRect?.();
+                        if (rect) {
+                            mentionPopupPos.value = {
+                                bottom: window.innerHeight - rect.top + 4,
+                                left: rect.left,
+                            };
+                        }
+                        showMentionPopup.value = renderProps.items.length > 0;
+                    };
+                    return {
+                    onStart: (renderProps: any) => updatePos(renderProps),
+                    onUpdate: (renderProps: any) => updatePos(renderProps),
+                    onKeyDown: ({ event }: { event: KeyboardEvent }) => {
+                        if (!showMentionPopup.value) return false;
+                        if (event.key === "ArrowUp") {
+                            selectedMentionIdx.value = Math.max(0, selectedMentionIdx.value - 1);
+                            return true;
+                        }
+                        if (event.key === "ArrowDown") {
+                            selectedMentionIdx.value = Math.min(
+                                mentionPopupItems.value.length - 1,
+                                selectedMentionIdx.value + 1,
+                            );
+                            return true;
+                        }
+                        if (event.key === "Enter") {
+                            selectMentionItem(selectedMentionIdx.value);
+                            return true;
+                        }
+                        if (event.key === "Escape") {
+                            showMentionPopup.value = false;
+                            return true;
+                        }
+                        return false;
+                    },
+                    onExit: () => {
+                        showMentionPopup.value = false;
+                        mentionCmd = null;
+                    },
+                    };
+                },
+            },
+        }),
     ],
     editorProps: {
         handlePaste(_view, event) {
@@ -144,6 +302,9 @@ const editor = useEditor({
     onUpdate: ({ editor: e }) => {
         const md = e.storage.markdown.getMarkdown();
         emit("update:modelValue", md);
+        if (props.mentionMembers) {
+            emit("mentionChange", extractMentionIds(e));
+        }
     },
 });
 
@@ -211,6 +372,36 @@ const toolbarItems: ToolItem[] = [
             </template>
         </div>
         <EditorContent :editor="editor" class="vort-editor__content" :style="{ minHeight }" @click="editor?.commands.focus()" />
+
+        <Teleport to="body">
+            <div
+                v-if="showMentionPopup && mentionPopupItems.length > 0"
+                class="mention-suggestion-popup"
+                :style="{ position: 'fixed', bottom: `${mentionPopupPos.bottom}px`, left: `${mentionPopupPos.left}px` }"
+            >
+                <div
+                    v-for="(item, index) in mentionPopupItems"
+                    :key="item.id"
+                    class="mention-suggestion-item"
+                    :class="{ 'is-selected': index === selectedMentionIdx }"
+                    @mousedown.prevent="selectMentionItem(index)"
+                >
+                    <span
+                        class="mention-suggestion-avatar"
+                        :style="{ backgroundColor: mentionAvatarBg(item.name) }"
+                    >
+                        <img
+                            v-if="item.avatarUrl"
+                            :src="item.avatarUrl"
+                            class="mention-suggestion-avatar-img"
+                            @error="($event.target as HTMLElement).style.display = 'none'"
+                        />
+                        <template v-else>{{ item.name.slice(0, 1) }}</template>
+                    </span>
+                    <span class="mention-suggestion-name">{{ item.name }}</span>
+                </div>
+            </div>
+        </Teleport>
     </div>
 </template>
 
@@ -344,6 +535,71 @@ const toolbarItems: ToolItem[] = [
 .vort-editor__content .tiptap strong { font-weight: 700; }
 .vort-editor__content .tiptap em { font-style: italic; }
 .vort-editor__content .tiptap s { text-decoration: line-through; }
+
+/* Mention tag inside editor */
+.mention-tag {
+    background: #f0f5ff;
+    border: 1px solid #d6e4ff;
+    border-radius: 4px;
+    padding: 1px 4px;
+    color: #3b82f6;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+/* Mention suggestion popup */
+.mention-suggestion-popup {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+    z-index: 10000;
+    overflow: hidden;
+    min-width: 200px;
+    max-width: 300px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+.mention-suggestion-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    cursor: pointer;
+    transition: background-color 0.15s;
+}
+.mention-suggestion-item:hover,
+.mention-suggestion-item.is-selected {
+    background: #f0f5ff;
+}
+.mention-suggestion-avatar {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 500;
+    flex-shrink: 0;
+    overflow: hidden;
+    position: relative;
+}
+.mention-suggestion-avatar-img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.mention-suggestion-name {
+    font-size: 14px;
+    color: #334155;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
 
 [data-resize-wrapper] {
     display: inline-block;

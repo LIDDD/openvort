@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, watchEffect } from "vue";
 import dayjs from "dayjs";
 import { useRoute, useRouter } from "vue-router";
 import { ProTable, TableCell } from "@/components/vort-biz";
-import { message, Pagination } from "@openvort/vort-ui";
+import { message, dialog, Pagination } from "@openvort/vort-ui";
 import WorkItemMemberPicker from "@/components/vort-biz/work-item/WorkItemMemberPicker.vue";
 import WorkItemPriority from "@/components/vort-biz/work-item/WorkItemPriority.vue";
 import WorkItemStatus from "@/components/vort-biz/work-item/WorkItemStatus.vue";
 import WorkItemTagPicker from "@/components/vort-biz/work-item/WorkItemTagPicker.vue";
+import IterationSelect from "@/components/vort-biz/work-item/IterationSelect.vue";
 import WorkItemFilters from "@/components/vort-biz/work-item/WorkItemFilters.vue";
 import WorkItemDetail from "./work-item/WorkItemDetail.vue";
 import WorkItemCreate from "./work-item/WorkItemCreate.vue";
@@ -21,27 +22,28 @@ import ViewSelector from "./components/ViewSelector.vue";
 import ViewManageDialog from "./components/ViewManageDialog.vue";
 import ViewCreateDialog from "./components/ViewCreateDialog.vue";
 import ColumnSettingsDialog from "./components/ColumnSettingsDialog.vue";
-import NewTagDialog from "./components/NewTagDialog.vue";
+import TagEditDialog from "./components/TagEditDialog.vue";
 import { GanttTimeline, GanttDivider } from "./gantt";
 import ViewModeToggle from "./gantt/ViewModeToggle.vue";
 import type { GanttZoomLevel } from "./gantt";
-import { useGanttUndo } from "./gantt/useGanttUndo";
-import type { GanttUndoSnapshot } from "./gantt/useGanttUndo";
 import type { ViewMode } from "./gantt/ViewModeToggle.vue";
 import { useVortFlowStore } from "@/stores";
-import { useVortFlowViews, SYSTEM_VIEWS } from "./composables/useVortFlowViews";
+import { useVortFlowViews } from "./composables/useVortFlowViews";
 import { useWorkItemExport } from "./composables/useWorkItemExport";
 import { useWorkItemColumns } from "./composables/useWorkItemColumns";
 import { useWorkItemViewState } from "./composables/useWorkItemViewState";
-import { useWorkItemDataSource } from "./composables/useWorkItemDataSource";
+import { useWorkItemDataSource, SORT_FIELD_MAP } from "./composables/useWorkItemDataSource";
 import { useWorkItemColumnFilters } from "./composables/useWorkItemColumnFilters";
 import { useWorkItemMetadata } from "./composables/useWorkItemMetadata";
 import { useWorkItemCrud } from "./composables/useWorkItemCrud";
 import { useWorkItemDetailPanel } from "./composables/useWorkItemDetailPanel";
 import { useWorkItemFieldEditors } from "./composables/useWorkItemFieldEditors";
-import { useWorkItemCommon } from "./work-item/useWorkItemCommon";
+import { useWorkItemGantt } from "./composables/useWorkItemGantt";
+import { normalizeVirtualStatusValues, useWorkItemCommon } from "./work-item/useWorkItemCommon";
 import { useWorkItemInlineEdit } from "./work-item/useWorkItemInlineEdit";
 import { useWorkItemDraft } from "./work-item/useWorkItemDraft";
+import { useWorkItemStoryDrag } from "./work-item/useWorkItemStoryDrag";
+import { resolveProjectIdFromScope } from "./work-item/projectScope";
 import type {
     WorkItemType,
     Priority,
@@ -68,19 +70,18 @@ const router = useRouter();
 const vortFlowStore = useVortFlowStore();
 
 const currentWorkItemType = computed(() => (props.type as "需求" | "任务" | "缺陷") || null);
-const currentViewId = computed(() => {
-    if (!currentWorkItemType.value) return "all";
-    return vortFlowStore.getViewId(currentWorkItemType.value);
-});
+// 视图状态 key：单类型用类型名；工作墙用 "wall" 独立持久化
+const viewTypeKey = computed<"需求" | "任务" | "缺陷" | "wall">(
+    () => currentWorkItemType.value || "wall"
+);
+const currentViewId = computed(() => vortFlowStore.getViewId(viewTypeKey.value));
 const onViewChange = (viewId: string) => {
-    if (currentWorkItemType.value) vortFlowStore.setViewId(currentWorkItemType.value, viewId);
+    vortFlowStore.setViewId(viewTypeKey.value, viewId);
 };
 const viewManageOpen = ref(false);
 const viewCreateOpen = ref(false);
 
-const { views: mergedViews, activeViewFilters: builtInViewFilters } = currentWorkItemType.value
-    ? useVortFlowViews(currentWorkItemType.value)
-    : { views: computed(() => SYSTEM_VIEWS), activeViewFilters: computed(() => ({})) };
+const { views: mergedViews, activeViewFilters: builtInViewFilters } = useVortFlowViews(viewTypeKey.value);
 
 const isArchivedView = computed(() => Boolean((builtInViewFilters.value as Record<string, any>)?.archived));
 
@@ -91,9 +92,10 @@ const {
     getAvatarBg, getAvatarLabel, getMemberAvatarUrl,
     loadMemberOptions, getMemberIdByName, getMemberNameById,
     getWorkItemTypeIconClass, getWorkItemTypeIcon,
-    mapBackendStateToStatus, mapBackendPriority, formatCnTime, formatDate,
+    mapBackendStateToStatus, mapBackendPriority, mapBackendPriorityScore, formatCnTime, formatDate,
     toBackendPriorityLevel, toTaskEstimateHours, getBackendStatesByDisplayStatus,
     bugStatusFilterOptions, demandStatusFilterOptions, taskStatusFilterOptions, loadStatusOptions,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
 
 const { saveDraft, loadDraft, clearDraft } = useWorkItemDraft();
@@ -102,13 +104,19 @@ const { saveDraft, loadDraft, clearDraft } = useWorkItemDraft();
 
 const keyword = ref("");
 const owner = ref<string[]>([]);
-const type = ref<WorkItemType | "">(props.type ?? "");
+const type = ref<WorkItemType[]>([]);
 const status = ref<string[]>([]);
 const totalCount = ref(0);
+// 「包含已归档」开关：开启后常规视图同时展示归档+未归档；
+// 「已归档」视图下无意义（本身只看归档），故渲染时隐藏并在下发时屏蔽。
+const includeArchived = ref(false);
 
 const resolveActiveType = (): WorkItemType => {
     if (props.type) return props.type;
-    if (type.value === "需求" || type.value === "任务" || type.value === "缺陷") return type.value;
+    if (type.value.length === 1) {
+        const v = type.value[0];
+        if (v === "需求" || v === "任务" || v === "缺陷") return v;
+    }
     return "缺陷";
 };
 
@@ -118,6 +126,16 @@ const allStatusFilterOptions: StatusOption[] = Array.from(
     ).values()
 );
 const currentStatusFilterOptions = computed(() => getStatusOptionsByType(resolveActiveType()));
+
+// 工作墙下按需求/任务/缺陷分组传给状态筛选弹窗
+const statusFilterGroups = computed(() => {
+    if (props.type) return [];
+    return [
+        { type: "需求" as WorkItemType, options: getStatusOptionsByType("需求") },
+        { type: "任务" as WorkItemType, options: getStatusOptionsByType("任务") },
+        { type: "缺陷" as WorkItemType, options: getStatusOptionsByType("缺陷") },
+    ];
+});
 
 const normalizeDateValue = (value: unknown): string => {
     if (value instanceof Date) return formatDate(value);
@@ -132,6 +150,21 @@ const normalizeDateValue = (value: unknown): string => {
 
 const getActiveProjectId = (): string => props.projectId || vortFlowStore.selectedProjectId || "";
 
+const tableEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const tableEnrichedCollapsed = ref<string[]>([]);
+const tableActiveGroups = computed(() =>
+    tableEnrichedGroups.value.length > 0 ? tableEnrichedGroups.value : ownerGroups.value,
+);
+const refreshTableEnrichedGroups = () => {
+    const pid = getActiveProjectId();
+    if (pid) {
+        getEnrichedOwnerGroups(pid).then((groups) => {
+            tableEnrichedGroups.value = groups;
+            tableEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+        });
+    }
+};
+
 const onAvatarError = (e: Event) => {
     const el = e.target as HTMLImageElement | null;
     if (el) el.style.display = "none";
@@ -144,14 +177,24 @@ const {
     baseTagOptions, dynamicTagOptions, dynamicIterationOptions, dynamicVersionOptions,
     branchOptionsMap, branchLoadingMap, remoteTemplates,
     getDescriptionTemplate, getRepoNameById, getBranchOptions,
-    loadRepoOptions, loadIterationOptions, loadBranchOptions, loadTagDefinitions,
+    loadRepoOptions, mergeIterationOptions, resetIterationOptions, loadBranchOptions, loadTagDefinitions,
     collectTagOptions, collectEnumOptions, loadApiMetadata, loadDescriptionTemplates,
-} = useWorkItemMetadata({ useApi: computed(() => props.useApi), getActiveProjectId });
+} = useWorkItemMetadata({
+    useApi: computed(() => props.useApi),
+    getActiveProjectId,
+});
 
 const currentProjectName = computed(() => {
     if (!props.projectId) return "";
     return apiProjects.value.find(p => p.id === props.projectId)?.name || "";
 });
+
+// 本地演示模式不请求接口，保留与新建抽屉一致的静态迭代选项。
+const localIterationOptions = [
+    { id: "Sprint 1", name: "Sprint 1" },
+    { id: "Sprint 2", name: "Sprint 2" },
+    { id: "Sprint 3", name: "Sprint 3" },
+];
 
 // --- Column filter state ---
 
@@ -175,19 +218,37 @@ const {
 
 // --- Column settings & View state ---
 
+const columnTypeKey = props.type || "wall";
+// 跨多项目（含全部项目）浏览时自动展示「关联项目」列；嵌入的单项目场景不展示
+const showProjectColumn = computed(() => {
+    const ids = (props.projectIds || []).filter(Boolean);
+    if (ids.length) return ids.length > 1;
+    return !props.projectId;
+});
 const {
     columnSettingsOpen, columnSettings, columns, columnSettingsForDialog,
     loadColumnSettingsFromStore, handleColumnSettingsSave, handleColumnWidthChange, applyOrderedColumnSettings,
-} = useWorkItemColumns({ workItemType: props.type || "" });
+} = useWorkItemColumns({ workItemType: columnTypeKey, showProjectColumn });
 
 const {
     viewDirty, isSystemView, saveViewDialogOpen, saveViewDropdownOpen, saveViewWrapperRef,
     currentViewStateForCreate, resetViewBaseline, collectCurrentViewState,
     handleUpdateCurrentView, handleSaveAsNew, handleSaveAsNewView, applyViewState,
 } = useWorkItemViewState({
-    workItemType: props.type || "", currentViewId, keyword, owner, status,
+    workItemType: columnTypeKey, currentViewId, keyword, owner, status,
     columnFilters, columnSortField, columnSortOrder, columnSettings, applyOrderedColumnSettings,
 });
+
+// ProTable 内置 sorter 触发的 sortChange 同步到 columnSortField/Order，
+// 让 useWorkItemDataSource 拿到正确的 effectiveSortField，避免被默认 priority 排序覆盖。
+// 白名单守卫：只对 SORT_FIELD_MAP 里有后端映射的字段才同步。
+// 像 workNo / estimateHours 这类列虽然 ProTable 标了 sorter:true 但后端不支持，
+// 不能让点击它们意外清掉用户已有的有效排序（如默认的 priority）。
+const handleProTableSortChange = (sorter: { field: string; order: "ascend" | "descend" | null }) => {
+    if (sorter.order && !(sorter.field in SORT_FIELD_MAP)) return;
+    columnSortField.value = sorter.order ? sorter.field : "";
+    columnSortOrder.value = sorter.order;
+};
 
 const handleCreateViewFromDialog = async (data: { name: string; scope: "personal" | "shared" }) => {
     const { filters, cols } = collectCurrentViewState();
@@ -207,6 +268,7 @@ const expandedItemIds = reactive<Record<string, boolean>>({});
 const expandingItemIds = reactive<Record<string, boolean>>({});
 const pinnedRowsByType = reactive<Record<WorkItemType, RowItem[]>>({ 需求: [], 任务: [], 缺陷: [] });
 const priorityModel = reactive<Record<string, Priority>>({});
+const priorityScoreModel = reactive<Record<string, number>>({});
 const tagsModel = reactive<Record<string, string[]>>({});
 const planTimeModel = reactive<Record<string, any>>({});
 const collaboratorsModel = reactive<Record<string, string[]>>({});
@@ -216,15 +278,23 @@ const collaboratorsModel = reactive<Record<string, string[]>>({});
 const {
     mapBackendItemToRow, findItemRowById, findItemRowByIdentifier,
     loadItemById, loadChildItems, request, postProcessTableRows, prependPinnedRow,
+    isMultiProjectView,
 } = useWorkItemDataSource({
     useApi: computed(() => props.useApi), propType: props.type || "",
     propProjectId: computed(() => props.projectId || ""),
+    propProjectIds: computed(() => props.projectIds || []),
     propIterationId: computed(() => props.iterationId || ""),
-    propViewFilters: computed(() => ({ ...builtInViewFilters.value, ...(props.viewFilters || {}) })),
+    propViewFilters: computed(() => ({
+        ...builtInViewFilters.value,
+        ...(props.viewFilters || {}),
+        // 「已归档」视图下屏蔽 include_archived，避免覆盖 archived=true 把未归档也拉进来
+        include_archived: !isArchivedView.value && includeArchived.value,
+    })),
     type, owner, status, columnFilters, columnSortField, columnSortOrder, totalCount,
     apiProjects, pinnedRowsByType, expandedItemIds, expandingItemIds, itemRowsById, itemChildrenMap,
     getMemberIdByName, getMemberNameById, loadMemberOptions,
-    mapBackendStateToStatus, mapBackendPriority, getBackendStatesByDisplayStatus, formatCnTime, formatDate,
+    mapBackendStateToStatus, mapBackendPriority, mapBackendPriorityScore,
+    getBackendStatesByDisplayStatus, formatCnTime, formatDate,
     collectTagOptions, collectEnumOptions,
 });
 
@@ -261,19 +331,23 @@ const {
     priorityPickerOpenMap, tagPickerOpenMap, statusPickerOpenMap,
     ownerPickerOpenMap, collaboratorsPickerOpenMap,
     getInteractiveCellKey, isCellBackgroundClick, openCellPickerOnBackgroundClick,
-    getRowPriority, selectPriority, getRowStatus, selectRowStatus,
+    getRowPriority, getRowPriorityScore, selectPriority, selectPriorityScore,
+    getRowStatus, selectRowStatus,
     getRowOwner, selectRowOwner, getRowCollaborators, setRowCollaborators,
     getRowTags, setRowTags, rowTagOptions,
-    getRowPlanTimeText, getRowOverdueInfo, onPlanTimeChange, onPlanTimeOpenChange,
+    getRowPlanTimeText, getRowOverdueInfo, getRowStaleInfo, onPlanTimeChange, onPlanTimeOpenChange,
     getRowPlanTime, togglePlanTimeMenu,
-    getTagColor, tagColorPalette, openCreateTagDialog, handleCancelCreateTag, handleConfirmCreateTag,
-    newTagName, newTagColor, newTagDialogOpen, openPlanTimeFor, planTimePickerOpen,
+    getTagColor, openCreateTagDialog, openEditTagDialog, handleTagDialogSaved,
+    tagDialogOpen, tagDialogMode, tagDialogData,
+    openPlanTimeFor, planTimePickerOpen,
 } = useWorkItemInlineEdit({
     useApi: computed(() => props.useApi), syncRecordUpdateToApi, syncRecordStatusToApi,
     getMemberIdByName, mapBackendPriority, toBackendPriorityLevel, toTaskEstimateHours,
     getBackendStatesByDisplayStatus: (t, s) => getBackendStatesByDisplayStatus(t as WorkItemType, s) || [],
     dynamicTagOptions, baseTagOptions, tagDefinitions: apiTagDefinitions,
-    priorityModel, tagsModel, collaboratorsModel, planTimeModel, normalizeDateValue,
+    priorityModel, priorityScoreModel, tagsModel, collaboratorsModel, planTimeModel, normalizeDateValue,
+    onTagsChanged: loadTagDefinitions,
+    onTagRenamed: () => { tableRef.value?.refresh?.(); },
 });
 
 // --- Field editors ---
@@ -281,13 +355,14 @@ const {
 const {
     estimateEditingFor, estimateDraftMap, estimateInputRef, openEstimateEditor, selectRowEstimateHours,
     progressEditingFor, progressDraftMap, progressInputRef, isProgressReadonly, openProgressEditor, selectRowProgress,
-    projectPickerOpenMap, selectRowProject, iterationPickerOpenMap, selectRowIteration,
+    projectPickerOpenMap, selectRowProject, selectRowIteration,
     repoPickerOpenMap, openRepoPicker, selectRowRepo,
     branchPickerOpenMap, openBranchPicker, selectRowBranch,
     openDateFieldFor, dateFieldPickerOpen, toggleDateFieldPicker, onDateFieldPickerOpenChange, selectRowDateField,
 } = useWorkItemFieldEditors({
     syncRecordUpdateToApi, getInteractiveCellKey, isCellBackgroundClick, openCellPickerOnBackgroundClick,
-    normalizeDateValue, apiProjects, apiIterations, getRepoNameById, loadRepoOptions, loadBranchOptions,
+    normalizeDateValue, apiProjects, apiIterations, dynamicIterationOptions, planTimeModel,
+    getRepoNameById, loadRepoOptions, loadBranchOptions,
 });
 
 // --- Detail panel ---
@@ -299,14 +374,39 @@ const {
     handleOpenRelated: detailOpenRelated, syncDetailRelations,
 } = useWorkItemDetailPanel({
     useApi: computed(() => props.useApi), syncRecordUpdateToApi,
-    loadItemById, loadChildItems, getRowPriority, getRowTags, planTimeModel,
+    loadItemById, loadChildItems, getRowPriority, getRowPriorityScore, getRowTags, planTimeModel,
+});
+
+// --- Work item drag (需求 / 任务 / 缺陷 / 工作墙) ---
+// 启用条件：开启 useApi 后，所有 type 都启用拖拽排序；工作墙（type="")也启用，
+// 跨类型嵌入由 composable 按规则校验（需求不能成为任务/缺陷的子等）。
+const storyDragEnabled = computed(() => Boolean(props.useApi));
+const storyDragProjectId = computed(() => props.projectId || vortFlowStore.selectedProjectId || "");
+
+const {
+    bindDragSource: bindStoryDragSource,
+    bindRowDropTarget: bindStoryRowDropTarget,
+    dropTargetClass: storyDropTargetClass,
+} = useWorkItemStoryDrag({
+    enabled: storyDragEnabled,
+    projectId: storyDragProjectId,
+    itemRowsById,
+    itemChildrenMap,
+    expandedItemIds,
+    expandingItemIds,
+    loadChildItems,
+    refreshTable: () => tableRef.value?.refresh?.(),
+    getVisibleRows: () => (tableRef.value?.dataSource as RowItem[]) || [],
 });
 
 // --- Export ---
 
-const { handleExportCsv, handleExportExcel, handleExportJson } = useWorkItemExport({ selectedRows, itemRowsById });
+const { handleExportCsv, handleExportExcel, handleExportJson } = useWorkItemExport({
+    selectedRows,
+    getCurrentPageRows: () => (tableRef.value?.dataSource as RowItem[]) || [],
+});
 
-// --- Gantt state ---
+// --- Gantt state (D6: 抽到 useWorkItemGantt composable) ---
 
 const viewMode = computed<ViewMode>({
     get: () => vortFlowStore.viewMode as ViewMode,
@@ -316,275 +416,66 @@ const ganttZoomLevel = computed<GanttZoomLevel>({
     get: () => vortFlowStore.ganttZoomLevel as GanttZoomLevel,
     set: (v) => { vortFlowStore.ganttZoomLevel = v; },
 });
-const isGanttMode = computed(() => viewMode.value === "gantt");
-const ganttLeftWidth = ref(0);
-const ganttContainerRef = ref<HTMLElement | null>(null);
-const ganttTablePaneRef = ref<HTMLElement | null>(null);
-const ganttTimelineRef = ref<InstanceType<typeof GanttTimeline> | null>(null);
-const ganttNeedScrollToToday = ref(false);
-const GANTT_ROW_HEIGHT = 50;
-const { canUndo: ganttCanUndo, canRedo: ganttCanRedo, pushRecord: ganttPushUndo, undo: ganttUndo, redo: ganttRedo, reset: ganttResetUndo } = useGanttUndo();
-
-const ganttRows = computed<RowItem[]>(() => {
-    if (!tableRef.value) return [];
-    const raw = tableRef.value.dataSource as RowItem[] | undefined;
-    return raw && postProcessTableRows ? postProcessTableRows(raw) : (raw || []);
+const tablePageSizeRef = computed<number>({
+    get: () => vortFlowStore.tablePageSize,
+    set: (v) => { vortFlowStore.tablePageSize = v; },
+});
+const ganttDividerRatioRef = computed<number>({
+    get: () => vortFlowStore.ganttDividerRatio,
+    set: (v) => { vortFlowStore.ganttDividerRatio = v; },
 });
 
-const tableFirstLoaded = ref(false);
+const {
+    GANTT_ROW_HEIGHT,
+    isGanttMode,
+    ganttLeftWidth,
+    ganttContainerRef,
+    ganttTablePaneRef,
+    ganttTimelineRef,
+    ganttRowTops,
+    ganttRowHeights,
+    ganttBodyHeight,
+    ganttTableHeaderHeight,
+    ganttRows,
+    tableFirstLoaded,
+    measureGanttPositions,
+    setupGanttObserver,
+    initGanttWidth,
+    onGanttDividerDrag,
+    onGanttDividerDragEnd,
+    ganttCanUndo,
+    ganttCanRedo,
+    ganttResetUndo,
+    handleGanttUndoAction,
+    handleGanttRedoAction,
+    handleGanttTimeChange,
+    handleGanttIconTimeChange,
+    handleGanttClearIconTime,
+    handleGanttProgressChange,
+    handleGanttCreateTime,
+    handleGanttClearDate,
+    ganttPaginationTotal,
+    ganttPaginationCurrent,
+    ganttPaginationPageSize,
+    handleGanttPageChange,
+    handleGanttPageSizeChange,
+    markTableFirstLoaded,
+} = useWorkItemGantt({
+    viewMode,
+    ganttZoomLevel,
+    tablePageSize: tablePageSizeRef,
+    ganttDividerRatio: ganttDividerRatioRef,
+    tableRef,
+    findItemRowByIdentifier,
+    syncRecordUpdateToApi,
+    postProcessTableRows,
+});
+
 const ganttRequest = async (params: any) => {
     const result = await request(params);
-    if (!tableFirstLoaded.value) tableFirstLoaded.value = true;
+    markTableFirstLoaded();
     return result;
 };
-const ganttRowTops = ref<number[]>([]);
-const ganttRowHeights = ref<number[]>([]);
-const ganttBodyHeight = ref(0);
-const ganttTableHeaderHeight = ref(0);
-
-let ganttResizeObs: ResizeObserver | null = null;
-
-function measureGanttPositions() {
-    const pane = ganttTablePaneRef.value;
-    if (!pane || !isGanttMode.value) return;
-
-    const thead = pane.querySelector(".vort-pro-table-thead");
-    if (thead) ganttTableHeaderHeight.value = thead.getBoundingClientRect().height;
-
-    const tbody = pane.querySelector(".vort-pro-table-tbody");
-    if (!tbody) return;
-    const rows = Array.from(tbody.children).filter(el => el.tagName === "TR");
-    const tops: number[] = [];
-    const heights: number[] = [];
-    let cumTop = 0;
-    for (const row of rows) {
-        const h = (row as HTMLElement).offsetHeight;
-        tops.push(cumTop);
-        heights.push(h);
-        cumTop += h;
-    }
-    ganttRowTops.value = tops;
-    ganttRowHeights.value = heights;
-    ganttBodyHeight.value = cumTop;
-}
-
-function setupGanttObserver() {
-    ganttResizeObs?.disconnect();
-    const pane = ganttTablePaneRef.value;
-    if (!pane) return;
-    const tbody = pane.querySelector(".vort-pro-table-tbody");
-    if (!tbody) return;
-    ganttResizeObs = new ResizeObserver(() => { measureGanttPositions(); });
-    ganttResizeObs.observe(tbody);
-}
-
-watch(isGanttMode, (v) => {
-    if (v) nextTick(() => { setupGanttObserver(); measureGanttPositions(); });
-    else { ganttResizeObs?.disconnect(); ganttResetUndo(); }
-});
-
-watch(ganttRows, () => {
-    if (isGanttMode.value) nextTick(measureGanttPositions);
-    if (ganttNeedScrollToToday.value) {
-        ganttNeedScrollToToday.value = false;
-        nextTick(() => ganttTimelineRef.value?.scrollToToday());
-    }
-}, { deep: false });
-
-watch(tableFirstLoaded, (loaded) => {
-    if (loaded && isGanttMode.value) {
-        nextTick(() => { initGanttWidth(); setupGanttObserver(); measureGanttPositions(); });
-    }
-});
-
-function initGanttWidth() {
-    if (!ganttContainerRef.value) return;
-    const totalW = ganttContainerRef.value.clientWidth;
-    ganttLeftWidth.value = Math.round(totalW * vortFlowStore.ganttDividerRatio);
-}
-
-function onGanttDividerDrag(delta: number) {
-    if (!ganttContainerRef.value) return;
-    const totalW = ganttContainerRef.value.clientWidth;
-    const minW = 300;
-    const maxW = totalW - 300;
-    ganttLeftWidth.value = Math.max(minW, Math.min(maxW, ganttLeftWidth.value + delta));
-}
-
-function onGanttDividerDragEnd() {
-    if (!ganttContainerRef.value) return;
-    const totalW = ganttContainerRef.value.clientWidth;
-    if (totalW > 0) vortFlowStore.ganttDividerRatio = ganttLeftWidth.value / totalW;
-}
-
-function snapshotRow(rowId: string, record: RowItem): GanttUndoSnapshot {
-    return {
-        rowId,
-        planStartDate: record.planStartDate || "",
-        planEndDate: record.planEndDate || "",
-        progress: record.progress ?? 0,
-        testTime: record.testTime || "",
-        draftTime: record.draftTime || "",
-        releaseTime: record.releaseTime || "",
-    };
-}
-
-function applyGanttSnapshot(s: GanttUndoSnapshot) {
-    const record = findItemRowByIdentifier(s.rowId);
-    if (!record) return;
-    record.planStartDate = s.planStartDate;
-    record.planEndDate = s.planEndDate;
-    record.planTime = [s.planStartDate, s.planEndDate];
-    record.progress = s.progress;
-    const patch: any = {
-        plan_start: s.planStartDate || "",
-        deadline: s.planEndDate || "",
-        progress: s.progress,
-    };
-    if (record.type === "需求") {
-        record.testTime = s.testTime || "";
-        record.draftTime = s.draftTime || "";
-        record.releaseTime = s.releaseTime || "";
-        patch.test_time = s.testTime || "";
-        patch.draft_time = s.draftTime || "";
-        patch.release_time = s.releaseTime || "";
-    }
-    syncRecordUpdateToApi(record, patch);
-}
-
-function handleGanttUndoAction() {
-    const snapshot = ganttUndo();
-    if (snapshot) applyGanttSnapshot(snapshot);
-}
-
-function handleGanttRedoAction() {
-    const snapshot = ganttRedo();
-    if (snapshot) applyGanttSnapshot(snapshot);
-}
-
-function handleGanttTimeChange(rowId: string, startDate: string, endDate: string) {
-    const record = findItemRowByIdentifier(rowId);
-    if (!record) return;
-    const prev = snapshotRow(rowId, record);
-    const patch: any = {};
-    const oldEnd = record.planTime?.[1] || "";
-    if (record.planTime?.[0] !== startDate || oldEnd !== endDate) {
-        record.planTime = [startDate, endDate];
-        record.planStartDate = startDate;
-        record.planEndDate = endDate;
-        patch.plan_start = startDate;
-        patch.deadline = endDate;
-    }
-    if (oldEnd && endDate && record.type === "需求") {
-        const deltaDays = dayjs(endDate).diff(dayjs(oldEnd), "day");
-        if (deltaDays !== 0) {
-            const minDate = dayjs(startDate);
-            if (record.testTime) {
-                let newTestTime = dayjs(record.testTime).add(deltaDays, "day");
-                if (newTestTime.isBefore(minDate)) newTestTime = minDate;
-                record.testTime = newTestTime.format("YYYY-MM-DD");
-                patch.test_time = record.testTime;
-            }
-            if (record.draftTime) {
-                let newDraftTime = dayjs(record.draftTime).add(deltaDays, "day");
-                if (newDraftTime.isBefore(minDate)) newDraftTime = minDate;
-                record.draftTime = newDraftTime.format("YYYY-MM-DD");
-                patch.draft_time = record.draftTime;
-            }
-            if (record.releaseTime) {
-                let newReleaseTime = dayjs(record.releaseTime).add(deltaDays, "day");
-                if (newReleaseTime.isBefore(minDate)) newReleaseTime = minDate;
-                record.releaseTime = newReleaseTime.format("YYYY-MM-DD");
-                patch.release_time = record.releaseTime;
-            }
-        }
-    }
-    if (Object.keys(patch).length) {
-        syncRecordUpdateToApi(record, patch);
-        ganttPushUndo({ prev, next: snapshotRow(rowId, record) });
-    }
-}
-
-function handleGanttIconTimeChange(rowId: string, field: "testTime" | "draftTime" | "releaseTime", date: string) {
-    const record = findItemRowByIdentifier(rowId);
-    if (!record || record.type !== "需求") return;
-    const prev = snapshotRow(rowId, record);
-    record[field] = date;
-    const apiFieldMap: Record<string, string> = { testTime: "test_time", draftTime: "draft_time", releaseTime: "release_time" };
-    syncRecordUpdateToApi(record, { [apiFieldMap[field]]: date });
-    ganttPushUndo({ prev, next: snapshotRow(rowId, record) });
-}
-
-function handleGanttClearIconTime(rowId: string, field: "testTime" | "draftTime" | "releaseTime") {
-    const record = findItemRowByIdentifier(rowId);
-    if (!record || record.type !== "需求") return;
-    const prev = snapshotRow(rowId, record);
-    record[field] = "";
-    const apiFieldMap: Record<string, string> = { testTime: "test_time", draftTime: "draft_time", releaseTime: "release_time" };
-    syncRecordUpdateToApi(record, { [apiFieldMap[field]]: "" });
-    ganttPushUndo({ prev, next: snapshotRow(rowId, record) });
-}
-
-
-function handleGanttProgressChange(rowId: string, progress: number) {
-    const record = findItemRowByIdentifier(rowId);
-    if (!record) return;
-    const prev = snapshotRow(rowId, record);
-    record.progress = progress;
-    syncRecordUpdateToApi(record, { progress });
-    ganttPushUndo({ prev, next: snapshotRow(rowId, record) });
-}
-
-function handleGanttCreateTime(rowId: string, startDate: string, endDate: string) {
-    const record = findItemRowByIdentifier(rowId);
-    if (!record) return;
-    const prev = snapshotRow(rowId, record);
-    record.planTime = [startDate, endDate];
-    record.planStartDate = startDate;
-    record.planEndDate = endDate;
-    syncRecordUpdateToApi(record, { plan_start: startDate, deadline: endDate });
-    ganttPushUndo({ prev, next: snapshotRow(rowId, record) });
-}
-
-function handleGanttClearDate(rowId: string, type: "start" | "end" | "both") {
-    const record = findItemRowByIdentifier(rowId);
-    if (!record) return;
-    const prev = snapshotRow(rowId, record);
-    const patch: Record<string, any> = {};
-    if (type === "start" || type === "both") {
-        record.planStartDate = "";
-        patch.plan_start = "";
-    }
-    if (type === "end" || type === "both") {
-        record.planEndDate = "";
-        patch.deadline = "";
-    }
-    record.planTime = [record.planStartDate || "", record.planEndDate || ""];
-    syncRecordUpdateToApi(record, patch);
-    ganttPushUndo({ prev, next: snapshotRow(rowId, record) });
-}
-
-const ganttPaginationTotal = computed(() => tableRef.value?.total ?? 0);
-const ganttPaginationCurrent = computed(() => tableRef.value?.current ?? 1);
-const ganttPaginationPageSize = computed(() => tableRef.value?.pageSize ?? vortFlowStore.tablePageSize);
-
-function handleGanttPageChange(page: number) {
-    if (!tableRef.value) return;
-    tableRef.value.current = page;
-    ganttNeedScrollToToday.value = true;
-    ganttResetUndo();
-    tableRef.value.refresh();
-}
-
-function handleGanttPageSizeChange(size: number) {
-    if (!tableRef.value) return;
-    tableRef.value.pageSize = size;
-    tableRef.value.current = 1;
-    vortFlowStore.tablePageSize = size;
-    ganttNeedScrollToToday.value = true;
-    ganttResetUndo();
-    tableRef.value.refresh();
-}
 
 // --- Page state ---
 
@@ -597,14 +488,36 @@ const initialLoading = ref(true);
 
 const queryParams = computed(() => ({
     keyword: keyword.value, owner: owner.value,
-    type: props.type || type.value, status: status.value, _rk: refreshKey.value,
+    type: props.type ? [props.type] : type.value, status: status.value, _rk: refreshKey.value,
+    // 把 viewFilters/builtInViewFilters 引用纳入 ProTable 的 params 监听，
+    // 这样切换关注成员（owner）+ 切换状态（status）能合并为一次 fetchData，
+    // 避免双重请求带来的 race condition。
+    _vf: props.viewFilters,
+    _bvf: builtInViewFilters.value,
 }));
 const refreshTable = () => { refreshKey.value++; };
-const onReset = () => { keyword.value = ""; owner.value = []; type.value = props.type ?? ""; status.value = []; ganttResetUndo(); };
+// 批量编辑完成后直接调用并等待表格实例刷新。仅递增 refreshKey 只能异步触发
+// 外部 params watcher，批量回调无法确认刷新请求已完成；先等待选中项状态落盘，
+// 再复用 ProTable 的刷新入口可确保当前页重新请求并替换旧快照。
+const handleBatchDone = async () => {
+    clearSelection();
+    await nextTick();
+    await tableRef.value?.refresh?.();
+};
+const onReset = () => { keyword.value = ""; owner.value = []; type.value = []; status.value = []; ganttResetUndo(); };
 
-watch(() => props.projectId, () => { loadRepoOptions(); loadIterationOptions(); tableRef.value?.refresh?.(); });
-watch(() => props.viewFilters, () => { if (mountedReady.value) tableRef.value?.refresh?.(); }, { deep: true });
-watch(builtInViewFilters, () => { if (mountedReady.value) tableRef.value?.refresh?.(); }, { deep: true });
+watch(() => [props.projectId, (props.projectIds || []).join(",")], () => {
+    // 迭代下拉在项目范围变化后清空旧缓存，等用户再次打开时再请求新范围。
+    resetIterationOptions();
+    loadRepoOptions();
+    refreshTableEnrichedGroups();
+    tableRef.value?.refresh?.();
+});
+// 工作墙顶部切换迭代时，propIterationId 变化但 projectId 不变，需要单独触发表格重新拉取
+watch(() => props.iterationId, () => { tableRef.value?.refresh?.(); });
+// 「包含已归档」开关切换后重新拉取；切到「已归档」视图时重置开关避免残留勾选态误导
+watch(includeArchived, () => { tableRef.value?.refresh?.(); });
+watch(isArchivedView, (v) => { if (v) includeArchived.value = false; });
 
 const rowKeyGetter = (record: RowItem) => record.backendId || record.workNo;
 
@@ -614,6 +527,26 @@ const createBugDrawerMode = ref<"create" | "detail">(
     route.query.action === "detail" ? "detail" : "create",
 );
 
+const isDetailEditing = () => {
+    if (createBugDrawerMode.value !== "detail") return false;
+    const comp = detailComponentRef.value;
+    if (!comp) return false;
+    return !!(comp.detailDescEditing || comp.editingCommentId || comp.detailCommentDraft?.trim());
+};
+
+const doCloseDrawer = () => {
+    cacheDescDraftBeforeClose();
+    if (createBugDrawerMode.value === "create") {
+        const formData = createWorkItemRef.value?.getFormData?.();
+        const descTemplate = createWorkItemRef.value?.getDescriptionTemplateForCurrentType?.() ?? "";
+        if (formData) {
+            const workItemType = (props.type || formData.type || "缺陷") as WorkItemType;
+            saveDraft(workItemType, formData, createParentItemId.value, descTemplate);
+        }
+    }
+    router.replace({ query: { ...route.query, action: undefined, id: undefined, parentId: undefined, tab: undefined } });
+};
+
 const createBugDrawerOpen = computed({
     get: () => {
         const action = route.query.action as string;
@@ -621,16 +554,18 @@ const createBugDrawerOpen = computed({
     },
     set: (val: boolean) => {
         if (!val) {
-            cacheDescDraftBeforeClose();
-            if (createBugDrawerMode.value === "create") {
-                const formData = createWorkItemRef.value?.getFormData?.();
-                const descTemplate = createWorkItemRef.value?.getDescriptionTemplateForCurrentType?.() ?? "";
-                if (formData) {
-                    const workItemType = (props.type || formData.type || "缺陷") as WorkItemType;
-                    saveDraft(workItemType, formData, createParentItemId.value, descTemplate);
-                }
+            if (isDetailEditing()) {
+                dialog.confirm({
+                    title: "未保存的更改",
+                    content: "当前有未保存的编辑内容，关闭将丢失这些更改。确定要关闭吗？",
+                    okText: "确定关闭",
+                    okType: "danger",
+                    cancelText: "继续编辑",
+                    onOk: () => doCloseDrawer(),
+                });
+                return;
             }
-            router.replace({ query: { ...route.query, action: undefined, id: undefined, parentId: undefined, tab: undefined } });
+            doCloseDrawer();
         }
     }
 });
@@ -643,22 +578,24 @@ const handleCancelCreateBug = () => {
 
 // --- Page-level CRUD wrappers (bridge composable + drawer state) ---
 
-const handleCreateBug = async () => {
-    await loadApiMetadata(props.type === "任务");
-    if (apiProjects.value.length > 0) {
-        const names = new Set(apiProjects.value.map((x) => x.name));
-        if (!createBugForm.project || !names.has(createBugForm.project)) {
-            createBugForm.project = apiProjects.value[0]!.name;
-        }
-    }
+// 工作墙模式下，drawer 的 title 跟随当前选中的创建类型
+const createDrawerTitleText = computed(() => {
+    if (props.type) return props.createDrawerTitle;
+    const t = createBugForm.type || "缺陷";
+    return `新建${t}`;
+});
+
+const handleCreateBug = async (selectedType?: WorkItemType) => {
+    const effectiveType = (props.type || selectedType || "缺陷") as WorkItemType;
+    await loadApiMetadata(effectiveType === "任务");
     createBugDrawerMode.value = "create";
     createParentItemId.value = "";
-    createProjectId.value = props.projectId || "";
+    // 仅在明确单选时回填项目；多选/全部项目没有唯一归属，保持关联项目为空。
+    createProjectId.value = resolveProjectIdFromScope(props.projectIds, props.projectId);
     resetCreateBugForm();
-    const workItemType = (props.type || "缺陷") as WorkItemType;
-    createDraftData.value = loadDraft(workItemType, "");
-    createBugForm.type = props.type ?? createBugForm.type;
-    router.replace({ query: { ...route.query, action: "create", parentId: undefined } });
+    createDraftData.value = loadDraft(effectiveType, "");
+    createBugForm.type = effectiveType;
+    router.replace({ query: { ...route.query, action: "create", parentId: undefined, type: props.type ? undefined : effectiveType } });
 };
 
 const handleCreateChild = async (record: RowItem) => {
@@ -689,16 +626,30 @@ const handleSubmitCreateBug = async (keepCreating = false) => {
 };
 
 const handleOpenBugDetail = async (record: RowItem) => {
+    // 打开工作项详情时，把顶部项目选择器同步到该工作项真实所属项目。
+    // 深链 / 分享链接 / 关联工作项跳转可能打开与当前所选项目不同项目的工作项，
+    // 若不同步会出现顶部项目与详情面板「对应项目不一致」。仅在已选中具体项目且不一致时同步，
+    // 「全部项目」模式（selectedProjectId 为空）保持不变，避免破坏跨项目浏览。
+    // 仅在「恰好选中单个项目」时同步，避免多选/全部项目模式下打开详情把筛选范围收敛成单项目。
+    if (
+        record.projectId &&
+        vortFlowStore.selectedProjectIds.length === 1 &&
+        record.projectId !== vortFlowStore.selectedProjectIds[0]
+    ) {
+        vortFlowStore.setProjectId(record.projectId);
+    }
     const info = await prepareDetailView(record);
     const base = createInitialBugForm();
     createBugDrawerMode.value = "detail";
     Object.assign(createBugForm, {
         ...base, title: record.title, owner: record.owner === "未指派" ? "" : record.owner,
         type: record.type, planTime: [...info.planTime], priority: info.priority,
+        priorityScore: info.priorityScore,
         tags: [...info.tags], description: record.description || base.description,
     });
     const typeToTab: Record<string, string> = { "需求": "story", "任务": "task", "缺陷": "bug" };
-    router.replace({ query: { ...route.query, action: "detail", id: record.backendId || record.workNo, tab: typeToTab[record.type] || typeToTab[props.type] } });
+    const fallbackTab = props.type ? typeToTab[props.type] : "";
+    router.replace({ query: { ...route.query, action: "detail", id: record.backendId || record.workNo, tab: typeToTab[record.type] || fallbackTab } });
 };
 
 const handleDetailUpdate = async (data: Partial<RowItem>) => {
@@ -743,6 +694,27 @@ const toggleItemExpand = async (record: RowItem) => {
 };
 
 // --- Tag rendering ---
+const tagTextMeasureCache = new Map<string, number>();
+let tagMeasureCtx: CanvasRenderingContext2D | null | undefined;
+const measureTagTextWidth = (text: string): number => {
+    if (!text) return 0;
+    const cached = tagTextMeasureCache.get(text);
+    if (cached !== undefined) return cached;
+    if (typeof document === "undefined") {
+        const fallback = text.length * 12;
+        tagTextMeasureCache.set(text, fallback);
+        return fallback;
+    }
+    if (tagMeasureCtx === undefined) {
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+        if (ctx) ctx.font = "12px sans-serif";
+        tagMeasureCtx = ctx;
+    }
+    const w = tagMeasureCtx ? tagMeasureCtx.measureText(text).width : text.length * 12;
+    tagTextMeasureCache.set(text, w);
+    return w;
+};
 
 const getCollapsedTags = (tags: string[], resolvedWidth?: string | number): { visible: string[]; hidden: number } => {
     const width = typeof resolvedWidth === "number" ? resolvedWidth
@@ -753,7 +725,8 @@ const getCollapsedTags = (tags: string[], resolvedWidth?: string | number): { vi
     const gap = 4;
     let used = 0;
     const visible: string[] = [];
-    const chipWidth = (text: string) => Math.max(36, text.length * 13 + 14);
+    // chip = px-1.5 (12px) + text + 2px safety margin
+    const chipWidth = (text: string) => Math.max(36, Math.ceil(measureTagTextWidth(text)) + 14);
     for (let i = 0; i < tags.length; i++) {
         const w = chipWidth(tags[i]!);
         const remaining = tags.length - i - 1;
@@ -762,6 +735,11 @@ const getCollapsedTags = (tags: string[], resolvedWidth?: string | number): { vi
         if (nextUsed > limit) break;
         visible.push(tags[i]!);
         used = nextUsed;
+    }
+    // 当列宽极窄连第一个 chip 都装不下时，至少展示首个标签，避免出现仅有 "+N"
+    // 而完全看不到任何标签内容的退化效果。
+    if (visible.length === 0 && tags.length > 0) {
+        visible.push(tags[0]!);
     }
     return { visible, hidden: Math.max(0, tags.length - visible.length) };
 };
@@ -776,7 +754,8 @@ async function openDetailFromRoute(id: string) {
     const tabTypeMap: Record<string, WorkItemType> = { story: "需求", task: "任务", bug: "缺陷" };
     const tabRouteMap: Record<string, string> = { story: "/vortflow/stories", task: "/vortflow/tasks", bug: "/vortflow/bugs" };
     const urlType = tabTypeMap[urlTab];
-    if (urlType && urlType !== props.type) {
+    // 单类型页面下，URL 指向其他类型时跳到对应列表；工作墙跨类型不跳
+    if (props.type && urlType && urlType !== props.type) {
         const targetPath = tabRouteMap[urlTab];
         if (targetPath) {
             const urlProjectId = (route.query.project_id || route.query.project) as string;
@@ -784,29 +763,39 @@ async function openDetailFromRoute(id: string) {
         }
         return;
     }
-    let record = findItemRowByIdentifier(id) || await loadItemById(id, props.type);
-    if (!record && !urlType) {
-        const otherTypes = (["需求", "任务", "缺陷"] as WorkItemType[]).filter(t => t !== props.type);
-        for (const t of otherTypes) { record = await loadItemById(id, t); if (record) break; }
+    // 工作墙模式（props.type 为空）下，优先按 URL tab 推导出的 type 作为 fallback，
+    // 避免误用默认的 "缺陷" 类型去拉取其它类型的 ID 导致 404 → drawer 弹出又收起。
+    const fallbackType: WorkItemType = (props.type as WorkItemType) || urlType || "缺陷";
+    // 强制拉最新数据，避免命中旧缓存导致"列表已展示负责人、详情却空白"
+    // （其他人无缓存打开正常）。拉取失败时 loadItemById 内部回退缓存。
+    let record = await loadItemById(id, fallbackType, true);
+    if (!record) {
+        const otherTypes = (["需求", "任务", "缺陷"] as WorkItemType[]).filter(t => t !== fallbackType);
+        for (const t of otherTypes) { record = await loadItemById(id, t, true); if (record) break; }
     }
     if (record) { handleOpenBugDetail(record); }
     else { router.replace({ query: { ...route.query, action: undefined, id: undefined, parentId: undefined, tab: undefined } }); }
 }
-
-onBeforeUnmount(() => { ganttResizeObs?.disconnect(); });
 
 onMounted(async () => {
     const urlProjectId = (route.query.project_id || route.query.project) as string;
     if (urlProjectId && urlProjectId !== vortFlowStore.selectedProjectId) {
         vortFlowStore.setProjectId(urlProjectId);
     }
-    const hasCachedColumns = !!vortFlowStore.getColumnSettings(props.type || "");
+    const hasCachedColumns = !!vortFlowStore.getColumnSettings(columnTypeKey);
     if (hasCachedColumns) { columnSettings.value = loadColumnSettingsFromStore(); resetViewBaseline(); }
 
+    // 工作墙：默认按优先级升序展示，让用户首次访问就能看到优先排序结果
+    if (!props.type && !columnSortField.value) {
+        columnSortField.value = "priority";
+        columnSortOrder.value = "ascend";
+    }
+
     await loadMemberOptions();
+    refreshTableEnrichedGroups();
     await Promise.all([
-        loadApiMetadata(false), loadRepoOptions(), loadIterationOptions(), loadTagDefinitions(),
-        loadStatusOptions(), vortFlowStore.loadColumnSettings(props.type || ""),
+        loadApiMetadata(false), loadRepoOptions(), loadTagDefinitions(),
+        loadStatusOptions(), vortFlowStore.loadColumnSettings(columnTypeKey),
         vortFlowStore.loadViews(), loadDescriptionTemplates(),
     ]);
     columnSettings.value = loadColumnSettingsFromStore();
@@ -865,6 +854,27 @@ watch(
         }
     },
 );
+
+// Sync document.title with the currently opened work item detail so that
+// shared links (e.g. ?action=detail&id=...) show a meaningful tab title.
+// When the detail drawer closes, router beforeEach restores the route title.
+watchEffect(() => {
+    const isDetailOpen = createBugDrawerOpen.value && createBugDrawerMode.value === "detail";
+    const title = detailCurrentRecord.value?.title?.trim();
+    if (isDetailOpen && title) {
+        document.title = `${title} - OpenVort`;
+    }
+});
+
+// 暴露给父组件用于联动筛选（如工作墙的成员关注切换）
+const setStatusFilter = (values: string[]) => {
+    status.value = Array.isArray(values) ? normalizeVirtualStatusValues(values) : [];
+};
+const setTypeFilter = (values: WorkItemType[]) => {
+    type.value = Array.isArray(values) ? [...values] : [];
+};
+
+defineExpose({ setStatusFilter, setTypeFilter });
 </script>
 
 <template>
@@ -878,15 +888,19 @@ watch(
             :create-button-text="props.createButtonText"
             :total-count="totalCount"
             :member-options="memberOptions"
-            :owner-groups="ownerGroups"
+            :owner-groups="tableActiveGroups"
             :status-options="currentStatusFilterOptions"
-            :show-type-filter="!props.type"
+            :status-groups="statusFilterGroups"
+            :show-status-pending-shortcut="!props.type"
+            :show-type-filter="false"
+            :show-type-tabs="!props.type"
+            :create-type-options="!props.type ? (['需求', '任务', '缺陷'] as WorkItemType[]) : []"
             :get-avatar-bg="getAvatarBg"
             :get-avatar-label="getAvatarLabel"
             :get-avatar-url="getMemberAvatarUrl"
             @search="tableRef?.refresh?.()"
             @reset="onReset"
-            @create="handleCreateBug"
+            @create="(t: WorkItemType | undefined) => handleCreateBug(t)"
         >
             <template v-if="currentWorkItemType" #before-count>
                 <ViewSelector
@@ -935,6 +949,10 @@ watch(
                 </div>
             </template>
             <template #extra-actions>
+                <label v-if="!isArchivedView" class="include-archived-toggle">
+                    <vort-checkbox v-model:checked="includeArchived" />
+                    <span>包含已归档</span>
+                </label>
                 <ViewModeToggle v-model="viewMode" />
                 <AiAssistButton
                     :prompt="`我想在项目「${currentProjectName}」中创建一个${resolveActiveType()}，请引导我完成。`"
@@ -996,6 +1014,7 @@ watch(
                 :toolbar="false"
                 :bordered="!isGanttMode"
                 @column-width-change="handleColumnWidthChange"
+                @sort-change="handleProTableSortChange"
             >
                 <template #header-status="{ column }">
                     <ColumnFilterPopover field="status" :title="column.title || ''" :config="statusFilterConfig" :sort-order="columnSortField === 'status' ? columnSortOrder : null" :filter-value="columnFilters['status']" @sort="(o) => handleColumnSort('status', o)" @filter="(v) => handleColumnFilter('status', v)">{{ column.title }}</ColumnFilterPopover>
@@ -1065,15 +1084,31 @@ watch(
                     <ColumnFilterPopover field="type" :title="column.title || ''" :config="typeFilterConfig" :sort-order="columnSortField === 'type' ? columnSortOrder : null" :filter-value="columnFilters['type']" @sort="(o) => handleColumnSort('type', o)" @filter="(v) => handleColumnFilter('type', v)">{{ column.title }}</ColumnFilterPopover>
                 </template>
 
-                <template #workNo="{ text }">
-                    <TableCell>
+                <template #workNo="{ text, record }">
+                    <TableCell
+                        :class="storyDragEnabled ? ['story-drop-cell', storyDropTargetClass(record)] : ''"
+                        v-bind="storyDragEnabled ? { ...bindStoryRowDropTarget(record), ...bindStoryDragSource(record) } : {}"
+                    >
+                        <span
+                            v-if="storyDragEnabled && !record.isArchived"
+                            class="story-drag-handle"
+                            :title="record.type === '缺陷' ? '拖动挂到需求或任务下' : '拖动调整顺序或父子关系'"
+                            aria-hidden="true"
+                        >
+                            <svg width="10" height="14" viewBox="0 0 10 14" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="2" cy="3" r="1.2" fill="currentColor"/><circle cx="2" cy="7" r="1.2" fill="currentColor"/><circle cx="2" cy="11" r="1.2" fill="currentColor"/><circle cx="8" cy="3" r="1.2" fill="currentColor"/><circle cx="8" cy="7" r="1.2" fill="currentColor"/><circle cx="8" cy="11" r="1.2" fill="currentColor"/></svg>
+                        </span>
                         <span class="text-sm text-gray-700">{{ text }}</span>
                     </TableCell>
                 </template>
 
                 <template #title="{ text, record }">
-                    <TableCell @click="handleOpenBugDetail(record)">
+                    <TableCell
+                        :class="storyDragEnabled ? ['story-drop-cell', storyDropTargetClass(record)] : ''"
+                        v-bind="storyDragEnabled ? { ...bindStoryRowDropTarget(record), ...bindStoryDragSource(record) } : {}"
+                        @click="handleOpenBugDetail(record)"
+                    >
                         <VortButton class="title-link-cell" :title="text" variant="link" @click.stop="handleOpenBugDetail(record)">
+                            <span v-if="record.isChild" class="story-child-indent"></span>
                             <span
                                 v-if="record.childrenCount"
                                 class="story-expand-toggle"
@@ -1085,14 +1120,14 @@ watch(
                             >
                                 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" class="flex-shrink-0 iconify iconify--gitee icon-caret-down" width="1em" height="1em" preserveAspectRatio="xMidYMid meet" viewBox="0 0 16 16"><g fill="none" fill-rule="evenodd"><path d="M0 0h16v16H0z"></path><path fill="currentColor" fill-rule="nonzero" d="m10.835 7.638-2.388 2.666a.628.628 0 01-.441.196.57.57 0 01-.426-.195L5.192 7.638c-.188-.19-.24-.478-.147-.725s.313-.413.556-.413h4.793c.243 0 .462.162.556.411.093.25.058.537-.115.727z"></path></g></svg>
                             </span>
-                            <span v-else-if="record.isChild" class="story-child-indent"></span>
                             <span v-else class="story-expand-placeholder"></span>
                             
                             <span class="work-type-icon" :class="getWorkItemTypeIconClass(record.type)">
                                 <component :is="getWorkItemTypeIcon(record.type)" :size="12" />
                             </span>
 
-                            <span class="title-link-text" :class="{ 'story-child-text': record.isChild }">{{ text }}</span>
+                            <span class="title-link-text" :class="{ 'story-child-text': record.isChild, 'is-archived-text': record.isArchived }">{{ text }}</span>
+                            <span v-if="record.isArchived" class="title-archived-tag">已归档</span>
                             <span
                                 v-if="getRowOverdueInfo(record)"
                                 class="title-overdue-tag"
@@ -1100,6 +1135,14 @@ watch(
                             >
                                 <svg class="title-overdue-icon" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M512 208c198.824 0 360 161.176 360 360s-161.176 360-360 360-360-161.176-360-360 161.176-360 360-360z m0 80c-154.64 0-280 125.36-280 280s125.36 280 280 280 280-125.36 280-280-125.36-280-280-280z m46.136 113.488v133.472l90.412 76.648-51.732 61.02L492.268 584a40 40 0 0 1-14.116-29.256l-0.016-1.256v-152h80zM259.528 126.972l56.128 57.008-160.964 158.48L98.56 285.452l160.96-158.48z m507.16 0l160.968 158.48-56.128 57.008-160.964-158.48 56.128-57.008z"></path></svg>
                                 逾期{{ getRowOverdueInfo(record)!.days }}天
+                            </span>
+                            <span
+                                v-else-if="getRowStaleInfo(record)"
+                                class="title-stale-tag"
+                                :title="`已超过 ${getRowStaleInfo(record)!.days} 天没有任何动作（事件 / 评论）`"
+                            >
+                                <svg class="title-stale-icon" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64z m0 820c-205.4 0-372-166.6-372-372s166.6-372 372-372 372 166.6 372 372-166.6 372-372 372z"></path><path fill="currentColor" d="M464 336v200a32 32 0 0 0 16 27.712l160 92.4a32 32 0 1 0 32-55.424l-144-83.136V336a32 32 0 0 0-64 0z"></path></svg>
+                                停滞{{ getRowStaleInfo(record)!.days }}天
                             </span>
                         </VortButton>
                     </TableCell>
@@ -1110,7 +1153,9 @@ watch(
                         <WorkItemPriority
                             v-model:open="priorityPickerOpenMap[getInteractiveCellKey(record)]"
                             :model-value="getRowPriority(record, text)"
-                            @change="(value) => selectPriority(record, value)"
+                            :score="getRowPriorityScore(record)"
+                            :enable-score-slider="true"
+                            @change-score="(value) => selectPriorityScore(record, value)"
                         />
                     </TableCell>
                 </template>
@@ -1123,7 +1168,9 @@ watch(
                             :options="rowTagOptions"
                             :get-tag-color="getTagColor"
                             :bordered="false"
+                            enable-edit
                             @update:model-value="(value) => setRowTags(record, value)"
+                            @edit-tag="openEditTagDialog($event)"
                         >
                             <template #trigger>
                                 <div class="flex items-center gap-1 flex-nowrap whitespace-nowrap overflow-hidden">
@@ -1173,13 +1220,14 @@ watch(
                             v-model:open="ownerPickerOpenMap[getInteractiveCellKey(record)]"
                             mode="owner"
                             :owner="getRowOwner(record, text)"
-                            :groups="ownerGroups"
+                            :groups="tableActiveGroups"
+                            :default-collapsed="tableEnrichedCollapsed"
                             :dropdown-max-height="420"
                             :bordered="false"
                             :get-avatar-bg="getAvatarBg"
                             :get-avatar-label="getAvatarLabel"
                             :get-avatar-url="getMemberAvatarUrl"
-                            @update:owner="(value) => selectRowOwner(record, value)"
+                            @update:owner="(value) => { selectRowOwner(record, value); if (value) recordRecentMember(value); }"
                         >
                             <template #trigger>
                                 <div
@@ -1219,13 +1267,14 @@ watch(
                             v-model:open="collaboratorsPickerOpenMap[getInteractiveCellKey(record)]"
                             mode="collaborators"
                             :collaborators="getRowCollaborators(record, text)"
-                            :groups="ownerGroups"
+                            :groups="tableActiveGroups"
+                            :default-collapsed="tableEnrichedCollapsed"
                             :dropdown-max-height="260"
                             :bordered="false"
                             :get-avatar-bg="getAvatarBg"
                             :get-avatar-label="getAvatarLabel"
                             :get-avatar-url="getMemberAvatarUrl"
-                            @update:collaborators="(value) => setRowCollaborators(record, value)"
+                            @update:collaborators="(value) => { setRowCollaborators(record, value); value.forEach(recordRecentMember); }"
                         >
                             <template #trigger>
                                 <div
@@ -1297,21 +1346,23 @@ watch(
                     </TableCell>
                 </template>
 
-                <template #iteration="{ text, record }">
-                    <TableCell @click.stop="iterationPickerOpenMap[getInteractiveCellKey(record)] = true">
+                <template #iteration="{ record }">
+                    <TableCell @click.stop>
                         <div class="cell-select-plain text-sm text-gray-700">
-                            <vort-select
+                            <IterationSelect
                                 :model-value="record.iterationId || undefined"
-                                :open="iterationPickerOpenMap[getInteractiveCellKey(record)]"
+                                :use-api="props.useApi"
+                                :project-id="record.projectId || props.projectId"
+                                :project-ids="record.projectId ? [] : props.projectIds"
+                                :static-options="localIterationOptions"
+                                :selected-label="record.iteration || record.iterationId || ''"
                                 placeholder="-"
                                 allow-clear
                                 size="small"
                                 :bordered="false"
-                                @update:open="iterationPickerOpenMap[getInteractiveCellKey(record)] = $event"
-                                @change="(val: any) => selectRowIteration(record, val)"
-                            >
-                                <vort-select-option v-for="iter in apiIterations" :key="iter.id" :value="iter.id">{{ iter.name }}</vort-select-option>
-                            </vort-select>
+                                @options-change="mergeIterationOptions"
+                                @change="(val: any, option: any) => selectRowIteration(record, String(val || ''), option)"
+                            />
                         </div>
                     </TableCell>
                 </template>
@@ -1381,21 +1432,22 @@ watch(
                 </template>
 
 
-                <template #project="{ text, record }">
+                <template #project="{ record }">
                     <TableCell @click.stop="projectPickerOpenMap[getInteractiveCellKey(record)] = true">
-                        <vort-select
-                            :model-value="record.projectId || undefined"
-                            :open="projectPickerOpenMap[getInteractiveCellKey(record)]"
-                            placeholder="-"
-                            allow-clear
-                            size="small"
-                            :bordered="false"
-                            class="w-full"
-                            @update:open="projectPickerOpenMap[getInteractiveCellKey(record)] = $event"
-                            @change="(val: string) => selectRowProject(record, val)"
-                        >
-                            <vort-select-option v-for="p in apiProjects" :key="p.id" :value="p.id">{{ p.name }}</vort-select-option>
-                        </vort-select>
+                        <div class="cell-select-plain text-sm text-gray-700">
+                            <vort-select
+                                :model-value="record.projectId || undefined"
+                                :open="projectPickerOpenMap[getInteractiveCellKey(record)]"
+                                placeholder="-"
+                                allow-clear
+                                size="small"
+                                :bordered="false"
+                                @update:open="projectPickerOpenMap[getInteractiveCellKey(record)] = $event"
+                                @change="(val: any) => selectRowProject(record, val)"
+                            >
+                                <vort-select-option v-for="p in apiProjects" :key="p.id" :value="p.id">{{ p.name }}</vort-select-option>
+                            </vort-select>
+                        </div>
                     </TableCell>
                 </template>
 
@@ -1612,7 +1664,7 @@ watch(
 
         <vort-drawer
             v-model:open="createBugDrawerOpen"
-            :title="createBugDrawerMode === 'create' ? props.createDrawerTitle : props.detailDrawerTitle"
+            :title="createBugDrawerMode === 'create' ? createDrawerTitleText : props.detailDrawerTitle"
             :width="1180"
             :body-style="{ padding: '16px 20px 20px' }"
         >
@@ -1638,16 +1690,18 @@ watch(
             <template v-else>
                 <WorkItemCreate
                     ref="createWorkItemRef"
-                    :type="props.type"
-                    :title="props.createDrawerTitle"
+                    :type="(props.type || createBugForm.type || '缺陷') as WorkItemType"
+                    :title="createDrawerTitleText"
                     :use-api="props.useApi"
                     :project-id="createProjectId"
+                    :project-ids="props.projectIds"
                     :parent-id="createParentItemId"
                     :parent-record="createParentRecord"
                     :iteration-id="props.iterationId"
                     :initial-draft="createDraftData"
                     @close="handleCancelCreateBug"
                     @success="handleCreateSuccess"
+                    @iteration-options="mergeIterationOptions"
                 />
             </template>
             <template #footer>
@@ -1666,13 +1720,11 @@ watch(
             </template>
         </vort-drawer>
 
-        <NewTagDialog
-            v-model:open="newTagDialogOpen"
-            v-model:tag-name="newTagName"
-            v-model:tag-color="newTagColor"
-            :color-palette="tagColorPalette"
-            @cancel="handleCancelCreateTag"
-            @confirm="handleConfirmCreateTag"
+        <TagEditDialog
+            v-model:open="tagDialogOpen"
+            :mode="tagDialogMode"
+            :data="tagDialogData"
+            @saved="handleTagDialogSaved"
         />
 
         <ImportDialog v-model:open="importDialogOpen" :project-id="props.projectId" @done="tableRef?.refresh?.()" />
@@ -1682,11 +1734,11 @@ watch(
             :selected-rows="selectedRows"
             :work-item-type="(props.type || '缺陷') as WorkItemType"
             :status-options="currentStatusFilterOptions"
-            @done="() => { clearSelection(); refreshTable(); }"
+            @done="handleBatchDone"
         />
         <ViewManageDialog
             v-model:open="viewManageOpen"
-            :work-item-type="type"
+            :work-item-type="props.type || ''"
             :current-filters="currentViewStateForCreate.filters"
             :current-columns="currentViewStateForCreate.cols"
         />
@@ -1743,6 +1795,39 @@ watch(
     white-space: nowrap;
 }
 
+.include-archived-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #4b5563;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+
+/* 归档行视觉弱化：标题置灰，配合「已归档」徽标提示不可编辑 */
+.title-link-text.is-archived-text {
+    color: #9ca3af !important;
+}
+.title-link-text.is-archived-text:hover {
+    text-decoration: none;
+}
+
+.title-archived-tag {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 18px;
+    padding: 0 6px;
+    border-radius: 9px;
+    color: #6b7280;
+    background: rgba(107, 114, 128, 0.12);
+    white-space: nowrap;
+}
+
 .title-overdue-icon {
     width: 12px;
     height: 12px;
@@ -1751,6 +1836,27 @@ watch(
 .title-overdue-tag.is-done {
     color: #d97706;
     background: #fffbeb;
+}
+
+.title-stale-tag {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 18px;
+    padding: 0 6px;
+    border-radius: 9px;
+    color: #4b5563;
+    background: rgba(107, 114, 128, 0.12);
+    white-space: nowrap;
+}
+
+.title-stale-icon {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
 }
 
 .story-expand-toggle {
@@ -1795,7 +1901,7 @@ watch(
 
 .story-child-indent {
     display: inline-block;
-    width: 44px;
+    width: 20px;
     flex-shrink: 0;
 }
 
@@ -2009,7 +2115,7 @@ watch(
 
 .gantt-split-layout {
     display: flex;
-    height: calc(100vh - 240px);
+    /* height: calc(100vh - 240px); */
     min-height: 400px;
     overflow-y: auto;
     overflow-x: hidden;
@@ -2069,6 +2175,82 @@ watch(
 .gantt-table-pane :deep(.vort-pro-table-scroll) {
     overflow-x: auto !important;
     overflow-y: hidden !important;
+}
+
+/* ===== Story drag & drop ===== */
+
+/*
+ * Drag handle 始终预占位（width:12px），避免 hover 时挤动工作编号文字。
+ * 默认低对比度（淡灰），行 hover 颜色加深，手柄本身 hover 变主题蓝。
+ */
+.story-drag-handle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 12px;
+    height: 18px;
+    margin-right: 6px;
+    border-radius: 3px;
+    color: #d8dde5;
+    cursor: grab;
+    flex-shrink: 0;
+    user-select: none;
+    transition: color 0.15s ease, background 0.15s ease;
+}
+:deep(.vort-pro-table-row:hover) .story-drag-handle {
+    color: #94a3b8;
+}
+.story-drag-handle:hover {
+    color: var(--vort-primary, #1456f0);
+    background: rgba(20, 86, 240, 0.08);
+}
+.story-drag-handle:active {
+    cursor: grabbing;
+}
+
+/*
+ * Drop cell 占位线
+ * 用 ::before（绕开 TableCell 自带的 ::after hover 边框），absolute 横向溢出 cell 形成贯穿整行的横线。
+ * - before:   行上沿一条蓝色细线
+ * - after:    行下沿一条蓝色细线
+ * - inside:   cell 浅蓝高亮（嵌入为子需求）
+ * - forbidden: 红色细线 + 浅红背景
+ */
+.story-drop-cell {
+    position: relative;
+}
+.story-drop-cell::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    width: 9999px;
+    height: 1px;
+    pointer-events: none;
+    z-index: 5;
+    background: transparent;
+    transition: background 0.1s ease;
+}
+.story-drop-cell.story-drop-before::before {
+    top: -1px;
+    background: var(--vort-primary, #1456f0);
+}
+.story-drop-cell.story-drop-after::before {
+    top: auto;
+    bottom: -1px;
+    background: var(--vort-primary, #1456f0);
+}
+.story-drop-cell.story-drop-inside {
+    background: rgba(20, 86, 240, 0.08);
+    box-shadow: inset 0 0 0 1px rgba(20, 86, 240, 0.35);
+}
+.story-drop-cell.story-drop-forbidden {
+    cursor: not-allowed;
+    background: rgba(239, 68, 68, 0.04);
+}
+.story-drop-cell.story-drop-forbidden::before {
+    top: auto;
+    bottom: -1px;
+    background: #ef4444;
 }
 
 </style>

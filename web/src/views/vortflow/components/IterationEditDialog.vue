@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, computed, watch, type Ref } from "vue";
 import { z } from "zod";
 import { Info } from "lucide-vue-next";
 import { DownOutlined } from "@openvort/vort-ui";
@@ -43,7 +43,14 @@ const vortFlowStore = useVortFlowStore();
 const {
     ownerGroups, getAvatarBg, getAvatarLabel, getMemberAvatarUrl,
     loadMemberOptions, getMemberIdByName, getMemberNameById,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
+
+const iterEditEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const iterEditEnrichedCollapsed = ref<string[]>([]);
+const iterEditActiveGroups = computed(() =>
+    iterEditEnrichedGroups.value.length > 0 ? iterEditEnrichedGroups.value : ownerGroups.value,
+);
 
 const formRef = ref();
 const formLoading = ref(false);
@@ -68,6 +75,11 @@ const dialogTitle = ref("");
 watch(() => props.open, (val) => {
     if (!val) return;
     loadMemberOptions();
+    const pid = props.iteration?.project_id || vortFlowStore.selectedProjectId || "";
+    getEnrichedOwnerGroups(pid).then((groups) => {
+        iterEditEnrichedGroups.value = groups;
+        iterEditEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+    });
     if (props.mode === "add") {
         dialogTitle.value = "新建迭代";
         formData.value = {
@@ -92,6 +104,7 @@ const handleOwnerSelect = (name: string) => {
     formData.value.owner_id = getMemberIdByName(name);
     ownerDropdownOpen.value = false;
     ownerKeyword.value = "";
+    if (name) recordRecentMember(name);
 };
 
 const handleSave = async (andContinue = false) => {
@@ -155,7 +168,8 @@ const handleSave = async (andContinue = false) => {
                     <WorkItemMemberPicker
                         mode="owner"
                         :owner="getMemberNameById(formData.owner_id || '')"
-                        :groups="ownerGroups"
+                        :groups="iterEditActiveGroups"
+                        :default-collapsed="iterEditEnrichedCollapsed"
                         :open="ownerDropdownOpen"
                         v-model:keyword="ownerKeyword"
                         :show-unassigned="true"

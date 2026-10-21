@@ -7,7 +7,7 @@ import asyncio
 import subprocess
 import threading
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -268,7 +268,7 @@ async def install_cli_tool(tool_name: str):
     from openvort.plugins.vortgit.cli_runner import BUILTIN_CLI_TOOLS
     spec = BUILTIN_CLI_TOOLS.get(tool_name)
     if not spec:
-        return {"success": False, "error": f"Unknown tool: {tool_name}"}
+        raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
 
     async def _stream():
         yield f"data: {json.dumps({'type': 'start', 'cmd': spec.install_cmd})}\n\n"
@@ -296,7 +296,7 @@ async def uninstall_cli_tool(tool_name: str):
     from openvort.plugins.vortgit.cli_runner import BUILTIN_CLI_TOOLS
     spec = BUILTIN_CLI_TOOLS.get(tool_name)
     if not spec or not spec.uninstall_cmd:
-        return {"success": False, "error": f"No uninstall command for: {tool_name}"}
+        raise HTTPException(status_code=404, detail=f"No uninstall command for: {tool_name}")
 
     async def _stream():
         yield f"data: {json.dumps({'type': 'start', 'cmd': spec.uninstall_cmd})}\n\n"

@@ -39,6 +39,10 @@ class VortCertPlugin(BasePlugin):
         """Delayed init: give DB time to be fully ready, then register patrol job."""
         await asyncio.sleep(3)
         try:
+            await self._migrate_certificate_data()
+        except Exception as exc:
+            log.warning("VortCert one-shot data migration failed: %s", exc)
+        try:
             from openvort.core.services.scheduler import Scheduler
             self._scheduler = Scheduler()
             self._scheduler.start()
@@ -46,6 +50,69 @@ class VortCertPlugin(BasePlugin):
             log.info("VortCert patrol service initialized")
         except Exception as exc:
             log.warning("Failed to initialize patrol service: %s", exc)
+
+    async def _migrate_certificate_data(self) -> None:
+        """One-shot, idempotent data fixup.
+
+        1. Backfill `cert_certificates.expires_at` for rows where it is NULL — this
+           covers certificates issued before the parse-expiry bug was fixed.
+        2. Re-derive `cert_domains.last_check_status / expires_at / issuer` for
+           every domain from its latest active certificate.
+
+        Safe to run on every startup: rows that already have non-NULL `expires_at`
+        are skipped, and `refresh_domain_status` is itself idempotent.
+        """
+        from sqlalchemy import select
+
+        from openvort.db.engine import get_session_factory
+        from openvort.plugins.vortcert.cert_inspector import parse_certificate
+        from openvort.plugins.vortcert.crypto import decrypt_value
+        from openvort.plugins.vortcert.models import CertCertificate, CertDomain
+        from openvort.plugins.vortcert.router import refresh_domain_status
+
+        sf = get_session_factory()
+        backfilled = 0
+        unparseable = 0
+
+        async with sf() as session:
+            result = await session.execute(
+                select(CertCertificate).where(CertCertificate.expires_at.is_(None))
+            )
+            rows = result.scalars().all()
+            for cert in rows:
+                if not cert.cert_pem:
+                    continue
+                try:
+                    info = parse_certificate(decrypt_value(cert.cert_pem))
+                except Exception as exc:
+                    log.debug("Cert pem decrypt failed during backfill (id=%s): %s", cert.id, exc)
+                    unparseable += 1
+                    continue
+                if info.ok and info.not_after is not None:
+                    cert.expires_at = info.not_after
+                    backfilled += 1
+                else:
+                    unparseable += 1
+            if rows:
+                await session.commit()
+
+        if backfilled or unparseable:
+            log.info(
+                "VortCert backfill cert_certificates.expires_at: backfilled=%d, unparseable=%d",
+                backfilled, unparseable,
+            )
+
+        async with sf() as session:
+            result = await session.execute(select(CertDomain))
+            domains = result.scalars().all()
+            for d in domains:
+                try:
+                    await refresh_domain_status(session, d.id)
+                except Exception as exc:
+                    log.warning("Failed to refresh status for %s: %s", d.domain, exc)
+            if domains:
+                await session.commit()
+                log.info("VortCert refreshed status for %d domain(s)", len(domains))
 
     def _sync_patrol_job(self) -> None:
         if not self._scheduler:
@@ -58,22 +125,23 @@ class VortCertPlugin(BasePlugin):
     # ---- Patrol execution ----
 
     async def run_patrol(self) -> None:
-        """Execute a full certificate check and notify on expiring / expired domains."""
+        """Refresh certificate status for all domains and emit alerts for expiring / expired ones.
+
+        Source of truth: `cert_certificates` table. We re-derive each domain's
+        `last_check_status / expires_at / issuer` from its latest active certificate,
+        then notify responsible members about warning/critical/expired states.
+        """
+        import uuid
         from datetime import datetime, timezone
 
         from sqlalchemy import select
 
         from openvort.db.engine import get_session_factory
-        from openvort.plugins.vortcert.checker import batch_check_domains
         from openvort.plugins.vortcert.models import CertCheckLog, CertDomain
+        from openvort.plugins.vortcert.router import refresh_domain_status
 
         def _utcnow_naive():
             return datetime.now(timezone.utc).replace(tzinfo=None)
-
-        def _strip_tz(dt):
-            if dt is None:
-                return None
-            return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
         log.info("VortCert patrol started")
 
@@ -86,48 +154,47 @@ class VortCertPlugin(BasePlugin):
             log.info("No domains to patrol")
             return
 
-        check_items = [{"domain": d.domain} for d in domains]
-        results = await batch_check_domains(check_items)
-
         now = _utcnow_naive()
         alert_entries: list[dict] = []
+        summary: dict[str, int] = {}
 
         async with sf() as session:
-            for domain_obj, check_result in zip(domains, results):
-                domain_obj = await session.get(CertDomain, domain_obj.id)
+            for d in domains:
+                derived = await refresh_domain_status(session, d.id)
+                if not derived.get("ok"):
+                    continue
+
+                domain_obj = await session.get(CertDomain, d.id)
                 if not domain_obj:
                     continue
 
-                domain_obj.last_check_at = now
-                domain_obj.last_check_status = check_result.status
-                domain_obj.expires_at = _strip_tz(check_result.expires_at)
-                domain_obj.issuer = check_result.issuer
+                status = derived.get("status") or ""
+                summary[status or "unchecked"] = summary.get(status or "unchecked", 0) + 1
 
                 log_entry = CertCheckLog(
-                    domain_id=domain_obj.id,
+                    id=uuid.uuid4().hex,
+                    domain_id=d.id,
                     domain=domain_obj.domain,
                     checked_at=now,
-                    expires_at=_strip_tz(check_result.expires_at),
-                    issuer=check_result.issuer,
-                    status=check_result.status,
-                    error_message=check_result.error_message,
-                    serial_number=check_result.serial_number,
+                    expires_at=domain_obj.expires_at,
+                    issuer=domain_obj.issuer or "",
+                    status=status,
+                    error_message="",
+                    serial_number="",
+                    source="derived",
                 )
                 session.add(log_entry)
 
-                if check_result.status in ALERT_STATUSES:
+                if status in ALERT_STATUSES:
                     alert_entries.append({
                         "domain": domain_obj.domain,
-                        "status": check_result.status,
-                        "days_remaining": check_result.days_remaining,
+                        "status": status,
+                        "days_remaining": derived.get("days_remaining"),
                         "responsible_member_id": domain_obj.responsible_member_id,
                     })
 
             await session.commit()
 
-        summary = {}
-        for r in results:
-            summary[r.status] = summary.get(r.status, 0) + 1
         log.info("VortCert patrol done: %s", summary)
 
         if alert_entries:

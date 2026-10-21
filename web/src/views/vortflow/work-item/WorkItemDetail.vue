@@ -4,20 +4,26 @@ import { message, dialog, Dropdown, DropdownMenuItem, DropdownMenuSeparator } fr
 import WorkItemMemberPicker from "@/components/vort-biz/work-item/WorkItemMemberPicker.vue";
 import WorkItemStatus from "@/components/vort-biz/work-item/WorkItemStatus.vue";
 import WorkItemPriority from "@/components/vort-biz/work-item/WorkItemPriority.vue";
+import IterationSelect, { type IterationSelectOption } from "@/components/vort-biz/work-item/IterationSelect.vue";
 import VortEditor from "@/components/vort-biz/editor/VortEditor.vue";
 import MarkdownView from "@/components/vort-biz/editor/MarkdownView.vue";
 import { Copy, CopyPlus, SquarePen, FileText, Bot, Loader2, MoreHorizontal, Send, Trash2, Paperclip, Download, X } from "lucide-vue-next";
 import StatusIcon from "@/components/vort-biz/work-item/StatusIcon.vue";
-import { useInlineAi } from "@/hooks";
 import { useWorkItemCommon } from "./useWorkItemCommon";
+import { useWorkItemDetailActivityLog } from "./useWorkItemDetailActivityLog";
+import { useWorkItemDetailComments } from "./useWorkItemDetailComments";
+import { useWorkItemDetailDescription } from "./useWorkItemDetailDescription";
+import { useWorkItemDetailAttachments } from "./useWorkItemDetailAttachments";
+import { useWorkItemDetailFieldOptions } from "./useWorkItemDetailFieldOptions";
+import { resolveBugIterationPlanTime } from "./iterationPlanTime";
 import WorkItemLinkPanel from "./WorkItemLinkPanel.vue";
 import TestCaseLinkPanel from "./TestCaseLinkPanel.vue";
 import DocLinkPanel from "./DocLinkPanel.vue";
 import NotifyDialog from "./NotifyDialog.vue";
-import { getVortflowProjects, getVortflowIterations, getVortflowVersions, getVortgitRepos, getVortgitRepoBranches, getVortflowComments, createVortflowComment, updateVortflowComment, deleteVortflowComment, getVortflowActivity, uploadVortflowFile, getVortflowDocLinks } from "@/api";
+import { getVortflowDocLinks } from "@/api";
 import { useUserStore } from "@/stores";
 import { formatFileSize } from "@/utils/format";
-import type { WorkItemType, Status, DateRange, RowItem, DetailComment, DetailLog, AttachmentItem, Priority } from "@/components/vort-biz/work-item/WorkItemTable.types";
+import type { WorkItemType, Status, DateRange, RowItem, Priority } from "@/components/vort-biz/work-item/WorkItemTable.types";
 
 interface Props {
     workNo: string;
@@ -41,6 +47,7 @@ const emit = defineEmits<{
 }>();
 
 const {
+    memberOptions,
     ownerGroups,
     getStatusOptionsByType,
     getStatusOption,
@@ -52,6 +59,9 @@ const {
     getMemberNameById,
     getWorkItemTypeIconClass,
     getWorkItemTypeIcon,
+    getEnrichedOwnerGroups,
+    defaultCollapsedGroups,
+    recordRecentMember,
 } = useWorkItemCommon();
 
 const userStore = useUserStore();
@@ -66,146 +76,121 @@ const detailStatusKeyword = ref("");
 const detailAssigneeDropdownOpen = ref(false);
 const detailAssigneeKeyword = ref("");
 const detailAssigneeGroupOpen = reactive<Record<string, boolean>>({});
+const detailEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const detailEnrichedCollapsed = ref<string[]>([]);
 const detailPriorityOpen = ref(false);
 const detailDescEditing = ref(props.initialDescEditing || false);
 const detailDescDraft = ref(props.initialDescDraft ?? "");
 
-const detailAttachmentInputRef = ref<HTMLInputElement | null>(null);
-const detailAttachmentUploading = ref(false);
-
-const triggerDetailAttachmentInput = () => detailAttachmentInputRef.value?.click();
-
-const handleDetailAttachmentFiles = async (e: Event) => {
-    const files = (e.target as HTMLInputElement).files;
-    if (!files || files.length === 0 || !record.value) return;
-    detailAttachmentUploading.value = true;
-    const newAttachments: AttachmentItem[] = [...(record.value.attachments || [])];
-    try {
-        for (const file of Array.from(files)) {
-            if (file.size > 20 * 1024 * 1024) {
-                message.warning(`文件 ${file.name} 超过 20MB 限制`);
-                continue;
-            }
-            try {
-                const res: any = await uploadVortflowFile(file);
-                if (res?.error) {
-                    message.error(res.error);
-                    continue;
-                }
-                newAttachments.push({
-                    name: res.name || file.name,
-                    url: res.url,
-                    size: res.size || file.size,
-                });
-            } catch {
-                message.error(`上传 ${file.name} 失败`);
-            }
-        }
-        record.value.attachments = newAttachments;
-        emit("update", { attachments: newAttachments });
-        appendDetailLog("添加了附件");
-    } finally {
-        detailAttachmentUploading.value = false;
-        if (detailAttachmentInputRef.value) detailAttachmentInputRef.value.value = "";
-    }
-};
-
-const removeDetailAttachment = (index: number) => {
-    if (!record.value) return;
-    const newAttachments = [...(record.value.attachments || [])];
-    newAttachments.splice(index, 1);
-    record.value.attachments = newAttachments;
-    emit("update", { attachments: newAttachments });
-    appendDetailLog("删除了附件");
-};
-
-defineExpose({ detailDescEditing, detailDescDraft });
 const notifyDialogOpen = ref(false);
-const detailCommentDraft = ref("");
-const editingCommentId = ref<string | null>(null);
-const editingCommentContent = ref("");
-const replyingToComment = ref<DetailComment | null>(null);
 
 const currentMemberId = computed(() => userStore.userInfo.member_id);
 
-const startEditComment = (item: DetailComment) => {
-    replyingToComment.value = null;
-    editingCommentId.value = item.id;
-    editingCommentContent.value = item.content;
-};
+// 把 record.type 转换成后端 entity_type；评论/日志 composable 复用
+function getEntityTypeKey(): string {
+    const type = record.value?.type;
+    if (type === "需求") return "story";
+    if (type === "任务") return "task";
+    return "bug";
+}
 
-const cancelEditComment = () => {
-    editingCommentId.value = null;
-    editingCommentContent.value = "";
-};
+const workNoRef = computed(() => props.workNo);
 
-const saveEditComment = async (item: DetailComment) => {
-    const content = editingCommentContent.value.trim();
-    if (!content) return;
-    try {
-        await updateVortflowComment(item.id, { content });
-        item.content = content;
-        message.success("评论已更新");
-        editingCommentId.value = null;
-        editingCommentContent.value = "";
-    } catch {
-        message.error("更新评论失败");
-    }
-};
+// ---- D1: 评论与活动日志（从原巨型 setup 抽出，统一通过解构保持模板/调用点不变） ----
+const activityLog = useWorkItemDetailActivityLog({
+    record,
+    workNo: workNoRef,
+    currentUser: detailCurrentUser,
+    getMemberNameById,
+});
+const {
+    detailLogsMap,
+    logExpandedMap,
+    detailLogs,
+    toggleLogExpand,
+    formatTimeAgo,
+    formatActivityLog,
+    appendDetailLog,
+} = activityLog;
 
-const handleDeleteComment = (item: DetailComment) => {
-    dialog.confirm({
-        title: "确认删除",
-        content: "确定要删除这条评论吗？删除后不可恢复。",
-        okType: "danger",
-        okText: "删除",
-        onOk: async () => {
-            try {
-                await deleteVortflowComment(item.id);
-                const comments = detailCommentsMap[props.workNo];
-                if (comments) {
-                    const idx = comments.findIndex(c => c.id === item.id);
-                    if (idx >= 0) comments.splice(idx, 1);
-                }
-                message.success("评论已删除");
-            } catch {
-                message.error("删除评论失败");
-            }
-        },
-    });
-};
+const comments = useWorkItemDetailComments({
+    record,
+    workNo: workNoRef,
+    currentUser: detailCurrentUser,
+    currentMemberId,
+    getMemberNameById,
+    getEntityType: getEntityTypeKey,
+    formatTimeAgo,
+});
+const {
+    detailCommentsMap,
+    detailComments,
+    detailCommentDraft,
+    editingCommentId,
+    editingCommentContent,
+    editingCommentMentionIds,
+    replyingToComment,
+    commentMentionIds,
+    startEditComment,
+    cancelEditComment,
+    saveEditComment,
+    handleDeleteComment,
+    startReplyComment,
+    cancelReply,
+    copyCommentLink,
+    submitDetailComment,
+} = comments;
 
-const startReplyComment = (item: DetailComment) => {
-    editingCommentId.value = null;
-    replyingToComment.value = item;
-    detailCommentDraft.value = "";
-};
+// ---- D2: 描述编辑 + AI 增强 ----
+const {
+    descAi,
+    descAiPhaseLabel,
+    aiEnrichBtnLabel,
+    openDetailDescEditor,
+    saveDetailDescEditor,
+    cancelDetailDescEditor,
+    startAiEnrichDesc,
+    applyAiDesc,
+    buildSupplementPrompt,
+} = useWorkItemDetailDescription({
+    record,
+    detailDescEditing,
+    detailDescDraft,
+    onUpdateDescription: (description) => emit("update", { description }),
+    appendDetailLog,
+    getEntityType: getEntityTypeKey,
+});
 
-const cancelReply = () => {
-    replyingToComment.value = null;
-    detailCommentDraft.value = "";
-};
+// ---- D3a: 附件上传 / 删除 ----
+const {
+    detailAttachmentInputRef,
+    detailAttachmentUploading,
+    triggerDetailAttachmentInput,
+    handleDetailAttachmentFiles,
+    removeDetailAttachment,
+} = useWorkItemDetailAttachments({
+    record,
+    onUpdateAttachments: (attachments) => emit("update", { attachments }),
+    appendDetailLog,
+});
 
-const copyCommentLink = async (item: DetailComment) => {
-    const link = `${window.location.href}#comment-${item.id}`;
-    try {
-        if (navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(link);
-        } else {
-            const input = document.createElement("input");
-            input.value = link;
-            document.body.appendChild(input);
-            input.select();
-            document.execCommand("copy");
-            document.body.removeChild(input);
-        }
-        message.success("评论链接已复制");
-    } catch {
-        message.error("复制链接失败");
-    }
-};
-const detailCommentsMap = reactive<Record<string, DetailComment[]>>({});
-const detailLogsMap = reactive<Record<string, DetailLog[]>>({});
+// ---- D3b: 字段下拉选项加载 ----
+const fieldOptions = useWorkItemDetailFieldOptions({ record });
+const {
+    apiProjects,
+    apiIterations,
+    apiVersions,
+    apiRepos,
+    apiBranches,
+    branchLoading,
+    normalizeDateValue,
+    loadBranchOptions,
+    mergeIterationOptions,
+    loadFieldOptions,
+    loadProjectLinkedOptions,
+} = fieldOptions;
+
+defineExpose({ detailDescEditing, detailDescDraft, editingCommentId, detailCommentDraft });
 
 const detailCurrentRecord = computed(() => record.value);
 const parentRecord = computed(() => props.parentRecord || null);
@@ -223,7 +208,9 @@ const addChildLabel = computed(() => record.value?.type === "任务" ? "添加�
 const emptyChildText = computed(() => `暂无关联的${childItemLabel.value}`);
 
 const handleCopyDetailLink = async () => {
-    const link = window.location.href;
+    const baseUrl = window.location.href.split("#")[0] || window.location.href;
+    const title = record.value?.title?.trim() || "";
+    const link = title ? `${baseUrl}#${title}` : baseUrl;
     try {
         if (navigator.clipboard?.writeText) {
             await navigator.clipboard.writeText(link);
@@ -253,16 +240,6 @@ const handleDelete = () => {
     });
 };
 
-const detailComments = computed(() => {
-    if (!props.workNo) return [];
-    return detailCommentsMap[props.workNo] || [];
-});
-
-const detailLogs = computed(() => {
-    if (!props.workNo) return [];
-    return detailLogsMap[props.workNo] || [];
-});
-
 const filteredDetailStatusOptions = computed(() => {
     const type = record.value?.type || "缺陷";
     const options = getStatusOptionsByType(type);
@@ -271,8 +248,12 @@ const filteredDetailStatusOptions = computed(() => {
     return options.filter((opt) => opt.label.toLowerCase().includes(kw));
 });
 
+const detailActiveGroups = computed(() =>
+    detailEnrichedGroups.value.length > 0 ? detailEnrichedGroups.value : ownerGroups.value,
+);
+
 const filteredDetailAssigneeGroups = computed(() => {
-    const groups = ownerGroups.value;
+    const groups = detailActiveGroups.value;
     const kw = detailAssigneeKeyword.value.trim();
     if (!kw) return groups;
     return groups
@@ -283,167 +264,18 @@ const filteredDetailAssigneeGroups = computed(() => {
         .filter((g) => g.members.length > 0);
 });
 
-const formatTimeAgo = (isoStr: string): string => {
-    if (!isoStr) return "";
-    const d = new Date(isoStr);
-    const now = Date.now();
-    const diff = now - d.getTime();
-    if (diff < 60_000) return "刚刚";
-    if (diff < 3600_000) return `${Math.floor(diff / 60_000)}分钟前`;
-    if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}小时前`;
-    const month = d.getMonth() + 1;
-    const day = d.getDate();
-    const h = String(d.getHours()).padStart(2, "0");
-    const m = String(d.getMinutes()).padStart(2, "0");
-    return `${month}月${day}日 ${h}:${m}`;
-};
-
-const FIELD_LABEL_MAP: Record<string, string> = {
-    title: "名称", description: "描述", state: "状态", priority: "优先级",
-    assignee_id: "负责人", pm_id: "负责人", estimate_hours: "预估工时",
-    actual_hours: "实际工时", tags: "标签", collaborators: "协作者",
-    deadline: "截止日期", project_id: "项目", start_at: "开始时间",
-    end_at: "结束时间", repo_id: "关联仓库", branch: "关联分支",
-    severity: "严重程度", task_type: "任务类型", parent_id: "父级",
-};
-
-const LONG_TEXT_FIELDS = new Set(["description"]);
-
-const STATE_LABEL_MAP: Record<string, string> = {
-    submitted: "收集中", intake: "意向", review: "评审", rejected: "已取消",
-    pm_refine: "需求细化", design: "设计中", design_done: "设计完成", breakdown: "任务拆解",
-    dev_assign: "待分配", in_progress: "进行中", testing: "测试中",
-    bugfix: "修复缺陷", done: "已完成",
-    todo: "待办的", closed: "已关闭",
-    open: "待确认", confirmed: "已确认",
-    fixing: "修复中", resolved: "已修复", verified: "已验证",
-    reopened: "重新打开", not_reproducible: "无法复现",
-    by_design: "设计如此", deferred: "延期处理", suspended: "已挂起",
-};
-
-const formatFieldValue = (key: string, value: any): string => {
-    if (value == null || value === "") return "空";
-    if (LONG_TEXT_FIELDS.has(key)) return "（已更新）";
-    if (key === "assignee_id" || key === "pm_id") return getMemberNameById(String(value)) || String(value);
-    if (key === "collaborators" && Array.isArray(value)) return value.map(v => getMemberNameById(String(v)) || String(v)).join("、") || "空";
-    if (key === "tags" && Array.isArray(value)) return value.join("、") || "空";
-    if (key === "state") return STATE_LABEL_MAP[String(value)] || String(value);
-    if (key === "priority") {
-        const m: Record<number, string> = { 1: "紧急", 2: "高", 3: "中", 4: "低" };
-        return m[value] || String(value);
-    }
-    if (key === "severity") {
-        const m: Record<number, string> = { 1: "致命", 2: "严重", 3: "一般", 4: "轻微" };
-        return m[value] || String(value);
-    }
-    return String(value);
-};
-
-const formatActivityAction = (action: string, detailRaw: any): string => {
-    let detail: Record<string, any> = {};
-    if (typeof detailRaw === "string") {
-        try { detail = JSON.parse(detailRaw); } catch { /* ignore */ }
-    } else if (detailRaw && typeof detailRaw === "object") {
-        detail = detailRaw;
-    }
-    if (action === "created") {
-        const title = detail.title ? `「${detail.title}」` : "";
-        return `创建了工作项${title}`;
-    }
-    if (action === "state_changed") {
-        const fromLabel = STATE_LABEL_MAP[detail.from] || detail.from || "?";
-        const toLabel = STATE_LABEL_MAP[detail.to] || detail.to || "?";
-        return `将状态从"${fromLabel}"修改为"${toLabel}"`;
-    }
-    if (action === "updated") {
-        const keys = Object.keys(detail);
-        if (!keys.length) return "更新了工作项";
-        const parts = keys.map(k => {
-            const label = FIELD_LABEL_MAP[k] || k;
-            const entry = detail[k];
-            if (entry && typeof entry === "object" && "to" in entry) {
-                const fromVal = formatFieldValue(k, entry.from);
-                const toVal = formatFieldValue(k, entry.to);
-                return `${label} 从"${fromVal}"为"${toVal}"`;
-            }
-            const val = formatFieldValue(k, entry);
-            return `${label}→"${val}"`;
-        });
-        return `修改了${parts.join("、")}`;
-    }
-    if (action === "deleted") return `删除了工作项${detail.title ? `「${detail.title}」` : ""}`;
-    if (action === "comment_added") return "添加了评论";
-    if (action === "comment_updated") return "修改了评论";
-    if (action === "comment_deleted") return "删除了评论";
-    if (action === "link_added") return "添加了关联工作项";
-    if (action === "link_removed") return "移除了关联工作项";
-    if (action === "doc_linked") return "关联了文档";
-    if (action === "doc_created") return "创建了文档";
-    if (action === "doc_uploaded") return "上传了文档";
-    if (action === "doc_unlinked") return "取消关联文档";
-    if (action === "member_added") return `添加了成员`;
-    if (action === "member_removed") return `移除了成员`;
-    if (action === "member_role_changed") return `修改了成员角色`;
-    if (action === "story_added") return "添加了需求";
-    if (action === "story_removed") return "移除了需求";
-    if (action === "task_added") return "添加了任务";
-    if (action === "task_removed") return "移除了任务";
-    if (action === "bug_added") return "添加了缺陷";
-    if (action === "bug_removed") return "移除了缺陷";
-    if (action === "released") return "已发布";
-    return action;
-};
-
 const ensureDetailPanelsData = async () => {
     const entityId = record.value?.backendId;
     if (!entityId) {
-        if (!detailCommentsMap[props.workNo]) detailCommentsMap[props.workNo] = [];
-        if (!detailLogsMap[props.workNo]) detailLogsMap[props.workNo] = [];
+        comments.ensureCommentsForCurrentWorkNo();
+        activityLog.ensureLogsForCurrentWorkNo();
         return;
     }
     const entityType = getEntityTypeKey();
-    const [commentsRes, activityRes] = await Promise.allSettled([
-        getVortflowComments(entityType, entityId),
-        getVortflowActivity(entityType, entityId),
+    await Promise.allSettled([
+        comments.loadComments(entityType, entityId),
+        activityLog.loadActivityLogs(entityType, entityId),
     ]);
-    if (commentsRes.status === "fulfilled") {
-        const items = ((commentsRes.value as any)?.items || []) as any[];
-        detailCommentsMap[props.workNo] = items.map((c: any) => ({
-            id: String(c.id),
-            author: getMemberNameById(c.author_id) || c.author_id || "未知",
-            authorId: c.author_id || "",
-            createdAt: formatTimeAgo(c.created_at),
-            content: c.content || "",
-            parentId: c.parent_id || null,
-            parentAuthor: c.parent_author_id ? (getMemberNameById(c.parent_author_id) || c.parent_author_id) : undefined,
-            parentContent: c.parent_content || undefined,
-        }));
-    } else {
-        if (!detailCommentsMap[props.workNo]) detailCommentsMap[props.workNo] = [];
-    }
-    if (activityRes.status === "fulfilled") {
-        const items = ((activityRes.value as any)?.items || []) as any[];
-        detailLogsMap[props.workNo] = items.map((e: any) => ({
-            id: String(e.id),
-            actor: getMemberNameById(e.actor_id) || e.actor_id || "系统",
-            createdAt: formatTimeAgo(e.created_at),
-            action: formatActivityAction(e.action, e.detail),
-        }));
-    } else {
-        if (!detailLogsMap[props.workNo]) detailLogsMap[props.workNo] = [];
-    }
-};
-
-const appendDetailLog = (action: string) => {
-    if (!detailLogsMap[props.workNo]) detailLogsMap[props.workNo] = [];
-    const logs = detailLogsMap[props.workNo];
-    if (!logs) return;
-    logs.unshift({
-        id: `${props.workNo}-l-${Date.now()}`,
-        actor: detailCurrentUser.value,
-        createdAt: "刚刚",
-        action
-    });
 };
 
 const toggleDetailStatusMenu = () => {
@@ -466,16 +298,45 @@ const selectDetailStatus = async (value: Status) => {
     record.value.status = value;
     detailStatusDropdownOpen.value = false;
     detailStatusKeyword.value = "";
-    appendDetailLog(`将状态修改为"${value}"`);
+    appendDetailLog("updated", { state: { from: prevStatus, to: value } });
     emit("update", { status: value });
+};
+
+const PRIORITY_DETAIL_DEFAULT_SCORES: Record<Priority, number> = {
+    urgent: 80, high: 60, medium: 40, low: 20, none: 0,
 };
 
 const selectDetailPriority = (value: Priority) => {
     if (!record.value) return;
+    const oldPriority = record.value.priority;
     record.value.priority = value;
+    (record.value as any).priorityScore = PRIORITY_DETAIL_DEFAULT_SCORES[value];
     detailPriorityOpen.value = false;
-    appendDetailLog(`将优先级修改为"${value}"`);
-    emit("update", { priority: value });
+    appendDetailLog("updated", { priority: { from: oldPriority, to: value } });
+    emit("update", {
+        priority: value,
+        priorityScore: PRIORITY_DETAIL_DEFAULT_SCORES[value],
+    });
+};
+
+const selectDetailPriorityScore = (score: number) => {
+    if (!record.value) return;
+    const normalized = Math.max(0, Math.min(100, Math.round(score)));
+    const level: Priority = normalized >= 80 ? "urgent"
+        : normalized >= 60 ? "high"
+        : normalized >= 40 ? "medium"
+        : normalized >= 20 ? "low"
+        : "none";
+    const oldLevel = record.value.priority;
+    const oldScore = (record.value as any).priorityScore;
+    record.value.priority = level;
+    (record.value as any).priorityScore = normalized;
+    if (oldLevel !== level) {
+        appendDetailLog("updated", { priority: { from: oldLevel, to: level } });
+    } else if (oldScore !== normalized) {
+        appendDetailLog("updated", { priority_score: { from: oldScore, to: normalized } });
+    }
+    emit("update", { priority: level, priorityScore: normalized });
 };
 
 const isDetailOwner = (member: string): boolean => {
@@ -493,23 +354,23 @@ const setDetailOwner = async (member: string) => {
     record.value.owner = nextOwner;
     detailAssigneeDropdownOpen.value = false;
     detailAssigneeKeyword.value = "";
-    appendDetailLog(`将负责人修改为"${nextOwner}"`);
+    appendDetailLog("updated", { assignee_id: { from: prev, to: nextOwner } });
     emit("update", { owner: nextOwner });
 };
 
 const toggleDetailCollaborator = async (member: string) => {
     if (!record.value) return;
-    const collaborators = [...record.value.collaborators];
+    const oldCollaborators = [...record.value.collaborators];
+    const collaborators = [...oldCollaborators];
     const idx = collaborators.indexOf(member);
     if (idx >= 0) {
         collaborators.splice(idx, 1);
-        appendDetailLog(`取消协作者"${member}"`);
     } else {
         collaborators.push(member);
-        appendDetailLog(`添加协作者"${member}"`);
     }
     record.value.collaborators = collaborators;
     emit("update", { collaborators });
+    appendDetailLog("updated", { collaborators: { from: oldCollaborators, to: collaborators } });
 };
 
 const setDetailCollaborators = async (nextCollaborators: string[]) => {
@@ -523,262 +384,6 @@ const setDetailCollaborators = async (nextCollaborators: string[]) => {
     }
 };
 
-const openDetailDescEditor = () => {
-    detailDescDraft.value = record.value?.description || "";
-    detailDescEditing.value = true;
-};
-
-const saveDetailDescEditor = () => {
-    if (!record.value) return;
-    record.value.description = detailDescDraft.value;
-    detailDescEditing.value = false;
-    appendDetailLog("更新了描述");
-    emit("update", { description: detailDescDraft.value });
-};
-
-const cancelDetailDescEditor = () => {
-    detailDescEditing.value = false;
-    detailDescDraft.value = "";
-    descAi.clear();
-};
-
-// ---- AI enrich description ----
-const descAi = useInlineAi({ sessionName: "描述完善助手" });
-
-const descAiPhaseLabel = computed(() => {
-    switch (descAi.phase.value) {
-        case "thinking": return "思考中";
-        case "tool_running": return "正在查询项目信息";
-        case "generating": return "生成中";
-        default: return "处理中";
-    }
-});
-
-const aiEnrichBtnLabel = computed(() => {
-    const type = record.value?.type || "需求";
-    return `AI 完善${type}描述`;
-});
-
-const extractImageRefs = (content: string): string[] => {
-    const images: string[] = [];
-    const mdImg = /!\[[^\]]*\]\([^)]+\)/g;
-    let m: RegExpExecArray | null;
-    while ((m = mdImg.exec(content)) !== null) images.push(m[0]);
-    const htmlImg = /<img[^>]+>/gi;
-    while ((m = htmlImg.exec(content)) !== null) images.push(m[0]);
-    return images;
-};
-
-const getStructureByType = (type: string): string => {
-    switch (type) {
-        case "缺陷":
-            return `- **问题描述**：清晰描述缺陷的具体现象
-- **复现步骤**：列出重现该缺陷的详细操作步骤
-- **实际结果**：当前实际出现的错误现象
-- **预期结果**：正常情况下应该出现的结果
-- **影响范围**：该缺陷影响的功能模块和严重程度`;
-        case "任务":
-            return `- **任务目标**：明确说明本任务要达成的目标
-- **实现方案**：列出具体的实施步骤或技术方案
-- **完成标准**：明确可验证的交付标准
-- **依赖与注意事项**：前置依赖、风险点或需要注意的事项`;
-        default:
-            return `- **需求背景**：为什么需要做这个需求
-- **用户故事**：作为___，我希望___，以便___
-- **验收标准**：列出具体可验证的验收条件
-- **技术要点**：关键的技术实现方向（如果能判断）`;
-    }
-};
-
-const buildDescEnrichPrompt = () => {
-    if (!record.value) return "";
-    const title = record.value.title || "";
-    const desc = detailDescDraft.value || record.value.description || "";
-    const project = record.value.projectName || "";
-    const type = record.value.type || "需求";
-
-    const images = extractImageRefs(desc);
-    const imagePart = images.length > 0
-        ? `\n\n重要：原描述中包含 ${images.length} 张图片，你必须在输出中原样保留所有图片引用（不要修改图片语法或 URL），将它们放在最相关的段落位置：\n${images.map((img, i) => `${i + 1}. ${img}`).join("\n")}`
-        : "";
-
-    const descPart = desc.trim()
-        ? `当前已有描述：\n${desc}\n\n请在此基础上完善和补充。`
-        : "（暂无描述内容）";
-
-    const structure = getStructureByType(type);
-
-    return `请帮我完善以下${type}的描述内容。
-
-${type}标题：${title}
-所属项目：${project || "未设置"}
-${descPart}
-
-请生成一份结构清晰的${type}描述，可以包含以下结构（按需裁剪）：
-${structure}
-
-如果需要了解项目的业务背景，你可以查询项目信息或关联的代码仓库来获取更多上下文。${imagePart}
-请直接输出 Markdown 格式的描述内容，不要包含${type}标题。`;
-};
-
-const startAiEnrichDesc = () => {
-    if (!detailDescEditing.value) {
-        openDetailDescEditor();
-    }
-    const prompt = buildDescEnrichPrompt();
-    if (!prompt) return;
-    descAi.run(prompt);
-};
-
-const applyAiDesc = () => {
-    if (!descAi.text.value) return;
-    detailDescDraft.value = descAi.text.value;
-    descAi.clear();
-};
-
-// ---- AI supplement prompt builder ----
-const buildSupplementPrompt = () => {
-    if (!record.value) return "";
-    const r = record.value;
-    const fields = [
-        `负责人：${r.owner || "未指派"}`,
-        `计划时间：${r.planTime?.[0] && r.planTime?.[1] ? `${r.planTime[0]} ~ ${r.planTime[1]}` : "未设置"}`,
-        `迭代：${r.iteration || "未设置"}`,
-        `版本：${r.version || "未设置"}`,
-        `预估工时：${r.estimateHours != null ? r.estimateHours + " 小时" : "未设置"}`,
-    ].join("\n");
-
-    const entityType = getEntityTypeKey();
-    return `请帮我补充${r.type}「${r.title}」(${r.workNo}) 的详细信息。
-实体类型：${entityType}，实体 ID：${r.backendId}
-
-所属项目：${r.projectName || "未设置"}
-当前字段：
-${fields}
-
-请根据${r.type}标题、描述和项目上下文，帮我合理补充以上尚未设置的字段。你可以：
-1. 先查询项目信息了解团队成员、迭代计划、版本规划
-2. 查看关联的代码仓库了解技术背景
-3. 参考同项目其他${r.type}的设置
-
-然后使用工具逐个更新这些字段。每个字段请先简要说明理由再操作。`;
-};
-
-const getEntityTypeKey = (): string => {
-    const type = record.value?.type;
-    if (type === "需求") return "story";
-    if (type === "任务") return "task";
-    return "bug";
-};
-
-const submitDetailComment = async () => {
-    const content = detailCommentDraft.value.trim();
-    if (!content) {
-        message.warning("请先输入评论内容");
-        return;
-    }
-    const entityId = record.value?.backendId;
-    if (!entityId) return;
-    const parentComment = replyingToComment.value;
-    const parentId = parentComment ? Number(parentComment.id) : undefined;
-    try {
-        const res: any = await createVortflowComment(getEntityTypeKey(), entityId, {
-            content,
-            parent_id: parentId || null,
-        });
-        const comments = detailCommentsMap[props.workNo] || (detailCommentsMap[props.workNo] = []);
-        const newComment: DetailComment = {
-            id: String(res?.id || `${props.workNo}-c-${Date.now()}`),
-            author: detailCurrentUser.value,
-            authorId: currentMemberId.value,
-            createdAt: "刚刚",
-            content,
-            parentId: parentId || null,
-            parentAuthor: parentComment?.author,
-            parentContent: parentComment?.content?.slice(0, 200),
-        };
-        comments.push(newComment);
-        detailCommentDraft.value = "";
-        replyingToComment.value = null;
-        message.success("评论已发布");
-    } catch (error: any) {
-        message.error(error?.message || "评论发布失败");
-    }
-};
-
-// ---- Editable field options ----
-const apiProjects = ref<Array<{ id: string; name: string }>>([]);
-const apiIterations = ref<Array<{ id: string; name: string }>>([]);
-const apiVersions = ref<Array<{ id: string; name: string }>>([]);
-const apiRepos = ref<Array<{ id: string; name: string }>>([]);
-const apiBranches = ref<Array<{ name: string }>>([]);
-const branchLoading = ref(false);
-
-const formatDate = (value: Date) => {
-    const y = value.getFullYear();
-    const m = String(value.getMonth() + 1).padStart(2, "0");
-    const d = String(value.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-};
-
-const normalizeDateValue = (value: unknown): string => {
-    if (value instanceof Date) return formatDate(value);
-    if (typeof value === "string") {
-        const direct = value.trim();
-        if (!direct) return "";
-        if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return direct;
-        const parsed = new Date(direct);
-        if (!Number.isNaN(parsed.getTime())) return formatDate(parsed);
-    }
-    return "";
-};
-
-const loadBranchOptions = async (repoId?: string) => {
-    if (!repoId) {
-        apiBranches.value = [];
-        return;
-    }
-    branchLoading.value = true;
-    try {
-        const res: any = await getVortgitRepoBranches(repoId);
-        apiBranches.value = ((res?.items || []) as any[])
-            .map((item) => ({ name: String(item.name || "") }))
-            .filter((item) => item.name);
-    } catch {
-        apiBranches.value = [];
-    } finally {
-        branchLoading.value = false;
-    }
-};
-
-const loadFieldOptions = async () => {
-    const projectId = record.value?.projectId || "";
-    const [projRes, iterRes, verRes, repoRes] = await Promise.allSettled([
-        getVortflowProjects(),
-        projectId ? getVortflowIterations({ project_id: projectId, page: 1, page_size: 100 }) : Promise.resolve({ items: [] }),
-        projectId ? getVortflowVersions({ project_id: projectId, page: 1, page_size: 100 }) : Promise.resolve({ items: [] }),
-        projectId ? getVortgitRepos({ project_id: projectId, page: 1, page_size: 100 }) : Promise.resolve({ items: [] }),
-    ]);
-    if (projRes.status === "fulfilled") {
-        apiProjects.value = ((projRes.value as any)?.items || []).map((p: any) => ({ id: String(p.id), name: String(p.name || p.id) }));
-    }
-    if (iterRes.status === "fulfilled") {
-        apiIterations.value = ((iterRes.value as any)?.items || []).map((p: any) => ({ id: String(p.id), name: String(p.name || p.id) }));
-    }
-    if (verRes.status === "fulfilled") {
-        apiVersions.value = ((verRes.value as any)?.items || []).map((p: any) => ({ id: String(p.id), name: String(p.name || p.id) }));
-    }
-    if (repoRes.status === "fulfilled") {
-        apiRepos.value = ((repoRes.value as any)?.items || []).map((item: any) => ({
-            id: String(item.id || ""),
-            name: String(item.name || item.full_name || item.id || ""),
-        })).filter((item: { id: string; name: string }) => item.id && item.name);
-    }
-    syncDetailLinkedLabels();
-    syncDetailRepoLabel();
-    await loadBranchOptions(record.value?.repoId || "");
-};
-
 const detailPlanTimeModel = computed<any>({
     get: () => {
         if (!record.value) return undefined;
@@ -787,16 +392,20 @@ const detailPlanTimeModel = computed<any>({
     },
     set: (value) => {
         if (!record.value) return;
+        const oldStart = record.value.planTime?.[0] || "";
+        const oldEnd = record.value.planTime?.[1] || "";
+        let newStart = "";
+        let newEnd = "";
         if (Array.isArray(value) && value.length === 2) {
-            const start = normalizeDateValue(value[0]);
-            const end = normalizeDateValue(value[1]);
-            record.value.planTime = [start, end] as DateRange;
-            emit("update", { planTime: record.value.planTime });
-        } else {
-            record.value.planTime = ["", ""];
-            emit("update", { planTime: record.value.planTime });
+            newStart = normalizeDateValue(value[0]);
+            newEnd = normalizeDateValue(value[1]);
         }
-        appendDetailLog("修改了计划时间");
+        record.value.planTime = [newStart, newEnd] as DateRange;
+        emit("update", { planTime: record.value.planTime });
+        const detail: Record<string, any> = {};
+        if (oldStart !== newStart) detail.plan_start = { from: oldStart, to: newStart };
+        if (oldEnd !== newEnd) detail.deadline = { from: oldEnd, to: newEnd };
+        if (Object.keys(detail).length) appendDetailLog("updated", detail);
     },
 });
 
@@ -804,11 +413,12 @@ const detailProjectName = computed({
     get: () => record.value?.projectName || "",
     set: (val: string) => {
         if (!record.value) return;
+        const oldVal = record.value.projectName || "";
         const match = apiProjects.value.find(p => p.name === val);
         record.value.projectName = val;
         if (match) record.value.projectId = match.id;
         emit("update", { projectName: val, projectId: match?.id });
-        appendDetailLog(`修改项目为"${val}"`);
+        appendDetailLog("updated", { project_name: { from: oldVal, to: val } });
         loadProjectLinkedOptions(match?.id || "");
     },
 });
@@ -817,46 +427,60 @@ const detailIteration = computed({
     get: () => record.value?.iterationId || "",
     set: (val: string) => {
         if (!record.value) return;
+        const oldName = record.value.iteration || "";
+        const oldPlanStart = record.value.planTime?.[0] || "";
+        const oldPlanEnd = record.value.planTime?.[1] || "";
         const nextId = String(val || "");
-        const name = apiIterations.value.find(i => i.id === nextId)?.name || "";
+        const name = apiIterations.value.find(i => i.id === nextId)?.name
+            || (nextId === record.value.iterationId ? record.value.iteration || "" : "");
         record.value.iterationId = nextId;
         record.value.iteration = name;
-        emit("update", { iterationId: nextId, iteration: name });
-        const label = name || "未设置";
-        appendDetailLog(`修改迭代为"${label}"`);
+        // 迭代日期联动只对缺陷生效。复制缺陷后切换项目/迭代时，
+        // 旧计划时间不能继续沿用，应改为新迭代的起止日期；需求和任务
+        // 仍保持手动维护计划时间的原有行为。
+        const iterationPlanTime = resolveBugIterationPlanTime(
+            record.value.type,
+            nextId,
+            apiIterations.value,
+        );
+        const update: Partial<RowItem> = { iterationId: nextId, iteration: name };
+        if (iterationPlanTime) {
+            record.value.planTime = [...iterationPlanTime] as DateRange;
+            record.value.planStartDate = iterationPlanTime[0];
+            record.value.planEndDate = iterationPlanTime[1];
+            update.planTime = [...iterationPlanTime] as DateRange;
+        }
+        emit("update", update);
+        const iterationChange: Record<string, any> = {
+            iteration: { from: oldName, to: name },
+        };
+        if (iterationPlanTime && (oldPlanStart !== iterationPlanTime[0] || oldPlanEnd !== iterationPlanTime[1])) {
+            Object.assign(iterationChange, {
+                plan_start: { from: oldPlanStart, to: iterationPlanTime[0] },
+                deadline: { from: oldPlanEnd, to: iterationPlanTime[1] },
+            });
+        }
+        appendDetailLog("updated", iterationChange);
     },
 });
+
+const handleDetailIterationOptionsChange = (options: IterationSelectOption[]) => {
+    mergeIterationOptions(options);
+};
 
 const detailVersion = computed({
     get: () => record.value?.versionId || "",
     set: (val: string) => {
         if (!record.value) return;
+        const oldName = record.value.version || "";
         const nextId = String(val || "");
         const name = apiVersions.value.find(v => v.id === nextId)?.name || "";
         record.value.versionId = nextId;
         record.value.version = name;
         emit("update", { versionId: nextId, version: name });
-        const label = name || "未设置";
-        appendDetailLog(`修改版本为"${label}"`);
+        appendDetailLog("updated", { version: { from: oldName, to: name } });
     },
 });
-
-const syncDetailLinkedLabels = () => {
-    if (!record.value) return;
-    if (record.value.iterationId && !record.value.iteration) {
-        record.value.iteration = apiIterations.value.find((item) => item.id === record.value?.iterationId)?.name || "";
-    }
-    if (record.value.versionId && !record.value.version) {
-        record.value.version = apiVersions.value.find((item) => item.id === record.value?.versionId)?.name || "";
-    }
-};
-
-const syncDetailRepoLabel = () => {
-    if (!record.value) return;
-    if (record.value.repoId) {
-        record.value.repo = apiRepos.value.find((item) => item.id === record.value?.repoId)?.name || record.value.repo || "";
-    }
-};
 
 const detailEstimateHours = computed<number | undefined>({
     get: () => {
@@ -865,6 +489,7 @@ const detailEstimateHours = computed<number | undefined>({
     },
     set: (value) => {
         if (!record.value) return;
+        const oldVal = record.value.estimateHours == null ? null : Number(record.value.estimateHours);
         const next = value == null ? undefined : Number(value);
         record.value.estimateHours = next;
         if (record.value.loggedHours != null && next != null) {
@@ -873,7 +498,7 @@ const detailEstimateHours = computed<number | undefined>({
             record.value.remainHours = undefined;
         }
         emit("update", { estimateHours: next });
-        appendDetailLog(`修改预估工时为"${next ?? "未设置"}h"`);
+        appendDetailLog("updated", { estimate_hours: { from: oldVal, to: next ?? null } });
     },
 });
 
@@ -881,6 +506,8 @@ const detailRepoId = computed({
     get: () => record.value?.repoId || "",
     set: (val: string) => {
         if (!record.value) return;
+        const oldRepoName = record.value.repo || "";
+        const oldBranch = record.value.branch || "";
         const nextId = String(val || "");
         const nextRepo = apiRepos.value.find((item) => item.id === nextId)?.name || "";
         const repoChanged = nextId !== (record.value.repoId || "");
@@ -894,7 +521,9 @@ const detailRepoId = computed({
             repo: nextRepo,
             branch: repoChanged ? "" : record.value.branch || "",
         });
-        appendDetailLog(`修改关联仓库为"${nextRepo || "未设置"}"`);
+        const detail: Record<string, any> = { repo_name: { from: oldRepoName, to: nextRepo } };
+        if (repoChanged && oldBranch) detail.branch = { from: oldBranch, to: "" };
+        appendDetailLog("updated", detail);
         loadBranchOptions(nextId);
     },
 });
@@ -903,10 +532,11 @@ const detailBranch = computed({
     get: () => record.value?.branch || "",
     set: (val: string) => {
         if (!record.value) return;
+        const oldBranch = record.value.branch || "";
         const nextBranch = String(val || "");
         record.value.branch = nextBranch;
         emit("update", { branch: nextBranch });
-        appendDetailLog(`修改关联分支为"${nextBranch || "未设置"}"`);
+        appendDetailLog("updated", { branch: { from: oldBranch, to: nextBranch } });
     },
 });
 
@@ -919,18 +549,21 @@ const detailActualTimeModel = computed<any>({
     },
     set: (value) => {
         if (!record.value) return;
+        const oldStart = record.value.startAt || "";
+        const oldEnd = record.value.endAt || "";
+        let startAt = "";
+        let endAt = "";
         if (Array.isArray(value) && value.length === 2) {
-            const startAt = normalizeDateValue(String(value[0] || ""));
-            const endAt = normalizeDateValue(String(value[1] || ""));
-            record.value.startAt = startAt;
-            record.value.endAt = endAt;
-            emit("update", { startAt, endAt });
-        } else {
-            record.value.startAt = "";
-            record.value.endAt = "";
-            emit("update", { startAt: "", endAt: "" });
+            startAt = normalizeDateValue(String(value[0] || ""));
+            endAt = normalizeDateValue(String(value[1] || ""));
         }
-        appendDetailLog("修改了实际时间");
+        record.value.startAt = startAt;
+        record.value.endAt = endAt;
+        emit("update", { startAt, endAt });
+        const detail: Record<string, any> = {};
+        if (oldStart !== startAt) detail.start_at = { from: oldStart, to: startAt };
+        if (oldEnd !== endAt) detail.end_at = { from: oldEnd, to: endAt };
+        if (Object.keys(detail).length) appendDetailLog("updated", detail);
     },
 });
 
@@ -938,10 +571,11 @@ const detailTestTime = computed({
     get: () => record.value?.testTime || undefined,
     set: (val: string | undefined) => {
         if (!record.value) return;
+        const oldVal = record.value.testTime || "";
         const v = val ? normalizeDateValue(val) : "";
         record.value.testTime = v;
         emit("update", { testTime: v });
-        appendDetailLog(`修改提测时间为"${v || "未设置"}"`);
+        appendDetailLog("updated", { test_time: { from: oldVal, to: v } });
     },
 });
 
@@ -949,10 +583,11 @@ const detailDraftTime = computed({
     get: () => record.value?.draftTime || undefined,
     set: (val: string | undefined) => {
         if (!record.value) return;
+        const oldVal = record.value.draftTime || "";
         const v = val ? normalizeDateValue(val) : "";
         record.value.draftTime = v;
         emit("update", { draftTime: v });
-        appendDetailLog(`修改出稿时间为"${v || "未设置"}"`);
+        appendDetailLog("updated", { draft_time: { from: oldVal, to: v } });
     },
 });
 
@@ -960,10 +595,11 @@ const detailReleaseTime = computed({
     get: () => record.value?.releaseTime || undefined,
     set: (val: string | undefined) => {
         if (!record.value) return;
+        const oldVal = record.value.releaseTime || "";
         const v = val ? normalizeDateValue(val) : "";
         record.value.releaseTime = v;
         emit("update", { releaseTime: v });
-        appendDetailLog(`修改发布时间为"${v || "未设置"}"`);
+        appendDetailLog("updated", { release_time: { from: oldVal, to: v } });
     },
 });
 
@@ -971,37 +607,13 @@ const detailType = computed({
     get: () => record.value?.type || "缺陷",
     set: (val: string) => {
         if (!record.value || val === record.value.type) return;
+        const oldType = record.value.type;
         // Do NOT mutate record.type before emit — the parent needs
         // the original type to detect the change and call convert API.
         emit("update", { type: val as WorkItemType });
-        appendDetailLog(`修改类型为"${val}"`);
+        appendDetailLog("updated", { task_type: { from: oldType, to: val } });
     },
 });
-
-const loadProjectLinkedOptions = async (projectId?: string) => {
-    const pid = projectId || record.value?.projectId || "";
-    if (!pid) return;
-    const [iterRes, verRes, repoRes] = await Promise.allSettled([
-        getVortflowIterations({ project_id: pid, page: 1, page_size: 100 }),
-        getVortflowVersions({ project_id: pid, page: 1, page_size: 100 }),
-        getVortgitRepos({ project_id: pid, page: 1, page_size: 100 }),
-    ]);
-    if (iterRes.status === "fulfilled") {
-        apiIterations.value = ((iterRes.value as any)?.items || []).map((p: any) => ({ id: String(p.id), name: String(p.name || p.id) }));
-    }
-    if (verRes.status === "fulfilled") {
-        apiVersions.value = ((verRes.value as any)?.items || []).map((p: any) => ({ id: String(p.id), name: String(p.name || p.id) }));
-    }
-    if (repoRes.status === "fulfilled") {
-        apiRepos.value = ((repoRes.value as any)?.items || []).map((item: any) => ({
-            id: String(item.id || ""),
-            name: String(item.name || item.full_name || item.id || ""),
-        })).filter((item: { id: string; name: string }) => item.id && item.name);
-    }
-    syncDetailLinkedLabels();
-    syncDetailRepoLabel();
-    await loadBranchOptions(record.value?.repoId || "");
-};
 
 // ---- Inline edit: click-to-edit pattern ----
 type EditableField =
@@ -1040,9 +652,10 @@ const saveTitle = () => {
     if (!record.value) return;
     const trimmed = titleDraft.value.trim();
     if (trimmed && trimmed !== record.value.title) {
+        const oldTitle = record.value.title;
         record.value.title = trimmed;
         emit("update", { title: trimmed });
-        appendDetailLog("修改了名称");
+        appendDetailLog("updated", { title: { from: oldTitle, to: trimmed } });
     }
     titleDraft.value = "";
     stopEditing();
@@ -1076,10 +689,11 @@ const detailProgress = computed({
     get: () => record.value?.progress ?? 0,
     set: (val: number) => {
         if (!record.value || isProgressReadonly.value) return;
+        const oldVal = record.value.progress ?? 0;
         const clamped = Math.max(0, Math.min(100, Math.round(val)));
         record.value.progress = clamped;
         emit("update", { progress: clamped });
-        appendDetailLog(`修改了进度为 ${clamped}%`);
+        appendDetailLog("updated", { progress: { from: oldVal, to: clamped } });
     },
 });
 
@@ -1099,6 +713,13 @@ const startEditingEstimate = () => {
 
 onMounted(async () => {
     await loadMemberOptions();
+    const pid = record.value?.projectId || "";
+    if (pid) {
+        getEnrichedOwnerGroups(pid).then((groups) => {
+            detailEnrichedGroups.value = groups;
+            detailEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+        });
+    }
     await loadFieldOptions();
     detailAssigneeGroupOpen["全部成员"] = true;
     await ensureDetailPanelsData();
@@ -1250,13 +871,14 @@ watch(() => props.initialData, (value) => {
                                 :dropdown-width="280"
                                 :dropdown-max-height="320"
                                 :bordered="false"
-                                :collapsible="false"
+                                :collapsible="true"
+                                :default-collapsed="detailEnrichedCollapsed"
                                 :get-avatar-bg="getAvatarBg"
                                 :get-avatar-label="getAvatarLabel"
                                 :get-avatar-url="getMemberAvatarUrl"
                                 @update:open="(open) => { detailAssigneeDropdownOpen = open; if (!open) detailAssigneeKeyword = ''; }"
-                                @update:owner="setDetailOwner"
-                                @update:collaborators="setDetailCollaborators"
+                                @update:owner="(v) => { setDetailOwner(v); if (v) recordRecentMember(v); }"
+                                @update:collaborators="(v) => { setDetailCollaborators(v); v.forEach(recordRecentMember); }"
                             >
                                 <template #trigger>
                                     <VortButton
@@ -1309,7 +931,6 @@ watch(() => props.initialData, (value) => {
                             >
                                 <vort-range-picker
                                     v-model="detailPlanTimeModel"
-                                    value-format="YYYY-MM-DD"
                                     format="YYYY-MM-DD"
                                     separator="~"
                                     allow-clear
@@ -1384,18 +1005,19 @@ watch(() => props.initialData, (value) => {
                                 :class="{ 'is-editing': isEditing('iteration') }"
                                 @mousedown.capture="canEditIteration && startEditing('iteration')"
                             >
-                                <vort-select
+                                <IterationSelect
                                     v-model="detailIteration"
+                                    :project-id="record.projectId || ''"
+                                    :selected-label="record.iteration || record.iterationId || ''"
                                     placeholder="未设置"
                                     allow-clear
                                     :disabled="!canEditIteration"
                                     :bordered="isEditing('iteration')"
                                     class="detail-field-select"
+                                    @options-change="handleDetailIterationOptionsChange"
                                     @change="stopEditing"
                                     @blur="stopEditing"
-                                >
-                                    <vort-select-option v-for="item in apiIterations" :key="item.id" :value="item.id">{{ item.name }}</vort-select-option>
-                                </vort-select>
+                                />
                             </div>
                         </div>
                         <div v-if="record?.type === '需求' || record?.type === '任务'" class="bug-detail-info-item bug-detail-info-item-row">
@@ -1453,7 +1075,6 @@ watch(() => props.initialData, (value) => {
                             >
                                 <vort-range-picker
                                     v-model="detailActualTimeModel"
-                                    value-format="YYYY-MM-DD"
                                     format="YYYY-MM-DD"
                                     separator="~"
                                     :placeholder="['未设置', '未设置']"
@@ -1490,7 +1111,10 @@ watch(() => props.initialData, (value) => {
                             <WorkItemPriority
                                 v-model:open="detailPriorityOpen"
                                 :model-value="record.priority || 'none'"
+                                :score="(record as any).priorityScore"
+                                :enable-score-slider="true"
                                 @change="selectDetailPriority"
+                                @change-score="selectDetailPriorityScore"
                             />
                         </div>
                         <div class="bug-detail-info-item bug-detail-info-item-row">
@@ -1780,7 +1404,12 @@ watch(() => props.initialData, (value) => {
                                     </div>
 
                                     <template v-if="editingCommentId === item.id">
-                                        <VortEditor v-model="editingCommentContent" min-height="80px" />
+                                        <VortEditor
+                                            v-model="editingCommentContent"
+                                            :mention-members="memberOptions"
+                                            min-height="80px"
+                                            @mention-change="(ids: string[]) => editingCommentMentionIds = ids"
+                                        />
                                         <div class="bug-detail-desc-actions" style="margin-top: 8px;">
                                             <vort-button size="small" @click="cancelEditComment">取消</vort-button>
                                             <vort-button size="small" variant="primary" @click="saveEditComment(item)">保存</vort-button>
@@ -1809,7 +1438,13 @@ watch(() => props.initialData, (value) => {
                                     <X :size="14" />
                                 </button>
                             </div>
-                            <VortEditor v-model="detailCommentDraft" :placeholder="replyingToComment ? '输入回复内容...' : '发表您的看法（Ctrl/Command+Enter发送）'" min-height="120px" />
+                            <VortEditor
+                                v-model="detailCommentDraft"
+                                :mention-members="memberOptions"
+                                :placeholder="replyingToComment ? '输入回复内容...' : '输入 @ 可提及成员（Ctrl/Command+Enter发送）'"
+                                min-height="120px"
+                                @mention-change="(ids: string[]) => commentMentionIds = ids"
+                            />
                             <div class="bug-detail-desc-actions">
                                 <vort-button v-if="replyingToComment" size="small" @click="cancelReply">取消</vort-button>
                                 <vort-button variant="primary" @click="submitDetailComment">{{ replyingToComment ? '回复' : '评论' }}</vort-button>
@@ -1820,11 +1455,43 @@ watch(() => props.initialData, (value) => {
                     <div v-else class="bug-detail-logs">
                         <div v-if="detailLogs.length === 0" class="bug-detail-empty">暂无操作日志</div>
                         <div v-else class="bug-detail-log-list">
-                            <div v-for="item in detailLogs" :key="item.id" class="bug-detail-log-item">
-                                <span class="bug-detail-log-dot" />
-                                <span class="actor">{{ item.actor }}</span>
-                                <span class="action">{{ item.action }}</span>
-                                <span class="time">{{ item.createdAt }}</span>
+                            <div
+                                v-for="item in detailLogs"
+                                :key="item.id"
+                                class="bug-detail-log-item-wrapper"
+                            >
+                                <div class="bug-detail-log-item">
+                                    <span class="bug-detail-log-dot" />
+                                    <span class="actor">{{ item.actor }}</span>
+                                    <span class="action">{{ item.action }}</span>
+                                    <button
+                                        v-if="item.expandableChanges?.length"
+                                        type="button"
+                                        class="bug-detail-log-toggle"
+                                        @click="toggleLogExpand(item.id)"
+                                    >{{ logExpandedMap[item.id] ? '收起' : '展开详情' }}</button>
+                                    <span class="time">{{ item.createdAt }}</span>
+                                </div>
+                                <div
+                                    v-if="logExpandedMap[item.id] && item.expandableChanges?.length"
+                                    class="bug-detail-log-changes"
+                                >
+                                    <div
+                                        v-for="ch in item.expandableChanges"
+                                        :key="ch.label"
+                                        class="bug-detail-log-change"
+                                    >
+                                        <div class="bug-detail-log-change-label">{{ ch.label }}</div>
+                                        <div class="bug-detail-log-change-row">
+                                            <span class="bug-detail-log-change-tag">修改前</span>
+                                            <pre class="bug-detail-log-change-content">{{ ch.before || '空' }}</pre>
+                                        </div>
+                                        <div class="bug-detail-log-change-row">
+                                            <span class="bug-detail-log-change-tag bug-detail-log-change-tag--after">修改后</span>
+                                            <pre class="bug-detail-log-change-content">{{ ch.after || '空' }}</pre>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1871,6 +1538,7 @@ watch(() => props.initialData, (value) => {
             :entity-id="record.backendId || ''"
             :title="record.title"
             :project-id="record.projectId || ''"
+            :current-member-id="currentMemberId || ''"
             :owner-id="record.ownerId || ''"
             :owner-name="record.owner === '未指派' ? '' : record.owner"
             :collaborator-names="record.collaborators || []"
@@ -2724,6 +2392,7 @@ watch(() => props.initialData, (value) => {
 .bug-detail-bottom-panel {
     border-top: 1px solid var(--vort-border-secondary);
     padding-top: 20px;
+    padding-bottom: 50px;
 }
 
 .bug-detail-bottom-tabs {
@@ -2928,6 +2597,7 @@ watch(() => props.initialData, (value) => {
 .bug-detail-comment-editor {
     border-top: 1px solid var(--vort-border-secondary);
     padding-top: 16px;
+    padding-bottom: 50px;
 }
 
 .comment-reply-bar {
@@ -3002,6 +2672,88 @@ watch(() => props.initialData, (value) => {
 .bug-detail-log-item .time {
     color: var(--vort-text-tertiary);
     margin-left: auto;
+}
+
+.bug-detail-log-item-wrapper {
+    display: flex;
+    flex-direction: column;
+}
+
+.bug-detail-log-toggle {
+    background: transparent;
+    border: none;
+    padding: 0 4px;
+    color: var(--vort-primary, #1456f0);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+}
+
+.bug-detail-log-toggle:hover {
+    text-decoration: underline;
+}
+
+.bug-detail-log-changes {
+    margin-left: 14px;
+    margin-top: 8px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    background: var(--vort-bg-secondary, #f7f8fa);
+    border: 1px solid var(--vort-border-secondary, #f0f0f0);
+    border-radius: 6px;
+}
+
+.bug-detail-log-change {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.bug-detail-log-change-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--vort-text);
+}
+
+.bug-detail-log-change-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.bug-detail-log-change-tag {
+    flex-shrink: 0;
+    padding: 2px 6px;
+    background: #fef3c7;
+    color: #92400e;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.5;
+}
+
+.bug-detail-log-change-tag--after {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.bug-detail-log-change-content {
+    flex: 1;
+    margin: 0;
+    padding: 6px 10px;
+    background: var(--vort-bg, #fff);
+    border: 1px solid var(--vort-border-secondary, #f0f0f0);
+    border-radius: 4px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--vort-text);
+    font-family: inherit;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow-y: auto;
 }
 
 .detail-field-shell {

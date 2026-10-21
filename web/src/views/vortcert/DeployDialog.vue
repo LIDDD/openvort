@@ -47,7 +47,11 @@ const getTargetSummary = (t: TargetItem) => {
     try {
         const config = JSON.parse(t.config || "{}");
         if (t.target_type === "aliyun_cdn") return config.cdn_domain || "";
-        if (t.target_type === "baota") return config.site_name || "";
+        if (t.target_type === "baota") {
+            return config.match_mode === "pattern"
+                ? `${config.domain_pattern || ""}（通配）`
+                : config.site_name || "";
+        }
     } catch { /* ignore */ }
     return "";
 };
@@ -129,20 +133,33 @@ const handleDeploy = async () => {
             target_ids: selectedTargetIds.value,
         }) as any;
 
-        const results = res.results || [];
-        const successes = results.filter((r: any) => r.ok);
-        const failures = results.filter((r: any) => !r.ok);
+        const results: any[] = res.results || [];
 
-        if (failures.length === 0) {
-            message.success(`证书已成功部署到 ${successes.length} 个目标`);
-        } else if (successes.length > 0) {
-            message.warning(`${successes.length} 个成功，${failures.length} 个失败`);
-        } else {
-            const msgs = failures.map((r: any) => `${r.target_name}: ${r.message}`).join("; ");
-            message.error(`部署失败: ${msgs}`);
+        // 站点级统计：通配符模式下一个 target 包含多个 details
+        let okSites = 0;
+        let failSites = 0;
+        const failDetails: string[] = [];
+        for (const r of results) {
+            const details: any[] = r.details || [{ site: r.target_name, ok: r.ok, message: r.message }];
+            for (const d of details) {
+                if (d.ok) {
+                    okSites += 1;
+                } else {
+                    failSites += 1;
+                    failDetails.push(`${d.site || r.target_name}: ${d.message}`);
+                }
+            }
         }
 
-        if (successes.length > 0) {
+        if (failSites === 0) {
+            message.success(`证书已成功部署到 ${okSites} 个站点`);
+        } else if (okSites > 0) {
+            message.warning(`${okSites} 个站点成功，${failSites} 个失败：${failDetails.slice(0, 2).join("；")}${failDetails.length > 2 ? " 等" : ""}`);
+        } else {
+            message.error(`部署失败：${failDetails.slice(0, 3).join("；")}${failDetails.length > 3 ? " 等" : ""}`);
+        }
+
+        if (okSites > 0) {
             emit("success");
             emit("update:open", false);
         }

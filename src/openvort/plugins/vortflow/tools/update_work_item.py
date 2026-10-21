@@ -87,6 +87,10 @@ class UpdateWorkItemTool(BaseTool):
             FlowIteration, FlowIterationStory, FlowIterationTask, FlowIterationBug,
             FlowVersion, FlowVersionStory, FlowVersionBug,
         )
+        from openvort.plugins.vortflow.router.helpers import (
+            priority_level_to_default_score,
+            severity_to_priority_score,
+        )
 
         entity_type = params["entity_type"]
         entity_id = params["entity_id"]
@@ -136,10 +140,25 @@ class UpdateWorkItemTool(BaseTool):
                 changes["description"] = {"from": old_desc[:50], "to": params["description"][:50]}
 
             if "priority" in params:
-                prio_field = "severity" if entity_type == "bug" else "priority"
-                old_val = getattr(entity, prio_field)
-                setattr(entity, prio_field, params["priority"])
-                changes[prio_field] = {"from": old_val, "to": params["priority"]}
+                prio = int(params["priority"])
+                if entity_type == "bug":
+                    old_val = entity.severity
+                    old_ps = getattr(entity, "priority_score", None)
+                    entity.severity = prio
+                    entity.priority_score = severity_to_priority_score(prio)
+                    changes["severity"] = {"from": old_val, "to": prio}
+                    changes["priority_score"] = {"from": old_ps, "to": entity.priority_score}
+                elif entity_type == "story":
+                    old_val = entity.priority
+                    old_ps = getattr(entity, "priority_score", None)
+                    entity.priority = prio
+                    entity.priority_score = priority_level_to_default_score(prio)
+                    changes["priority"] = {"from": old_val, "to": prio}
+                    changes["priority_score"] = {"from": old_ps, "to": entity.priority_score}
+                else:
+                    old_score = getattr(entity, "priority_score", None)
+                    entity.priority_score = priority_level_to_default_score(prio)
+                    changes["priority_score"] = {"from": old_score, "to": entity.priority_score}
 
             for date_field in ("deadline", "start_at", "end_at"):
                 if date_field in params:
@@ -173,6 +192,13 @@ class UpdateWorkItemTool(BaseTool):
                 fk_field = {"story": "story_id", "task": "task_id", "bug": "bug_id"}[entity_type]
                 fk_col = getattr(iteration_link_model, fk_field)
 
+                old_iter_name = (await session.execute(
+                    select(FlowIteration.name)
+                    .join(iteration_link_model, iteration_link_model.iteration_id == FlowIteration.id)
+                    .where(fk_col == entity_id)
+                    .limit(1)
+                )).scalar_one_or_none() or ""
+
                 await session.execute(
                     sa_delete(iteration_link_model).where(fk_col == entity_id)
                 )
@@ -184,9 +210,9 @@ class UpdateWorkItemTool(BaseTool):
                         return json.dumps({"ok": False, "message": f"迭代不存在: {new_iter_id}"})
                     link = iteration_link_model(**{"iteration_id": new_iter_id, fk_field: entity_id})
                     session.add(link)
-                    changes["iteration"] = {"to": it.name}
+                    changes["iteration"] = {"from": old_iter_name, "to": it.name}
                 else:
-                    changes["iteration"] = {"to": ""}
+                    changes["iteration"] = {"from": old_iter_name, "to": ""}
 
             # Version linking (story and bug only)
             if "version_id" in params:
@@ -195,6 +221,13 @@ class UpdateWorkItemTool(BaseTool):
                 version_link_model = {"story": FlowVersionStory, "bug": FlowVersionBug}[entity_type]
                 fk_field = {"story": "story_id", "bug": "bug_id"}[entity_type]
                 fk_col = getattr(version_link_model, fk_field)
+
+                old_ver_name = (await session.execute(
+                    select(FlowVersion.name)
+                    .join(version_link_model, version_link_model.version_id == FlowVersion.id)
+                    .where(fk_col == entity_id)
+                    .limit(1)
+                )).scalar_one_or_none() or ""
 
                 await session.execute(
                     sa_delete(version_link_model).where(fk_col == entity_id)
@@ -207,9 +240,9 @@ class UpdateWorkItemTool(BaseTool):
                         return json.dumps({"ok": False, "message": f"版本不存在: {new_ver_id}"})
                     link = version_link_model(**{"version_id": new_ver_id, fk_field: entity_id})
                     session.add(link)
-                    changes["version"] = {"to": ver.name}
+                    changes["version"] = {"from": old_ver_name, "to": ver.name}
                 else:
-                    changes["version"] = {"to": ""}
+                    changes["version"] = {"from": old_ver_name, "to": ""}
 
             if not changes:
                 return json.dumps({"ok": False, "message": "字段值与当前相同，无需修改"})

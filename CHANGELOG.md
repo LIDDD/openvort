@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] - 2026-04-27
+
+### Added
+
+- Test time, release time, and publish time fields for stories, tasks, and bugs across detail panel, table, and Gantt chart
+- Right-click menu on Gantt chart for editing or clearing test/release time
+- Design Done status with full workflow and state management support
+- Batch bug submission and per-case execution history for test plans
+- Execution result drawer and case edit drawer for test plan detail
+- Per-case execution details and case_id_map in test plan detail response
+- Certificate deletion from VortCert detail page
+- Certificate deployment log query filtered by domain
+- Member-level report fetching and editing endpoints
+- System time injection for AI tools to handle time-related queries accurately
+- Database connection pool configuration for improved concurrency
+- Demo mode displaying default credentials on the login page
+- API Key edit mode with masked display and persistent session
+- Label loading from API with improved color handling
+- Real-time aggregated notifications with smarter link generation
+- Background task to recover and dispatch expired notifications
+
+### Improved
+
+- Refined work item detail drawer interaction (click outside to close, toolbar button styling, date pickers)
+- Polished Gantt chart visuals (progress bar opacity, weekend marker, bottom border, icon size)
+- Optimized work item table scrollbar layout
+- Enhanced acme.sh auto-install with better error handling and logging
+- Reminder notifications now respect receiver visibility
+- Upgraded @openvort/vort-ui to 1.3.0
+
+### Fixed
+
+- Resolved miscellaneous known issues and improved overall stability
+
 ## [0.12.0] - 2026-04-09
 
 ### Added

@@ -71,7 +71,7 @@ class CertIssueTool(BaseTool):
             return json.dumps({"ok": False, "message": f"不支持的操作: {action}"}, ensure_ascii=False)
 
     async def _issue(self, domain: str, wildcard: bool) -> str:
-        from openvort.plugins.vortcert.issuer import issue_certificate, read_cert_file
+        from openvort.plugins.vortcert.issuer import issue_certificate, read_cert_file, read_chain_pem
 
         clean_domain = domain.lstrip("*.")
 
@@ -108,7 +108,7 @@ class CertIssueTool(BaseTool):
 
         cert_pem = read_cert_file(result.cert_path)
         key_pem = read_cert_file(result.key_path)
-        chain_pem = read_cert_file(result.chain_path)
+        chain_pem = read_chain_pem(result)
 
         now = datetime.now(timezone.utc)
         sf2 = get_session_factory()
@@ -136,7 +136,7 @@ class CertIssueTool(BaseTool):
         }, ensure_ascii=False)
 
     async def _renew(self, domain: str) -> str:
-        from openvort.plugins.vortcert.issuer import renew_certificate, read_cert_file
+        from openvort.plugins.vortcert.issuer import renew_certificate, read_cert_file, read_chain_pem
 
         clean_domain = domain.lstrip("*.")
         result = await renew_certificate(clean_domain)
@@ -146,7 +146,7 @@ class CertIssueTool(BaseTool):
 
         cert_pem = read_cert_file(result.cert_path)
         key_pem = read_cert_file(result.key_path)
-        chain_pem = read_cert_file(result.chain_path)
+        chain_pem = read_chain_pem(result)
 
         sf = get_session_factory()
         async with sf() as session:

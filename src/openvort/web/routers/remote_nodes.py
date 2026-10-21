@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query
 from pydantic import BaseModel
 
 from openvort.web.deps import get_db_session_factory
@@ -148,13 +148,13 @@ async def list_nodes():
 async def create_node(req: CreateNodeRequest):
     """Create a new node (OpenClaw or Docker)."""
     if not req.name:
-        return {"success": False, "error": "名称不能为空"}
+        raise HTTPException(status_code=400, detail="名称不能为空")
 
     service = _get_service()
 
     if req.node_type == "docker":
         if not req.image:
-            return {"success": False, "error": "请选择 Docker 镜像"}
+            raise HTTPException(status_code=400, detail="请选择 Docker 镜像")
         node = await service.create_docker_node(
             name=req.name,
             image=req.image,
@@ -166,11 +166,11 @@ async def create_node(req: CreateNodeRequest):
         )
         create_result = node.pop("_create_result", {})
         if not create_result.get("ok"):
-            return {"success": False, "error": create_result.get("message", "创建容器失败"), "node": node}
+            raise HTTPException(status_code=500, detail=create_result.get("message", "创建容器失败"))
         return {"success": True, "node": node}
     else:
         if not req.gateway_url or not req.gateway_token:
-            return {"success": False, "error": "Gateway 地址和 Token 不能为空"}
+            raise HTTPException(status_code=400, detail="Gateway 地址和 Token 不能为空")
         node = await service.create_node(
             name=req.name,
             gateway_url=req.gateway_url,
@@ -197,7 +197,7 @@ async def quick_create_node(req: QuickCreateRequest):
     )
     create_result = node.pop("_create_result", {})
     if not create_result.get("ok"):
-        return {"success": False, "error": create_result.get("message", "创建容器失败")}
+        raise HTTPException(status_code=500, detail=create_result.get("message", "创建容器失败"))
 
     from openvort.web.deps import get_db_session_factory
     from openvort.contacts.models import Member
@@ -223,7 +223,7 @@ async def get_node(node_id: str):
     service = _get_service()
     node = await service.get_node(node_id)
     if not node:
-        return {"error": "节点不存在"}, 404
+        raise HTTPException(status_code=404, detail="节点不存在")
     return node
 
 
@@ -247,7 +247,7 @@ async def update_node(node_id: str, req: UpdateNodeRequest):
 
     node = await service.update_node(node_id, **kwargs)
     if not node:
-        return {"success": False, "error": "节点不存在"}
+        raise HTTPException(status_code=404, detail="节点不存在")
     return {"success": True, "node": node}
 
 
@@ -257,14 +257,14 @@ async def delete_node(node_id: str):
     service = _get_service()
     node = await service.get_node(node_id)
     if not node:
-        return {"success": False, "error": "节点不存在"}
+        raise HTTPException(status_code=404, detail="节点不存在")
 
     if node.get("node_type") == "docker":
         await service.remove_docker_container(node_id)
 
     ok = await service.delete_node(node_id)
     if not ok:
-        return {"success": False, "error": "删除失败"}
+        raise HTTPException(status_code=500, detail="删除失败")
     return {"success": True}
 
 

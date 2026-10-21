@@ -82,8 +82,9 @@ const toWorkNo = (id: string) =>
     `#${id.replace(/-/g, "").slice(0, 6).toUpperCase().padEnd(6, "X")}`;
 
 const getOwnerId = (item: any): string => {
+    // 与 useWorkItemDataSource.getOwnerSourceId / 后端 owner 口径保持一致。
     if (item?.link_type === "story") {
-        return String(item?.pm_id || item?.assignee_id || "").trim();
+        return String(item?.assignee_id || item?.pm_id || "").trim();
     }
     if (item?.link_type === "bug") {
         return String(item?.assignee_id || item?.developer_id || "").trim();

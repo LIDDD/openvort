@@ -2,7 +2,7 @@
 
 import uuid
 
-from fastapi import APIRouter, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 
 from openvort.web.app import require_auth
 from openvort.web.upload_utils import get_upload_dir, get_upload_url
@@ -27,11 +27,11 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 async def upload_editor_image(file: UploadFile = File(...)):
     """Upload an image for the rich-text editor (VortEditor)."""
     if file.content_type not in ALLOWED_IMAGE_TYPES:
-        return {"error": "仅支持 jpg/png/gif/webp 格式"}
+        raise HTTPException(status_code=400, detail="仅支持 jpg/png/gif/webp 格式")
 
     content = await file.read()
     if len(content) > MAX_IMAGE_SIZE:
-        return {"error": "文件大小不能超过 10MB"}
+        raise HTTPException(status_code=413, detail="文件大小不能超过 10MB")
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "png"
     upload_dir = get_upload_dir("editor")
@@ -49,11 +49,11 @@ async def upload_vortflow_file(request: Request, file: UploadFile = File(...)):
     original_name = file.filename or "file"
     ext = original_name.rsplit(".", 1)[-1].lower() if "." in original_name else ""
     if ext not in ALLOWED_FILE_EXTENSIONS:
-        return {"error": f"不支持的文件类型: .{ext}"}
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: .{ext}")
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
-        return {"error": "文件大小不能超过 20MB"}
+        raise HTTPException(status_code=413, detail="文件大小不能超过 20MB")
 
     upload_dir = get_upload_dir("vortflow")
     saved_name = f"{uuid.uuid4().hex}.{ext}" if ext else uuid.uuid4().hex

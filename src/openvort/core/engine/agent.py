@@ -259,6 +259,14 @@ class AgentRuntime:
             # 追加 assistant 回复
             messages.append({"role": "assistant", "content": self._serialize_content(response.content)})
 
+            truncated_results = self._truncated_tool_results(response)
+            if truncated_results:
+                log.warning(f"输出达到 max_tokens 被截断，跳过 {len(truncated_results)} 个不完整的工具调用")
+                messages.append({"role": "user", "content": truncated_results})
+                continue
+            if response.stop_reason == "max_tokens":
+                log.warning("输出达到 max_tokens 被截断")
+
             # 不是 tool_use — 检查是否虚假完成后结束
             if response.stop_reason != "tool_use":
                 if (not any_tool_called and not correction_injected
@@ -553,6 +561,18 @@ class AgentRuntime:
                 return
 
             messages.append({"role": "assistant", "content": self._serialize_content(response.content)})
+
+            truncated_results = self._truncated_tool_results(response)
+            if truncated_results:
+                log.warning(f"[im-stream] 输出达到 max_tokens 被截断，跳过 {len(truncated_results)} 个不完整的工具调用")
+                for block in response.content:
+                    if getattr(block, "type", None) == "tool_use":
+                        yield {"type": "tool_result", "name": block.name, "result": self._TOOL_TRUNCATED_RESULT}
+                messages.append({"role": "user", "content": truncated_results})
+                accumulated_text = ""
+                continue
+            if response.stop_reason == "max_tokens":
+                log.warning("[im-stream] 输出达到 max_tokens 被截断")
 
             if response.stop_reason != "tool_use":
                 if (not any_tool_called and not correction_injected
@@ -865,6 +885,17 @@ class AgentRuntime:
 
                 messages.append({"role": "assistant", "content": self._serialize_content(response.content)})
 
+                truncated_results = self._truncated_tool_results(response)
+                if truncated_results:
+                    log.warning(f"[web] 输出达到 max_tokens 被截断，跳过 {len(truncated_results)} 个不完整的工具调用")
+                    for block in response.content:
+                        if getattr(block, "type", None) == "tool_use":
+                            yield {"type": "tool_result", "name": block.name, "result": self._TOOL_TRUNCATED_RESULT}
+                    messages.append({"role": "user", "content": truncated_results})
+                    continue
+                if response.stop_reason == "max_tokens":
+                    log.warning("[web] 输出达到 max_tokens 被截断")
+
                 if response.stop_reason != "tool_use":
                     if (not any_tool_called and not correction_injected
                             and self._requires_channel_send_tool(content)):
@@ -1096,6 +1127,28 @@ class AgentRuntime:
             if getattr(block, "type", None) == "text":
                 parts.append(block.text)
         return "\n".join(parts) if parts else "（无回复内容）"
+
+    _TOOL_TRUNCATED_RESULT = (
+        "[系统自动检查] 本次输出达到 max_tokens 上限被截断，该工具调用的参数不完整，未执行。"
+        "请将内容拆分成多次较小的调用（例如大文件先写入一部分，再用 append 追加剩余部分），"
+        "不要重复提交同样长度的内容。"
+    )
+
+    @classmethod
+    def _truncated_tool_results(cls, response) -> list[dict]:
+        """输出因 max_tokens 截断时，为每个不完整的 tool_use 生成错误结果（不执行工具）"""
+        if response.stop_reason != "max_tokens":
+            return []
+        return [
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": cls._TOOL_TRUNCATED_RESULT,
+                "is_error": True,
+            }
+            for block in response.content
+            if getattr(block, "type", None) == "tool_use"
+        ]
 
     @staticmethod
     def _serialize_content(content) -> list[dict]:

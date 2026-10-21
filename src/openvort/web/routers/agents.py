@@ -1,6 +1,6 @@
 """Agent 路由管理路由（CRUD）"""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from openvort.web.deps import get_agent
@@ -41,7 +41,7 @@ async def list_agents():
 async def create_agent_route(req: AgentRouteItem):
     """创建 Agent 路由规则"""
     if not _router_instance:
-        return {"success": False, "error": "Agent 路由器未初始化"}
+        raise HTTPException(status_code=503, detail="Agent 路由器未初始化")
     from openvort.core.engine.router import AgentConfig
     config = AgentConfig(
         name=req.name, model=req.model, system_prompt=req.system_prompt,
@@ -56,9 +56,9 @@ async def create_agent_route(req: AgentRouteItem):
 async def delete_agent_route(name: str):
     """删除 Agent 路由规则（仅移除配置，不销毁已创建的实例）"""
     if not _router_instance:
-        return {"success": False, "error": "Agent 路由器未初始化"}
+        raise HTTPException(status_code=503, detail="Agent 路由器未初始化")
     if name == "default":
-        return {"success": False, "error": "不能删除默认 Agent"}
+        raise HTTPException(status_code=400, detail="不能删除默认 Agent")
     _router_instance._configs = [c for c in _router_instance._configs if c.name != name]
     _router_instance._agents.pop(name, None)
     return {"success": True}

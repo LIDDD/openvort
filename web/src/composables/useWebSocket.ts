@@ -1,6 +1,7 @@
 import { ref } from "vue";
 import { useUserStore, useNotificationStore } from "@/stores";
 import { notification } from "@openvort/vort-ui";
+import { desktopNotify } from "@/composables/useDesktopNotification";
 
 export type WsMessageHandler = (data: any) => void;
 
@@ -34,6 +35,22 @@ function tryNotify(data: any) {
                 description: (summary as string).slice(0, 120),
                 duration: 5000,
             });
+            desktopNotify({
+                title: senderName,
+                body: (summary as string).slice(0, 180),
+                tag: `chat:${data.session_id || senderName}`,
+                url: data.session_id ? `/chat?session=${encodeURIComponent(data.session_id)}` : "/chat",
+            });
+        } else if (msgType === "task_completed" || msgType === "task_failed") {
+            const isFailed = msgType === "task_failed";
+            const name = data.member_name || data.executor_name || "AI 员工";
+            const jobName = data.job_name || data.task_name || "";
+            desktopNotify({
+                title: isFailed ? `${name}：任务失败` : `${name}：任务完成`,
+                body: jobName || (isFailed ? "请检查执行日志" : "已完成一次远程任务"),
+                tag: `task:${data.member_id || name}`,
+                url: "/ai-employees",
+            });
         }
     } catch { /* silent */ }
 }
@@ -63,6 +80,24 @@ function dispatchMessage(data: any) {
             message: data.title || "VortFlow",
             description: (data.message || "").slice(0, 120),
             duration: 5000,
+        });
+        const entityType = data?.data?.entity_type;
+        const entityId = data?.data?.entity_id;
+        const projectId = data?.data?.project_id;
+        let url = "/notifications";
+        if (entityType && entityId) {
+            const seg = entityType === "story" ? "stories" : entityType === "task" ? "tasks" : entityType === "bug" ? "bugs" : "";
+            if (seg) {
+                const params = new URLSearchParams({ action: "detail", id: String(entityId) });
+                if (projectId) params.set("project", String(projectId));
+                url = `/vortflow/${seg}?${params.toString()}`;
+            }
+        }
+        desktopNotify({
+            title: data.title || "VortFlow 通知",
+            body: (data.message || "").slice(0, 180),
+            tag: `vortflow:${entityType || ""}:${entityId || data.id || Date.now()}`,
+            url,
         });
     }
 

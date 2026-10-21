@@ -1,6 +1,8 @@
 """Iteration CRUD, Iteration Stories & Tasks."""
 
-from fastapi import APIRouter, Query
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import func, select, delete as sa_delete
 
 from openvort.db.engine import get_session_factory
@@ -11,7 +13,7 @@ from openvort.plugins.vortflow.models import (
 from openvort.plugins.vortflow.engine import (
     STORY_DONE_STATES, TASK_DONE_STATES, BUG_CLOSED_STATES,
 )
-from .helpers import _iteration_dict, _log_event, _parse_dt, _story_dict, _task_dict, _bug_dict
+from .helpers import _iteration_dict, _log_event, _parse_dt, _story_dict, _task_dict, _bug_dict, resolve_project_ids, _attach_project_names
 from .schemas import (
     IterationCreate, IterationUpdate, IterationStoryBody, IterationTaskBody, IterationBugBody,
 )
@@ -23,7 +25,8 @@ sub_router = APIRouter()
 
 @sub_router.get("/iterations")
 async def list_iterations(
-    project_id: str = Query("", description="按项目过滤"),
+    project_id: str = Query("", description="按项目过滤（单个）"),
+    project_ids: str = Query("", description="按项目过滤（逗号分隔多选，优先于 project_id）"),
     status: str = Query("", description="按状态过滤"),
     keyword: str = Query("", description="按名称/目标搜索"),
     owner_id: str = Query("", description="按负责人过滤"),
@@ -32,11 +35,17 @@ async def list_iterations(
 ):
     sf = get_session_factory()
     async with sf() as session:
-        stmt = select(FlowIteration).order_by(FlowIteration.start_date.desc().nulls_last())
+        # 分页加载依赖稳定顺序；仅按日期排序时同日期/空日期记录在不同请求间
+        # 可能换位，导致分页结果重复或漏掉迭代。ID 作为次排序键保证翻页顺序稳定。
+        stmt = select(FlowIteration).order_by(
+            FlowIteration.start_date.desc().nulls_last(),
+            FlowIteration.id.asc(),
+        )
         count_stmt = select(func.count()).select_from(FlowIteration)
-        if project_id:
-            stmt = stmt.where(FlowIteration.project_id == project_id)
-            count_stmt = count_stmt.where(FlowIteration.project_id == project_id)
+        pids = resolve_project_ids(project_id, project_ids)
+        if pids:
+            stmt = stmt.where(FlowIteration.project_id.in_(pids))
+            count_stmt = count_stmt.where(FlowIteration.project_id.in_(pids))
         if status:
             stmt = stmt.where(FlowIteration.status == status)
             count_stmt = count_stmt.where(FlowIteration.status == status)
@@ -106,6 +115,7 @@ async def list_iterations(
             d["work_item_total"] = s["total"] + t["total"] + b["total"]
             d["work_item_done"] = s["done"] + t["done"] + b["done"]
             items.append(d)
+        await _attach_project_names(session, items)
     return {"total": total, "items": items}
 
 
@@ -115,7 +125,7 @@ async def get_iteration(iteration_id: str):
     async with sf() as session:
         r = await session.get(FlowIteration, iteration_id)
         if not r:
-            return {"error": "迭代不存在"}
+            raise HTTPException(status_code=404, detail="迭代不存在")
     return _iteration_dict(r)
 
 
@@ -144,7 +154,7 @@ async def update_iteration(iteration_id: str, body: IterationUpdate):
     async with sf() as session:
         i = await session.get(FlowIteration, iteration_id)
         if not i:
-            return {"error": "迭代不存在"}
+            raise HTTPException(status_code=404, detail="迭代不存在")
         changes = {}
         for field in ["name", "goal", "status", "owner_id", "estimate_hours"]:
             val = getattr(body, field)
@@ -173,7 +183,7 @@ async def delete_iteration(iteration_id: str):
     async with sf() as session:
         i = await session.get(FlowIteration, iteration_id)
         if not i:
-            return {"error": "迭代不存在"}
+            raise HTTPException(status_code=404, detail="迭代不存在")
         await session.execute(sa_delete(FlowIterationStory).where(FlowIterationStory.iteration_id == iteration_id))
         await session.execute(sa_delete(FlowIterationTask).where(FlowIterationTask.iteration_id == iteration_id))
         await session.execute(sa_delete(FlowIterationBug).where(FlowIterationBug.iteration_id == iteration_id))
@@ -181,6 +191,174 @@ async def delete_iteration(iteration_id: str):
         await _log_event(session, "iteration", iteration_id, "deleted", {"name": i.name})
         await session.commit()
     return {"ok": True}
+
+
+@sub_router.get("/iterations/{iteration_id}/health")
+async def iteration_health(iteration_id: str):
+    """迭代健康度：时间进度 / 完成度 / scope creep / 未估时数 / Top 贡献者。
+
+    给工作墙的 IterationHealthBar 用。
+    """
+    from openvort.contacts.models import Member
+
+    sf = get_session_factory()
+    async with sf() as session:
+        iteration = await session.get(FlowIteration, iteration_id)
+        if not iteration:
+            raise HTTPException(status_code=404, detail="迭代不存在")
+
+        now = datetime.now()
+        start = iteration.start_date
+        end = iteration.end_date
+
+        # 时间进度（按整天计算）。无 start/end 时 duration_days=0，前端按"未排期"处理
+        if start and end:
+            duration_days = max(1, (end.date() - start.date()).days + 1)
+            elapsed_days = max(0, min(duration_days, (now.date() - start.date()).days + 1))
+        else:
+            duration_days = 0
+            elapsed_days = 0
+
+        # 工作项总数与完成数
+        async def count_total_done(link_table, link_id_attr, item_table, done_states):
+            total = (await session.execute(
+                select(func.count())
+                .select_from(link_table)
+                .where(link_table.iteration_id == iteration_id)
+            )).scalar_one()
+            done = (await session.execute(
+                select(func.count())
+                .select_from(link_table)
+                .join(item_table, link_id_attr == item_table.id)
+                .where(
+                    link_table.iteration_id == iteration_id,
+                    item_table.is_archived.is_not(True),
+                    item_table.state.in_(done_states),
+                )
+            )).scalar_one()
+            return total, done
+
+        story_total, story_done = await count_total_done(
+            FlowIterationStory, FlowIterationStory.story_id, FlowStory, STORY_DONE_STATES
+        )
+        task_total, task_done = await count_total_done(
+            FlowIterationTask, FlowIterationTask.task_id, FlowTask, TASK_DONE_STATES
+        )
+        bug_total, bug_done = await count_total_done(
+            FlowIterationBug, FlowIterationBug.bug_id, FlowBug, BUG_CLOSED_STATES
+        )
+
+        total = story_total + task_total + bug_total
+        done = story_done + task_done + bug_done
+
+        # scope creep：迭代开始日之后被加进来的工作项数（关联表 created_at > start_date）
+        if start:
+            creep_count = 0
+            for link_table in (FlowIterationStory, FlowIterationTask, FlowIterationBug):
+                cnt = (await session.execute(
+                    select(func.count())
+                    .select_from(link_table)
+                    .where(
+                        link_table.iteration_id == iteration_id,
+                        link_table.created_at > start,
+                    )
+                )).scalar_one()
+                creep_count += cnt
+        else:
+            creep_count = 0
+
+        # 未估时：迭代内 task.estimate_hours IS NULL 的数量（仅 task 强制要估时）
+        not_estimated_count = (await session.execute(
+            select(func.count())
+            .select_from(FlowIterationTask)
+            .join(FlowTask, FlowIterationTask.task_id == FlowTask.id)
+            .where(
+                FlowIterationTask.iteration_id == iteration_id,
+                FlowTask.is_archived.is_not(True),
+                FlowTask.estimate_hours.is_(None),
+            )
+        )).scalar_one()
+
+        # Top 贡献者：按 done desc 取前 3
+        # owner 口径与 work-items / members_workload 一致：
+        # - 需求 owner = coalesce(nullif(assignee_id,''), pm_id)
+        # - 任务 owner = assignee_id
+        # - 缺陷 owner = coalesce(nullif(assignee_id,''), developer_id)
+        story_owner = func.coalesce(func.nullif(FlowStory.assignee_id, ""), FlowStory.pm_id)
+        task_owner = FlowTask.assignee_id
+        bug_owner = func.coalesce(func.nullif(FlowBug.assignee_id, ""), FlowBug.developer_id)
+
+        async def by_owner(owner_col, link_table, link_id_attr, item_table, done_states):
+            """返回 (total_map, done_map): owner_id -> count"""
+            base = (
+                select(owner_col, func.count())
+                .select_from(link_table)
+                .join(item_table, link_id_attr == item_table.id)
+                .where(
+                    link_table.iteration_id == iteration_id,
+                    item_table.is_archived.is_not(True),
+                    owner_col.is_not(None),
+                )
+                .group_by(owner_col)
+            )
+            total_rows = (await session.execute(base)).all()
+            done_rows = (await session.execute(
+                base.where(item_table.state.in_(done_states))
+            )).all()
+            return (
+                {r[0]: r[1] for r in total_rows if r[0]},
+                {r[0]: r[1] for r in done_rows if r[0]},
+            )
+
+        s_total_by, s_done_by = await by_owner(
+            story_owner, FlowIterationStory, FlowIterationStory.story_id, FlowStory, STORY_DONE_STATES
+        )
+        t_total_by, t_done_by = await by_owner(
+            task_owner, FlowIterationTask, FlowIterationTask.task_id, FlowTask, TASK_DONE_STATES
+        )
+        b_total_by, b_done_by = await by_owner(
+            bug_owner, FlowIterationBug, FlowIterationBug.bug_id, FlowBug, BUG_CLOSED_STATES
+        )
+
+        all_owner_ids = set(s_total_by) | set(t_total_by) | set(b_total_by)
+        contrib = []
+        for oid in all_owner_ids:
+            ot = s_total_by.get(oid, 0) + t_total_by.get(oid, 0) + b_total_by.get(oid, 0)
+            od = s_done_by.get(oid, 0) + t_done_by.get(oid, 0) + b_done_by.get(oid, 0)
+            contrib.append({"member_id": oid, "total": ot, "done": od})
+
+        # 排序：done desc，再按 total desc，再按 member_id 稳定
+        contrib.sort(key=lambda x: (-x["done"], -x["total"], x["member_id"]))
+        top3 = contrib[:3]
+
+        if top3:
+            top_ids = [c["member_id"] for c in top3]
+            members = (await session.execute(
+                select(Member.id, Member.name).where(Member.id.in_(top_ids))
+            )).all()
+            name_map = {m[0]: m[1] for m in members}
+            for c in top3:
+                c["name"] = name_map.get(c["member_id"]) or c["member_id"][:6]
+
+    return {
+        "id": iteration.id,
+        "name": iteration.name,
+        "status": iteration.status,
+        "start_date": iteration.start_date.isoformat() if iteration.start_date else None,
+        "end_date": iteration.end_date.isoformat() if iteration.end_date else None,
+        "duration_days": duration_days,
+        "elapsed_days": elapsed_days,
+        "total": total,
+        "done": done,
+        "by_type": {
+            "story": {"total": story_total, "done": story_done},
+            "task": {"total": task_total, "done": task_done},
+            "bug": {"total": bug_total, "done": bug_done},
+        },
+        "creep_count": creep_count,
+        "not_estimated_count": not_estimated_count,
+        "top_contributors": top3,
+    }
 
 
 # ---- Iteration Stories ----
@@ -212,10 +390,10 @@ async def add_iteration_story(iteration_id: str, body: IterationStoryBody):
     async with sf() as session:
         iteration = await session.get(FlowIteration, iteration_id)
         if not iteration:
-            return {"error": "迭代不存在"}
+            raise HTTPException(status_code=404, detail="迭代不存在")
         story = await session.get(FlowStory, body.story_id)
         if not story:
-            return {"error": "需求不存在"}
+            raise HTTPException(status_code=404, detail="需求不存在")
         existing = await session.execute(
             select(FlowIterationStory).where(
                 FlowIterationStory.iteration_id == iteration_id,
@@ -223,7 +401,7 @@ async def add_iteration_story(iteration_id: str, body: IterationStoryBody):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "需求已在迭代中"}
+            raise HTTPException(status_code=409, detail="需求已在迭代中")
         link = FlowIterationStory(
             iteration_id=iteration_id, story_id=body.story_id,
             story_order=body.story_order,
@@ -280,10 +458,10 @@ async def add_iteration_task(iteration_id: str, body: IterationTaskBody):
     async with sf() as session:
         iteration = await session.get(FlowIteration, iteration_id)
         if not iteration:
-            return {"error": "迭代不存在"}
+            raise HTTPException(status_code=404, detail="迭代不存在")
         task = await session.get(FlowTask, body.task_id)
         if not task:
-            return {"error": "任务不存在"}
+            raise HTTPException(status_code=404, detail="任务不存在")
         existing = await session.execute(
             select(FlowIterationTask).where(
                 FlowIterationTask.iteration_id == iteration_id,
@@ -291,7 +469,7 @@ async def add_iteration_task(iteration_id: str, body: IterationTaskBody):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "任务已在迭代中"}
+            raise HTTPException(status_code=409, detail="任务已在迭代中")
         link = FlowIterationTask(
             iteration_id=iteration_id, task_id=body.task_id,
             task_order=body.task_order,
@@ -327,10 +505,10 @@ async def add_iteration_bug(iteration_id: str, body: IterationBugBody):
     async with sf() as session:
         iteration = await session.get(FlowIteration, iteration_id)
         if not iteration:
-            return {"error": "迭代不存在"}
+            raise HTTPException(status_code=404, detail="迭代不存在")
         bug = await session.get(FlowBug, body.bug_id)
         if not bug:
-            return {"error": "缺陷不存在"}
+            raise HTTPException(status_code=404, detail="缺陷不存在")
         existing = await session.execute(
             select(FlowIterationBug).where(
                 FlowIterationBug.iteration_id == iteration_id,
@@ -338,7 +516,7 @@ async def add_iteration_bug(iteration_id: str, body: IterationBugBody):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "缺陷已在迭代中"}
+            raise HTTPException(status_code=409, detail="缺陷已在迭代中")
         link = FlowIterationBug(
             iteration_id=iteration_id, bug_id=body.bug_id,
             bug_order=body.bug_order,

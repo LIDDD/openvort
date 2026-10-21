@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { Pencil } from "lucide-vue-next";
 import PopoverSelect from "@/components/vort-biz/popover-select/PopoverSelect.vue";
 
 interface TagPickerOption {
@@ -19,6 +20,9 @@ interface Props {
     bordered?: boolean;
     maxVisibleTags?: number;
     getTagColor?: (tag: string) => string;
+    /** Show inline "edit" action on each row; emits edit-tag event on click. */
+    enableEdit?: boolean;
+    editTitle?: string;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -31,12 +35,15 @@ const props = withDefaults(defineProps<Props>(), {
     dropdownMaxHeight: 220,
     bordered: true,
     maxVisibleTags: 3,
-    getTagColor: undefined
+    getTagColor: undefined,
+    enableEdit: false,
+    editTitle: "编辑标签",
 });
 
 const emit = defineEmits<{
     "update:modelValue": [value: string[]];
     change: [value: string[]];
+    "edit-tag": [option: TagPickerOption];
 }>();
 
 const open = defineModel<boolean>("open", { default: false });
@@ -89,6 +96,10 @@ const toggleOption = (tag: string) => {
     }
     emit("update:modelValue", next);
     emit("change", next);
+};
+
+const handleEditClick = (option: TagPickerOption) => {
+    emit("edit-tag", option);
 };
 </script>
 
@@ -154,6 +165,15 @@ const toggleOption = (tag: string) => {
                     />
                     <span class="tag-picker-name">{{ option.label }}</span>
                 </div>
+                <button
+                    v-if="enableEdit"
+                    type="button"
+                    class="tag-picker-edit-btn"
+                    :title="editTitle"
+                    @click.stop="handleEditClick(option)"
+                >
+                    <Pencil :size="14" />
+                </button>
             </div>
         </div>
 
@@ -206,6 +226,10 @@ const toggleOption = (tag: string) => {
 }
 
 .tag-picker-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     min-height: 32px;
     padding: 2px 8px;
     border-radius: 6px;
@@ -225,6 +249,8 @@ const toggleOption = (tag: string) => {
     display: flex;
     align-items: center;
     gap: 12px;
+    min-width: 0;
+    flex: 1;
 }
 
 .tag-picker-color-dot {
@@ -238,5 +264,35 @@ const toggleOption = (tag: string) => {
     color: #334155;
     font-size: 14px;
     line-height: 20px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tag-picker-edit-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: #94a3b8;
+    border-radius: 4px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+}
+
+.tag-picker-row:hover .tag-picker-edit-btn,
+.tag-picker-edit-btn:focus-visible {
+    opacity: 1;
+}
+
+.tag-picker-edit-btn:hover {
+    color: var(--vort-primary, #1456f0);
+    background: rgba(20, 86, 240, 0.08);
 }
 </style>

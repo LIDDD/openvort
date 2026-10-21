@@ -13,10 +13,12 @@ from sqlalchemy.orm import selectinload
 
 from openvort.plugins.report.models import (
     Report,
+    ReportComment,
     ReportPublication,
     ReportPublicationReceiver,
     ReportPublicationSubmitter,
     ReportPublicationWhitelist,
+    ReportReactionPhrase,
     ReportRead,
     ReportReceiverFilter,
 )
@@ -684,7 +686,7 @@ class ReportService:
             from openvort.plugins.vortflow.aggregator import send_im_to_member
 
             type_label = TYPE_LABELS.get(report.report_type, "汇报")
-            report_url = self._build_report_url("read")
+            report_url = self._build_report_url("received", report_id=report.id)
             text = (
                 f"**{reporter_name}** 提交了{type_label}\n\n"
                 f"**{report.title or '无标题'}**\n\n"
@@ -725,7 +727,7 @@ class ReportService:
             from openvort.plugins.vortflow.aggregator import send_im_to_member
 
             type_label = TYPE_LABELS.get(report.report_type, "汇报")
-            report_url = self._build_report_url("read")
+            report_url = self._build_report_url("received", report_id=report.id)
             text = (
                 f"**{reporter_name}** 修改了{type_label}\n\n"
                 f"**{report.title or '无标题'}**\n\n"
@@ -782,7 +784,7 @@ class ReportService:
         type_label = TYPE_LABELS.get(pub_dict.get("report_type", ""), "汇报")
         date_label = f"{target_date.month}月{target_date.day}日"
         deadline_display = self._compute_deadline_display(target_date, pub_dict.get("deadline_time", ""))
-        report_url = self._build_report_url()
+        report_url = self._build_report_url("submitted")
         sent, failed = 0, 0
         for mid in pending_ids:
             name = names.get(mid, "")
@@ -852,7 +854,7 @@ class ReportService:
             lines.append(f"\n未提交成员：{'、'.join(pending_names[:10])}"
                          + (f" 等{len(pending_names)}人" if len(pending_names) > 10 else ""))
 
-        report_url = self._build_report_url("read")
+        report_url = self._build_report_url("received")
         if report_url:
             lines.append(f"\n[查看汇报]({report_url})")
 
@@ -923,14 +925,19 @@ class ReportService:
         return f"{d.month}月{d.day}日 {hm}"
 
     @staticmethod
-    def _build_report_url(tab: str = "") -> str:
+    def _build_report_url(tab: str = "", report_id: str = "") -> str:
         from openvort.config.settings import get_settings
         site_url = (get_settings().web.site_url or "").rstrip("/")
         if not site_url:
             return ""
         url = f"{site_url}/reports"
+        params: list[str] = []
         if tab:
-            url += f"?tab={tab}"
+            params.append(f"tab={tab}")
+        if report_id:
+            params.append(f"report_id={report_id}")
+        if params:
+            url += "?" + "&".join(params)
         return url
 
     @staticmethod
@@ -1051,3 +1058,314 @@ class ReportService:
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "updated_at": r.updated_at.isoformat() if r.updated_at else None,
         }
+
+    # ===================== Permission helpers =====================
+
+    async def _ensure_can_access_report(self, session, report_id: str, member_id: str) -> Report | None:
+        """Return the Report if member is reporter or one of the publication receivers.
+
+        Returns None if the report does not exist or the member has no access.
+        Used as a shared guard for reactions / comments endpoints.
+        """
+        report = await session.get(Report, report_id)
+        if not report:
+            return None
+        if report.reporter_id == member_id:
+            return report
+        if report.publication_id:
+            recv = await session.execute(
+                select(ReportPublicationReceiver).where(
+                    ReportPublicationReceiver.publication_id == report.publication_id,
+                    ReportPublicationReceiver.member_id == member_id,
+                )
+            )
+            if recv.scalar_one_or_none() is not None:
+                return report
+        return None
+
+    # ===================== Reaction phrases =====================
+
+    DEFAULT_REACTION_PHRASES = [
+        ("seen", "已阅", "👀", 10),
+        ("good", "赞一个", "👍", 20),
+        ("hard", "辛苦了", "💪", 30),
+        ("agree", "同意", "✅", 40),
+        ("adjust", "需要调整", "📝", 50),
+        ("cheer", "加油", "🔥", 60),
+    ]
+
+    async def seed_default_reaction_phrases(self) -> None:
+        """Insert built-in phrases if the table is empty. Idempotent."""
+        async with self._sf() as session:
+            existing = await session.execute(select(sa_func.count(ReportReactionPhrase.id)))
+            if (existing.scalar() or 0) > 0:
+                return
+            for code, label, emoji, order in self.DEFAULT_REACTION_PHRASES:
+                session.add(ReportReactionPhrase(
+                    code=code, label=label, emoji=emoji, sort_order=order, enabled=True,
+                ))
+            await session.commit()
+            log.info("已写入默认汇报点评文案 6 条")
+
+    async def list_reaction_phrases(self, *, enabled_only: bool = False) -> list[dict]:
+        async with self._sf() as session:
+            stmt = select(ReportReactionPhrase)
+            if enabled_only:
+                stmt = stmt.where(ReportReactionPhrase.enabled == True)  # noqa: E712
+            stmt = stmt.order_by(ReportReactionPhrase.sort_order.asc(), ReportReactionPhrase.created_at.asc())
+            rows = (await session.execute(stmt)).scalars().all()
+            return [self._phrase_to_dict(p) for p in rows]
+
+    async def create_reaction_phrase(self, *, code: str, label: str, emoji: str = "",
+                                      sort_order: int = 0, enabled: bool = True) -> dict | None:
+        code = (code or "").strip()
+        label = (label or "").strip()
+        if not code or not label:
+            return None
+        async with self._sf() as session:
+            dup = await session.execute(
+                select(ReportReactionPhrase).where(ReportReactionPhrase.code == code)
+            )
+            if dup.scalar_one_or_none():
+                return {"error": "code 已存在"}
+            phrase = ReportReactionPhrase(
+                code=code, label=label, emoji=emoji or "",
+                sort_order=sort_order, enabled=enabled,
+            )
+            session.add(phrase)
+            await session.commit()
+            await session.refresh(phrase)
+            return self._phrase_to_dict(phrase)
+
+    async def update_reaction_phrase(self, phrase_id: str, **fields) -> dict | None:
+        async with self._sf() as session:
+            phrase = await session.get(ReportReactionPhrase, phrase_id)
+            if not phrase:
+                return None
+            for key in ("label", "emoji", "sort_order", "enabled"):
+                if key in fields and fields[key] is not None:
+                    setattr(phrase, key, fields[key])
+            await session.commit()
+            await session.refresh(phrase)
+            return self._phrase_to_dict(phrase)
+
+    async def delete_reaction_phrase(self, phrase_id: str) -> bool:
+        async with self._sf() as session:
+            phrase = await session.get(ReportReactionPhrase, phrase_id)
+            if not phrase:
+                return False
+            await session.delete(phrase)
+            await session.commit()
+            return True
+
+    @staticmethod
+    def _phrase_to_dict(p: ReportReactionPhrase) -> dict:
+        return {
+            "id": p.id,
+            "code": p.code,
+            "label": p.label,
+            "emoji": p.emoji or "",
+            "sort_order": p.sort_order,
+            "enabled": p.enabled,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+        }
+
+    # ===================== Comments =====================
+
+    async def list_comments(self, report_id: str, member_id: str | None = None) -> dict | None:
+        """List comments under a report. Returns flat list ordered by created_at asc;
+        parent_id present means it's a reply. Frontend renders nested view."""
+        async with self._sf() as session:
+            if member_id:
+                report = await self._ensure_can_access_report(session, report_id, member_id)
+                if not report:
+                    return {"error": "无权查看该汇报"}
+
+            rows = (await session.execute(
+                select(ReportComment).where(ReportComment.report_id == report_id)
+                .order_by(ReportComment.created_at.asc())
+            )).scalars().all()
+            by_id = {c.id: c for c in rows}
+            all_mids = {c.author_id for c in rows}
+            for c in rows:
+                if c.parent_id and c.parent_id in by_id:
+                    all_mids.add(by_id[c.parent_id].author_id)
+            info = await self._resolve_member_info(session, list(all_mids)) if all_mids else {}
+
+            items = []
+            for c in rows:
+                author = info.get(c.author_id, {})
+                item = {
+                    "id": c.id,
+                    "report_id": c.report_id,
+                    "author_id": c.author_id,
+                    "author_name": author.get("name", ""),
+                    "author_avatar_url": author.get("avatar_url", ""),
+                    "parent_id": c.parent_id,
+                    "content": c.content,
+                    "mentions": json.loads(c.mentions_json) if c.mentions_json else [],
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                    "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                }
+                if c.parent_id and c.parent_id in by_id:
+                    parent = by_id[c.parent_id]
+                    parent_author = info.get(parent.author_id, {})
+                    item["parent_author_id"] = parent.author_id
+                    item["parent_author_name"] = parent_author.get("name", "")
+                    item["parent_content"] = (parent.content or "")[:200]
+                items.append(item)
+            return {"items": items}
+
+    async def create_comment(self, *, report_id: str, author_id: str, content: str,
+                              parent_id: int | None = None, mentions: list[str] | None = None) -> dict | None:
+        content = (content or "").strip()
+        if not content:
+            return {"error": "评论内容不能为空"}
+
+        parent_root_id: int | None = None
+        report: Report | None = None
+        parent_author_id: str | None = None
+        async with self._sf() as session:
+            report = await self._ensure_can_access_report(session, report_id, author_id)
+            if not report:
+                return {"error": "无权评论该汇报"}
+
+            if parent_id:
+                parent = await session.get(ReportComment, parent_id)
+                if not parent or parent.report_id != report_id:
+                    return {"error": "回复目标不存在"}
+                # Only allow 1 level of nesting: if parent is a reply, attach to its root.
+                parent_root_id = parent.parent_id or parent.id
+                parent_author_id = parent.author_id
+
+            comment = ReportComment(
+                report_id=report_id,
+                author_id=author_id,
+                parent_id=parent_root_id,
+                content=content,
+                mentions_json=json.dumps(mentions or [], ensure_ascii=False),
+            )
+            session.add(comment)
+            await session.commit()
+            await session.refresh(comment)
+            author_info = (await self._resolve_member_info(session, [author_id])).get(author_id, {})
+
+        # Fire-and-forget notification
+        await self._notify_comment(
+            report=report, comment=comment, author_id=author_id,
+            mentions=mentions or [], parent_author_id=parent_author_id,
+        )
+
+        return {
+            "id": comment.id,
+            "report_id": comment.report_id,
+            "author_id": comment.author_id,
+            "author_name": author_info.get("name", ""),
+            "author_avatar_url": author_info.get("avatar_url", ""),
+            "parent_id": comment.parent_id,
+            "content": comment.content,
+            "mentions": json.loads(comment.mentions_json) if comment.mentions_json else [],
+            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+            "updated_at": comment.updated_at.isoformat() if comment.updated_at else None,
+        }
+
+    async def update_comment(self, comment_id: int, member_id: str, *,
+                              content: str, mentions: list[str] | None = None) -> dict | None:
+        content = (content or "").strip()
+        if not content:
+            return {"error": "评论内容不能为空"}
+        async with self._sf() as session:
+            comment = await session.get(ReportComment, comment_id)
+            if not comment:
+                return None
+            if comment.author_id != member_id:
+                return {"error": "只能编辑自己的评论"}
+            comment.content = content
+            comment.mentions_json = json.dumps(mentions or [], ensure_ascii=False)
+            await session.commit()
+            await session.refresh(comment)
+            author_info = (await self._resolve_member_info(session, [member_id])).get(member_id, {})
+            return {
+                "id": comment.id,
+                "report_id": comment.report_id,
+                "author_id": comment.author_id,
+                "author_name": author_info.get("name", ""),
+                "author_avatar_url": author_info.get("avatar_url", ""),
+                "parent_id": comment.parent_id,
+                "content": comment.content,
+                "mentions": json.loads(comment.mentions_json) if comment.mentions_json else [],
+                "created_at": comment.created_at.isoformat() if comment.created_at else None,
+                "updated_at": comment.updated_at.isoformat() if comment.updated_at else None,
+            }
+
+    async def delete_comment(self, comment_id: int, member_id: str) -> dict | None:
+        async with self._sf() as session:
+            comment = await session.get(ReportComment, comment_id)
+            if not comment:
+                return None
+            if comment.author_id != member_id:
+                return {"error": "只能删除自己的评论"}
+            # Delete the comment and all its replies (1-level nesting only).
+            await session.execute(
+                delete(ReportComment).where(ReportComment.parent_id == comment_id)
+            )
+            await session.delete(comment)
+            await session.commit()
+            return {"ok": True}
+
+    async def _notify_comment(self, *, report: Report, comment: ReportComment, author_id: str,
+                               mentions: list[str], parent_author_id: str | None) -> None:
+        """Send IM notifications: author of the report + mentions + parent comment author.
+
+        Skip the actor themselves and de-duplicate recipients."""
+        try:
+            recipients: list[str] = []
+            seen: set[str] = set()
+
+            def _add(mid: str | None):
+                if mid and mid != author_id and mid not in seen:
+                    seen.add(mid)
+                    recipients.append(mid)
+
+            _add(report.reporter_id)
+            _add(parent_author_id)
+            for m in mentions:
+                _add(m)
+
+            if not recipients:
+                return
+
+            async with self._sf() as session:
+                names = await self._resolve_member_names(session, [author_id] + recipients)
+            actor_name = names.get(author_id, "")
+            type_label = TYPE_LABELS.get(report.report_type, "汇报")
+            report_url = self._build_report_url("read")
+
+            from openvort.plugins.vortflow.aggregator import send_im_to_member
+
+            preview = (comment.content or "").strip().replace("\n", " ")
+            if len(preview) > 200:
+                preview = preview[:200] + "..."
+
+            for rid in recipients:
+                # Tailor verb based on relation to this recipient.
+                if rid == report.reporter_id:
+                    verb = f"评论了你的{type_label}"
+                elif rid == parent_author_id:
+                    verb = "回复了你"
+                else:
+                    verb = f"在{type_label}评论中提到了你"
+                text = (
+                    f"**{actor_name}** {verb}\n\n"
+                    f"**{report.title or '无标题'}**\n\n"
+                    f"> {preview}"
+                )
+                if report_url:
+                    text += f"\n\n[查看详情]({report_url})"
+                try:
+                    await send_im_to_member(rid, text)
+                except Exception as e:
+                    log.warning(f"评论通知失败 receiver={rid}: {e}")
+        except Exception as e:
+            log.warning(f"发送评论通知失败: {e}")

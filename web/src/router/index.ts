@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import type { RouteRecordRaw } from "vue-router";
 import { useUserStore, usePluginStore } from "@/stores";
 import { registerPluginRoutes } from "@/router/pluginRoutes";
+import { sanitizeRedirect, buildLoginLocation } from "@/utils/redirect";
 
 import vortflowConfig from "@/views/vortflow/plugin";
 import vortgitConfig from "@/views/vortgit/plugin";
@@ -98,12 +99,12 @@ router.beforeEach(async (to, _from, next) => {
     const isLoginPage = to.name === "login";
 
     if (isLoginPage && userStore.token) {
-        next("/");
+        next(sanitizeRedirect(to.query.redirect));
         return;
     }
 
     if (!isLoginPage && !userStore.token) {
-        next("/login");
+        next(buildLoginLocation(to.fullPath));
         return;
     }
 

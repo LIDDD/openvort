@@ -228,7 +228,10 @@ onMounted(loadData);
                     <VortInput v-model="form.model" placeholder="text-embedding-v3" />
                 </VortFormItem>
                 <VortFormItem label="向量维度">
-                    <VortInput v-model.number="form.dimensions" type="number" placeholder="1024" />
+                    <div>
+                        <VortInput v-model.number="form.dimensions" type="number" placeholder="1024" disabled />
+                        <p class="mt-1 text-xs text-gray-500">当前知识库仅支持 1024 维向量。</p>
+                    </div>
                 </VortFormItem>
                 <VortFormItem label="设为默认">
                     <VortSwitch v-model:checked="form.is_default" />

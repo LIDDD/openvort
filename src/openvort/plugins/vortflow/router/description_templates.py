@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
 from openvort.db.engine import get_session_factory
@@ -23,7 +23,7 @@ async def list_description_templates():
 @sub_router.put("/description-templates/{work_item_type}")
 async def update_description_template(work_item_type: str, body: DescriptionTemplateUpdate):
     if work_item_type not in VALID_TYPES:
-        return {"error": f"无效的工作项类型: {work_item_type}"}
+        raise HTTPException(status_code=400, detail=f"无效的工作项类型: {work_item_type}")
     sf = get_session_factory()
     async with sf() as session:
         result = await session.execute(

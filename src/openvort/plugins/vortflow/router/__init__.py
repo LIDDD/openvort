@@ -23,6 +23,7 @@ from .convert import sub_router as convert_router
 from .document_links import sub_router as document_links_router
 from .reminder import sub_router as reminder_router
 from .archive import sub_router as archive_router
+from .work_items import sub_router as work_items_router
 
 router = APIRouter(prefix="/api/vortflow", tags=["vortflow"])
 
@@ -47,3 +48,4 @@ router.include_router(convert_router)
 router.include_router(document_links_router)
 router.include_router(reminder_router)
 router.include_router(archive_router)
+router.include_router(work_items_router)

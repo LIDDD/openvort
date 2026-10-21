@@ -45,6 +45,13 @@ def _mask_secret(value: str) -> str:
     return f"{value[:3]}***{value[-3:]}"
 
 
+def _validate_config(config: dict | None) -> None:
+    # kb_chunks.embedding is a fixed Vector(1024) column.
+    dimensions = (config or {}).get("dimensions", 1024)
+    if type(dimensions) is not int or dimensions != 1024:
+        raise ValueError("当前知识库仅支持 1024 维向量")
+
+
 class EmbeddingService:
     """Embedding service backed by voice_providers table (service_type='embedding')."""
 
@@ -133,6 +140,7 @@ class EmbeddingService:
         config: dict | None = None,
         is_default: bool = False,
     ) -> VoiceProvider:
+        _validate_config(config)
         async with self._session_factory() as session:
             if is_default:
                 await session.execute(
@@ -181,6 +189,8 @@ class EmbeddingService:
             if not provider or provider.service_type != "embedding":
                 return None
 
+            if config is not None:
+                _validate_config(config)
             if name is not None:
                 provider.name = name
             if api_key is not None:
@@ -273,11 +283,9 @@ class EmbeddingService:
     def _encrypt_secret(value: str) -> str:
         if not value:
             return ""
-        try:
-            from openvort.plugins.vortgit.crypto import encrypt_token
-            return encrypt_token(value)
-        except Exception:
-            return value
+        from openvort.plugins.vortgit.crypto import encrypt_token
+
+        return encrypt_token(value)
 
     @staticmethod
     def _decrypt_secret(value: str) -> str:

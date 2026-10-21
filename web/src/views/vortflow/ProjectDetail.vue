@@ -12,9 +12,10 @@ import {
     getVortflowTasks, getVortflowBugs, getVortflowProjectMembers,
     addVortflowProjectMember, removeVortflowProjectMember,
     updateVortflowProjectMemberRole,
-    getVortgitRepos, getVortgitCodeTasks, getVortflowIterations,
+    getVortgitRepos, getVortgitCodeTasks, getAllVortflowIterations,
     updateVortgitRepo,
 } from "@/api";
+import { message } from "@openvort/vort-ui";
 import { useVortFlowStore } from "@/stores";
 import { useWorkItemCommon } from "./work-item/useWorkItemCommon";
 import * as echarts from "echarts";
@@ -80,7 +81,7 @@ const repoTypeLabels: Record<string, string> = {
 
 const stateColorMap: Record<string, string> = {
     submitted: "default", intake: "default", review: "processing", rejected: "red", pm_refine: "orange",
-    design: "cyan", design_done: "cyan", breakdown: "purple", dev_assign: "geekblue", in_progress: "blue",
+    design: "cyan", design_done: "cyan", pending_dev: "purple", breakdown: "purple", dev_assign: "geekblue", in_progress: "blue",
     testing: "orange", bugfix: "volcano", done: "green",
     todo: "default", closed: "default",
     open: "red", confirmed: "orange", fixing: "processing",
@@ -88,7 +89,7 @@ const stateColorMap: Record<string, string> = {
 };
 const stateLabels: Record<string, string> = {
     submitted: "收集中", intake: "意向", review: "评审", rejected: "已驳回", pm_refine: "产品完善",
-    design: "UI 设计", design_done: "设计完成", breakdown: "拆分估时", dev_assign: "分配开发",
+    design: "UI 设计", design_done: "设计完成", pending_dev: "待开发", breakdown: "拆分估时", dev_assign: "分配开发",
     in_progress: "进行中", testing: "测试中", bugfix: "Bug 修复", done: "已完成",
     todo: "待办", closed: "已关闭",
     open: "打开", confirmed: "已确认", fixing: "修复中",
@@ -156,7 +157,7 @@ const loadData = async () => {
             getVortflowBugs({ project_id: projectId.value, page: 1, page_size: 10 }),
             getVortflowProjectMembers(projectId.value),
             getVortgitRepos({ project_id: projectId.value, page: 1, page_size: 20 }).catch(() => ({ items: [] })),
-            getVortflowIterations({ project_id: projectId.value, page: 1, page_size: 50 }),
+            getAllVortflowIterations({ project_id: projectId.value, page_size: 200 }),
         ]);
         project.value = projRes || {};
         if (statsRes) {
@@ -232,9 +233,21 @@ const handleAddMember = async () => {
     if (selectedMemberNames.value.length === 0) return;
     addingMembers.value = true;
     try {
+        const unresolved: string[] = [];
+        const resolved: { id: string; name: string }[] = [];
         for (const name of selectedMemberNames.value) {
-            const memberId = getMemberIdByName(name) || name;
-            await addVortflowProjectMember(projectId.value, { member_id: memberId, role: newMemberRole.value });
+            const memberId = getMemberIdByName(name);
+            if (memberId) resolved.push({ id: memberId, name });
+            else unresolved.push(name);
+        }
+        if (unresolved.length > 0) {
+            // 之前这里走 `getMemberIdByName(name) || name` 把名字直接当 member_id 写到
+            // FlowProjectMember.member_id，会污染整张通讯录索引并让该项目的相关通知投递不到企微。
+            message.warning(`未识别的成员：${unresolved.join("、")}，请重新选择`);
+            return;
+        }
+        for (const { id } of resolved) {
+            await addVortflowProjectMember(projectId.value, { member_id: id, role: newMemberRole.value });
         }
         selectedMemberNames.value = [];
         newMemberRole.value = "member";
@@ -451,14 +464,6 @@ onBeforeUnmount(() => {
                                 <div class="text-sm text-gray-800 mt-1">
                                     {{ formatDate(project.start_date) }} ~ {{ formatDate(project.end_date) }}
                                 </div>
-                            </div>
-                            <div v-if="project.product">
-                                <span class="text-xs text-gray-400">产品</span>
-                                <div class="text-sm text-gray-800 mt-1">{{ project.product }}</div>
-                            </div>
-                            <div v-if="project.version">
-                                <span class="text-xs text-gray-400">版本</span>
-                                <div class="text-sm text-gray-800 mt-1">v{{ project.version }}</div>
                             </div>
                             <div v-if="project.description">
                                 <span class="text-xs text-gray-400">项目简介</span>

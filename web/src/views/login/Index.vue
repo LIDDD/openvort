@@ -1,14 +1,16 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from "vue";
 import { z } from "zod";
-import { useRouter } from "vue-router";
+import { useRouter, useRoute } from "vue-router";
 import { useUserStore } from "@/stores";
+import { sanitizeRedirect } from "@/utils/redirect";
 import openvortLogo from "@/assets/brand/openvort-logo.png";
 import { User, Lock } from "lucide-vue-next";
 import { message } from "@openvort/vort-ui";
 import { login, getSiteInfo } from "@/api";
 
 const router = useRouter();
+const route = useRoute();
 const userStore = useUserStore();
 
 // Demo flag comes from backend at runtime (OPENVORT_IS_DEMO in .env), with
@@ -67,7 +69,7 @@ const handleLogin = async () => {
         });
         userStore.setMustChangePassword(!!res.must_change_password);
         message.success("登录成功，您好，欢迎回来");
-        router.push("/");
+        router.push(sanitizeRedirect(route.query.redirect));
     } catch {
         message.error("用户不存在或密码错误");
     } finally {

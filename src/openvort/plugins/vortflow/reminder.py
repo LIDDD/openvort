@@ -13,6 +13,7 @@ from openvort.db.engine import get_session_factory
 from openvort.plugins.vortflow.aggregator import send_im_to_member
 from openvort.plugins.vortflow.engine import (
     BUG_CLOSED_STATES,
+    STORY_DEVELOPMENT_PENDING_STATES,
     STORY_DONE_STATES,
     TASK_DONE_STATES,
 )
@@ -48,6 +49,12 @@ _E_FIRE = chr(0x1F525)                    # 🔥
 _E_CHART = chr(0x1F4CA)                   # 📊
 _E_BULB = chr(0x1F4A1)                    # 💡
 _E_WARN = chr(0x26A0) + chr(0xFE0F)      # ⚠️
+
+
+def _uses_development_deadline(etype: str, item: Any) -> bool:
+    """需求进入待测试或后续状态后，不再用开发 deadline 产生风险提醒。"""
+    return etype != "story" or getattr(item, "state", "") in STORY_DEVELOPMENT_PENDING_STATES
+
 
 DEFAULT_SCENES: dict[str, dict[str, Any]] = {
     "morning": {"enabled": True, "time": "09:00"},
@@ -494,9 +501,10 @@ def _render_morning(
     urgent: list[tuple[str, Any]] = []
 
     for etype, item in items:
-        if item.deadline and item.deadline < now:
+        uses_deadline = _uses_development_deadline(etype, item)
+        if uses_deadline and item.deadline and item.deadline < now:
             overdue.append((etype, item))
-        elif item.deadline and item.deadline <= now + timedelta(days=near_days):
+        elif uses_deadline and item.deadline and item.deadline <= now + timedelta(days=near_days):
             near_deadline.append((etype, item))
         if etype == "bug" and getattr(item, "severity", 4) <= 2:
             urgent.append((etype, item))
@@ -528,7 +536,7 @@ def _render_morning(
         lines.append("**\u4eca\u65e5\u91cd\u70b9**")
         for i, (etype, item) in enumerate(top_items, 1):
             label = _item_label(etype, item, site_url, project_id)
-            suffix = _deadline_suffix(item, now)
+            suffix = _deadline_suffix(etype, item, now)
             lines.append(f"{i}. {label}{suffix}")
 
     if overdue or near_deadline or urgent:
@@ -596,10 +604,14 @@ def _render_afternoon(
 ) -> str:
     date_str = now.strftime("%Y-%m-%d %H:%M")
 
-    overdue = [(t, i) for t, i in items if i.deadline and i.deadline < now]
+    overdue = [
+        (t, i) for t, i in items
+        if _uses_development_deadline(t, i) and i.deadline and i.deadline < now
+    ]
     today_due = [
         (t, i) for t, i in items
-        if i.deadline and i.deadline.date() == now.date() and i.deadline >= now
+        if _uses_development_deadline(t, i)
+        and i.deadline and i.deadline.date() == now.date() and i.deadline >= now
     ]
 
     lines: list[str] = [
@@ -659,7 +671,7 @@ def _render_weekly(
 
     overdue: list[tuple[str, Any]] = []
     for etype, item in items:
-        if item.deadline and item.deadline < now:
+        if _uses_development_deadline(etype, item) and item.deadline and item.deadline < now:
             overdue.append((etype, item))
 
     lines: list[str] = [
@@ -734,8 +746,8 @@ def _item_label(etype: str, item, site_url: str = "", project_id: str = "") -> s
     return f"**{tag}** {item.title}"
 
 
-def _deadline_suffix(item, now: datetime) -> str:
-    if not item.deadline:
+def _deadline_suffix(etype: str, item, now: datetime) -> str:
+    if not _uses_development_deadline(etype, item) or not item.deadline:
         return ""
     days = (item.deadline - now).days
     if days < 0:
@@ -755,8 +767,17 @@ def _pick_top_items(
         etype, item = pair
         sev = getattr(item, "severity", 4) if etype == "bug" else 4
         pri = getattr(item, "priority", 4) if etype == "story" else 4
-        overdue_days = (now - item.deadline).days if item.deadline and item.deadline < now else -9999
-        near = (item.deadline - now).days if item.deadline and item.deadline >= now else 9999
+        uses_deadline = _uses_development_deadline(etype, item)
+        overdue_days = (
+            (now - item.deadline).days
+            if uses_deadline and item.deadline and item.deadline < now
+            else -9999
+        )
+        near = (
+            (item.deadline - now).days
+            if uses_deadline and item.deadline and item.deadline >= now
+            else 9999
+        )
         return (-overdue_days, sev, pri, near)
     return sorted(items, key=_sort_key)[:limit]
 

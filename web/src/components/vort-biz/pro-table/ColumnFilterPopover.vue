@@ -167,8 +167,10 @@ const toggleOpen = () => {
 const isInsideChildPopup = (target: Node): boolean => {
     const el = target as HTMLElement;
     if (!el.closest) return false;
+    // vort-ui 日期/时间面板 teleport 到 body，class 为连写形式（rangepicker/datepicker/timepicker）。
+    // 点击面板内部时不能误判为浮窗外点击，否则范围选择第二步还没点就被关掉。
     return !!el.closest(
-        "[data-radix-popper-content-wrapper], [data-reka-popper-content-wrapper], .vort-datepicker-panel, .vort-range-picker-panel, .vort-select-dropdown"
+        "[data-radix-popper-content-wrapper], [data-reka-popper-content-wrapper], .vort-datepicker-panel, .vort-rangepicker-panel, .vort-timepicker-panel, .vort-select-dropdown"
     );
 };
 

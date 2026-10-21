@@ -25,12 +25,19 @@ const targetTypes = [
     { value: "baota", label: "宝塔面板" },
 ];
 
+const baotaMatchModes = [
+    { value: "single", label: "单站点" },
+    { value: "pattern", label: "通配符匹配多站点" },
+];
+
 const form = ref({
     name: "",
     target_type: "aliyun_cdn",
     cdn_domain: "",
     panel_url: "",
+    match_mode: "single" as "single" | "pattern",
     site_name: "",
+    domain_pattern: "",
     api_key: "",
     dns_provider_id: "",
 });
@@ -44,6 +51,7 @@ const rules = toTypedSchema(
 
 const isAliyunCdn = computed(() => form.value.target_type === "aliyun_cdn");
 const isBaota = computed(() => form.value.target_type === "baota");
+const isBaotaPattern = computed(() => isBaota.value && form.value.match_mode === "pattern");
 
 watch(() => props.open, async (val) => {
     if (val) {
@@ -55,14 +63,17 @@ watch(() => props.open, async (val) => {
                 target_type: props.editData.target_type || "aliyun_cdn",
                 cdn_domain: config.cdn_domain || "",
                 panel_url: config.panel_url || "",
+                match_mode: config.match_mode === "pattern" ? "pattern" : "single",
                 site_name: config.site_name || "",
+                domain_pattern: config.domain_pattern || "",
                 api_key: "",
                 dns_provider_id: props.editData.dns_provider_id || "",
             };
         } else {
             form.value = {
                 name: "", target_type: "aliyun_cdn", cdn_domain: "",
-                panel_url: "", site_name: "", api_key: "", dns_provider_id: "",
+                panel_url: "", match_mode: "single", site_name: "", domain_pattern: "",
+                api_key: "", dns_provider_id: "",
             };
         }
         try {
@@ -83,8 +94,16 @@ const handleOk = async () => {
         message.error("请选择 DNS 服务商（用于获取阿里云 API 凭证）");
         return;
     }
-    if (isBaota.value && (!form.value.panel_url || !form.value.site_name)) {
-        message.error("请填写面板地址和站点名称");
+    if (isBaota.value && !form.value.panel_url) {
+        message.error("请填写面板地址");
+        return;
+    }
+    if (isBaota.value && form.value.match_mode === "single" && !form.value.site_name) {
+        message.error("请填写站点名称");
+        return;
+    }
+    if (isBaotaPattern.value && !form.value.domain_pattern) {
+        message.error("请填写域名通配符（如 *.example.com）");
         return;
     }
     if (isBaota.value && !props.editData && !form.value.api_key) {
@@ -98,7 +117,15 @@ const handleOk = async () => {
         if (isAliyunCdn.value) {
             config = { cdn_domain: form.value.cdn_domain };
         } else if (isBaota.value) {
-            config = { panel_url: form.value.panel_url, site_name: form.value.site_name };
+            config = {
+                panel_url: form.value.panel_url,
+                match_mode: form.value.match_mode,
+            };
+            if (form.value.match_mode === "pattern") {
+                config.domain_pattern = form.value.domain_pattern.trim();
+            } else {
+                config.site_name = form.value.site_name.trim();
+            }
         }
 
         const data: any = {
@@ -167,8 +194,21 @@ const handleOk = async () => {
                 <vort-form-item label="面板地址" required>
                     <vort-input v-model="form.panel_url" placeholder="例如：http://47.xx.xx.xx:8888" />
                 </vort-form-item>
-                <vort-form-item label="站点名称" required>
-                    <vort-input v-model="form.site_name" placeholder="宝塔面板中的站点名称" />
+                <vort-form-item label="部署模式" required>
+                    <vort-select v-model="form.match_mode">
+                        <vort-select-option v-for="m in baotaMatchModes" :key="m.value" :value="m.value">
+                            {{ m.label }}
+                        </vort-select-option>
+                    </vort-select>
+                </vort-form-item>
+                <vort-form-item v-if="form.match_mode === 'single'" label="站点名称" required>
+                    <vort-input v-model="form.site_name" placeholder="宝塔面板中的站点名称（精确）" />
+                </vort-form-item>
+                <vort-form-item v-else label="域名通配符" required>
+                    <vort-input v-model="form.domain_pattern" placeholder="例如：*.vortmall.cn" />
+                    <div class="text-xs text-gray-400 mt-1">
+                        部署时自动匹配宝塔上所有符合该模式的站点。<code>*.example.com</code> 仅匹配一级子域（与 Let's Encrypt 通配符证书范围一致）。
+                    </div>
                 </vort-form-item>
                 <vort-form-item label="API Key">
                     <template v-if="editData && !editingApiKey">
@@ -188,7 +228,12 @@ const handleOk = async () => {
         <div class="mt-4 p-3 bg-gray-50 rounded-lg text-xs text-gray-500 leading-relaxed">
             <p class="font-medium text-gray-600 mb-1">配置说明</p>
             <p v-if="isAliyunCdn">阿里云 CDN：通过 SetCdnDomainSSLCertificate API 推送证书。需要 CDN 域名和阿里云 AccessKey（复用 DNS 服务商配置）。</p>
-            <p v-else-if="isBaota">宝塔面板：通过面板 API 设置站点 SSL 证书。需在宝塔「面板设置 → API 接口」中开启 API 并将 OpenVort 服务器 IP 加入白名单。</p>
+            <template v-else-if="isBaota">
+                <p class="mb-1">宝塔面板：通过面板 API 设置站点 SSL 证书。需在宝塔「面板设置 → API 接口」中开启 API 并将 OpenVort 服务器 IP 加入白名单。</p>
+                <p v-if="form.match_mode === 'pattern'">
+                    通配符模式：部署时先调宝塔 GetSites 拉取所有站点，按域名通配符筛选后逐个推送证书。一次配置可覆盖任意数量的子域名站点。
+                </p>
+            </template>
         </div>
     </Dialog>
 </template>
