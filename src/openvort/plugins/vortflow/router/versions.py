@@ -2,14 +2,14 @@
 
 from datetime import datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import func, select, delete as sa_delete
 
 from openvort.db.engine import get_session_factory
 from openvort.plugins.vortflow.models import (
     FlowVersion, FlowVersionStory, FlowVersionBug, FlowStory, FlowBug,
 )
-from .helpers import _log_event, _parse_dt, _story_dict, _bug_dict, _version_dict
+from .helpers import _log_event, _parse_dt, _story_dict, _bug_dict, _version_dict, resolve_project_ids, _attach_project_names
 from .schemas import VersionCreate, VersionUpdate, VersionStoryBody, VersionBugBody
 
 sub_router = APIRouter()
@@ -19,7 +19,8 @@ sub_router = APIRouter()
 
 @sub_router.get("/versions")
 async def list_versions(
-    project_id: str = Query("", description="按项目过滤"),
+    project_id: str = Query("", description="按项目过滤（单个）"),
+    project_ids: str = Query("", description="按项目过滤（逗号分隔多选，优先于 project_id）"),
     status: str = Query("", description="按状态过滤"),
     keyword: str = Query("", description="按版本号/名称搜索"),
     owner_id: str = Query("", description="按负责人过滤"),
@@ -30,9 +31,10 @@ async def list_versions(
     async with sf() as session:
         stmt = select(FlowVersion).order_by(FlowVersion.created_at.desc(), FlowVersion.id.desc())
         count_stmt = select(func.count()).select_from(FlowVersion)
-        if project_id:
-            stmt = stmt.where(FlowVersion.project_id == project_id)
-            count_stmt = count_stmt.where(FlowVersion.project_id == project_id)
+        pids = resolve_project_ids(project_id, project_ids)
+        if pids:
+            stmt = stmt.where(FlowVersion.project_id.in_(pids))
+            count_stmt = count_stmt.where(FlowVersion.project_id.in_(pids))
         if status:
             stmt = stmt.where(FlowVersion.status == status)
             count_stmt = count_stmt.where(FlowVersion.status == status)
@@ -47,7 +49,9 @@ async def list_versions(
         total = (await session.execute(count_stmt)).scalar_one()
         stmt = stmt.offset((page - 1) * page_size).limit(page_size)
         rows = (await session.execute(stmt)).scalars().all()
-    return {"total": total, "items": [_version_dict(r) for r in rows]}
+        items = [_version_dict(r) for r in rows]
+        await _attach_project_names(session, items)
+    return {"total": total, "items": items}
 
 
 @sub_router.get("/versions/{version_id}")
@@ -56,7 +60,7 @@ async def get_version(version_id: str):
     async with sf() as session:
         r = await session.get(FlowVersion, version_id)
         if not r:
-            return {"error": "版本不存在"}
+            raise HTTPException(status_code=404, detail="版本不存在")
     return _version_dict(r)
 
 
@@ -90,7 +94,7 @@ async def update_version(version_id: str, body: VersionUpdate):
     async with sf() as session:
         v = await session.get(FlowVersion, version_id)
         if not v:
-            return {"error": "版本不存在"}
+            raise HTTPException(status_code=404, detail="版本不存在")
         changes = {}
         for field in ["name", "description", "status", "owner_id", "progress"]:
             val = getattr(body, field)
@@ -123,7 +127,7 @@ async def delete_version(version_id: str):
     async with sf() as session:
         v = await session.get(FlowVersion, version_id)
         if not v:
-            return {"error": "版本不存在"}
+            raise HTTPException(status_code=404, detail="版本不存在")
         await session.execute(sa_delete(FlowVersionStory).where(FlowVersionStory.version_id == version_id))
         await session.delete(v)
         await _log_event(session, "version", version_id, "deleted", {"name": v.name})
@@ -138,9 +142,9 @@ async def release_version(version_id: str):
     async with sf() as session:
         v = await session.get(FlowVersion, version_id)
         if not v:
-            return {"error": "版本不存在"}
+            raise HTTPException(status_code=404, detail="版本不存在")
         if v.status == "released":
-            return {"error": "版本已发布"}
+            raise HTTPException(status_code=409, detail="版本已发布")
         v.status = "released"
         v.actual_release_at = datetime.utcnow()
         v.release_date = v.actual_release_at
@@ -181,10 +185,10 @@ async def add_version_story(version_id: str, body: VersionStoryBody):
     async with sf() as session:
         version = await session.get(FlowVersion, version_id)
         if not version:
-            return {"error": "版本不存在"}
+            raise HTTPException(status_code=404, detail="版本不存在")
         story = await session.get(FlowStory, body.story_id)
         if not story:
-            return {"error": "需求不存在"}
+            raise HTTPException(status_code=404, detail="需求不存在")
         existing = await session.execute(
             select(FlowVersionStory).where(
                 FlowVersionStory.version_id == version_id,
@@ -192,7 +196,7 @@ async def add_version_story(version_id: str, body: VersionStoryBody):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "需求已在版本中"}
+            raise HTTPException(status_code=409, detail="需求已在版本中")
         link = FlowVersionStory(
             version_id=version_id, story_id=body.story_id,
             added_reason=body.added_reason, story_order=body.story_order,
@@ -228,10 +232,10 @@ async def add_version_bug(version_id: str, body: VersionBugBody):
     async with sf() as session:
         version = await session.get(FlowVersion, version_id)
         if not version:
-            return {"error": "版本不存在"}
+            raise HTTPException(status_code=404, detail="版本不存在")
         bug = await session.get(FlowBug, body.bug_id)
         if not bug:
-            return {"error": "缺陷不存在"}
+            raise HTTPException(status_code=404, detail="缺陷不存在")
         existing = await session.execute(
             select(FlowVersionBug).where(
                 FlowVersionBug.version_id == version_id,
@@ -239,7 +243,7 @@ async def add_version_bug(version_id: str, body: VersionBugBody):
             )
         )
         if existing.scalar_one_or_none():
-            return {"error": "缺陷已在版本中"}
+            raise HTTPException(status_code=409, detail="缺陷已在版本中")
         link = FlowVersionBug(
             version_id=version_id, bug_id=body.bug_id,
             bug_order=body.bug_order,

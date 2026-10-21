@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, onMounted, watch, type Ref } from "vue";
 import { useRouter } from "vue-router";
 import { Plus } from "lucide-vue-next";
 import { DownOutlined } from "@openvort/vort-ui";
@@ -48,7 +48,21 @@ const {
     loadMemberOptions,
     getMemberIdByName,
     getMemberNameById,
+    getEnrichedOwnerGroups, defaultCollapsedGroups, recordRecentMember,
 } = useWorkItemCommon();
+
+const iterEnrichedGroups = ref<{ label: string; members: string[] }[]>([]);
+const iterEnrichedCollapsed = ref<string[]>([]);
+const iterActiveGroups = computed(() =>
+    iterEnrichedGroups.value.length > 0 ? iterEnrichedGroups.value : ownerGroups.value,
+);
+const refreshIterEnrichedGroups = () => {
+    const pid = vortFlowStore.selectedProjectId || "";
+    getEnrichedOwnerGroups(pid).then((groups) => {
+        iterEnrichedGroups.value = groups;
+        iterEnrichedCollapsed.value = defaultCollapsedGroups(groups);
+    });
+};
 
 const statusOptions = [
     { label: "全部", value: "" },
@@ -60,10 +74,10 @@ const statusColorMap: Record<string, string> = { planning: "default", active: "p
 const statusLabels: Record<string, string> = { planning: "待开始", active: "进行中", completed: "已结束" };
 
 const fetchList = async (params: FilterParams) => {
-    const projectId = vortFlowStore.selectedProjectId || undefined;
+    const projectIds = vortFlowStore.selectedProjectIds || [];
     const res = await getVortflowIterations({
         keyword: params.keyword, status: params.status, owner_id: params.owner_id,
-        project_id: projectId,
+        project_ids: projectIds.length ? projectIds.join(",") : undefined,
         page: params.page, page_size: params.size,
     });
     return { records: (res as any).items || [], total: (res as any).total || 0 };
@@ -75,9 +89,10 @@ const { listData, loading, total, filterParams, showPagination, loadData, onSear
         defaultParams: { page: 1, size: 20, keyword: "", status: "", owner_id: "" },
     });
 
-watch(() => vortFlowStore.selectedProjectId, () => {
+watch(() => vortFlowStore.selectedProjectIds, () => {
     loadData();
-});
+    refreshIterEnrichedGroups();
+}, { deep: true });
 
 const iterationOwnerId = (i: IterationItem) => i.owner_id || i.assignee_id || i.pm_id || "";
 const ownerName = (i: IterationItem) => i.owner_name || getMemberNameById(iterationOwnerId(i)) || "未指派";
@@ -165,11 +180,13 @@ const handleFilterOwnerSelect = (name: string) => {
     filterParams.owner_id = getMemberIdByName(name);
     filterOwnerDropdownOpen.value = false;
     filterOwnerKeyword.value = "";
+    if (name) recordRecentMember(name);
     onSearchSubmit();
 };
 
 onMounted(async () => {
     await Promise.all([loadMemberOptions(), loadData()]);
+    refreshIterEnrichedGroups();
 });
 </script>
 
@@ -211,7 +228,8 @@ onMounted(async () => {
                     <WorkItemMemberPicker
                         mode="owner"
                         :owner="getMemberNameById(filterParams.owner_id)"
-                        :groups="ownerGroups"
+                        :groups="iterActiveGroups"
+                        :default-collapsed="iterEnrichedCollapsed"
                         :open="filterOwnerDropdownOpen"
                         v-model:keyword="filterOwnerKeyword"
                         :show-all-option="true"

@@ -17,6 +17,7 @@ import {
 } from "lucide-vue-next";
 import BotBindDialog from "./components/BotBindDialog.vue";
 import { getChannelBots, deleteChannelBot, testChannelBot, type ChannelBotItem } from "@/api";
+import { formatLocalDate } from "@/utils/format";
 
 const router = useRouter();
 
@@ -305,7 +306,7 @@ async function loadStats() {
 
 const totalEmployees = computed(() => employees.value.length);
 const todayActiveCount = computed(() => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = formatLocalDate();
     return Object.values(stats.value).filter(s => s.last_active_at?.startsWith(today)).length;
 });
 const todayTotalSessions = computed(() => {

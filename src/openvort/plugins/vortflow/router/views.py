@@ -2,7 +2,7 @@
 
 import json
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy import or_, select
 
 from openvort.db.engine import get_session_factory
@@ -77,9 +77,9 @@ async def update_view(view_id: str, body: ViewUpdate, request: Request):
     async with sf() as session:
         v = await session.get(FlowView, view_id)
         if not v:
-            return {"error": "视图不存在"}
+            raise HTTPException(status_code=404, detail="视图不存在")
         if v.scope == "personal" and v.owner_id != member_id:
-            return {"error": "无权修改他人的个人视图"}
+            raise HTTPException(status_code=403, detail="无权修改他人的个人视图")
         if body.name is not None:
             v.name = body.name
         if body.filters is not None:
@@ -100,9 +100,9 @@ async def delete_view(view_id: str, request: Request):
     async with sf() as session:
         v = await session.get(FlowView, view_id)
         if not v:
-            return {"error": "视图不存在"}
+            raise HTTPException(status_code=404, detail="视图不存在")
         if v.scope == "personal" and v.owner_id != member_id:
-            return {"error": "无权删除他人的个人视图"}
+            raise HTTPException(status_code=403, detail="无权删除他人的个人视图")
         await session.delete(v)
         await session.commit()
     return {"ok": True}

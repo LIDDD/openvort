@@ -6,9 +6,6 @@ class ProjectCreate(BaseModel):
     code: str = ""
     color: str = "#3b82f6"
     description: str = ""
-    product: str = ""
-    iteration: str = ""
-    version: str = ""
     start_date: str | None = None
     end_date: str | None = None
     owner_id: str | None = None
@@ -20,9 +17,6 @@ class ProjectUpdate(BaseModel):
     code: str | None = None
     color: str | None = None
     description: str | None = None
-    product: str | None = None
-    iteration: str | None = None
-    version: str | None = None
     start_date: str | None = None
     end_date: str | None = None
     owner_id: str | None = None
@@ -32,6 +26,8 @@ class StoryCreate(BaseModel):
     title: str
     description: str = ""
     priority: int = 3
+    # 0-100 精排分数；不传则根据 priority 派生段起始值（1→80、2→60、3→40、4→20）
+    priority_score: int | None = None
     parent_id: str | None = None
     assignee_id: str | None = None
     tags: list[str] = []
@@ -39,15 +35,21 @@ class StoryCreate(BaseModel):
     attachments: list[dict] = []
     plan_start: str | None = None
     deadline: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
     test_time: str | None = None
     draft_time: str | None = None
     release_time: str | None = None
+    repo_id: str | None = None
+    branch: str | None = None
 
 class StoryUpdate(BaseModel):
     title: str | None = None
     description: str | None = None
     state: str | None = None
     priority: int | None = None
+    # 0-100 精排分数；同时传 priority 与 priority_score 时以 priority_score 为准
+    priority_score: int | None = None
     parent_id: str | None = None
     assignee_id: str | None = None
     tags: list[str] | None = None
@@ -66,6 +68,43 @@ class StoryUpdate(BaseModel):
     branch: str | None = None
     progress: int | None = None
 
+class StoryReorder(BaseModel):
+    """需求拖拽排序请求体。
+
+    语义（互斥模式之一）：
+    - 指定 before_id 或 after_id：插入到该锚点附近（同 parent，sort_order 取相邻区间中点）
+    - 指定 parent_id（且不传 before_id/after_id）：变更父需求，sort_order 取该 parent 下末尾 +1024
+    - 同时传 parent_id 与 before_id/after_id：先确认目标 parent，再按相邻锚点定位
+    """
+    parent_id: str | None = None  # null 表示挪到顶层；不传则保持原 parent
+    before_id: str | None = None  # 插到该需求之前
+    after_id: str | None = None  # 插到该需求之后
+
+
+class TaskReorder(BaseModel):
+    """任务拖拽排序请求体。
+
+    支持改变 story_id（嵌入到需求下）和 parent_id（成为另一任务的子任务），
+    以及在锚点附近插入。锚点优先级：anchor.story_id + anchor.parent_id > body 显式指定。
+    """
+    story_id: str | None = None  # 显式指定所属需求；为空字符串/None 由后端判断（保留原值或锚点决定）
+    parent_id: str | None = None  # 显式指定父任务；null 表示顶层任务
+    before_id: str | None = None
+    after_id: str | None = None
+
+
+class BugReorder(BaseModel):
+    """缺陷拖拽排序请求体。
+
+    支持改变 story_id（嵌入到需求下）和 task_id（嵌入到任务下），以及锚点附近插入。
+    缺陷之间没有父子关系，inside 模式只允许目标为需求或任务。
+    """
+    story_id: str | None = None
+    task_id: str | None = None
+    before_id: str | None = None
+    after_id: str | None = None
+
+
 class TaskCreate(BaseModel):
     project_id: str | None = None
     story_id: str | None = None
@@ -79,8 +118,13 @@ class TaskCreate(BaseModel):
     collaborators: list[str] = []
     attachments: list[dict] = []
     estimate_hours: float | None = None
+    priority_score: int | None = None
     plan_start: str | None = None
     deadline: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
+    repo_id: str | None = None
+    branch: str | None = None
 
 class TaskUpdate(BaseModel):
     project_id: str | None = None
@@ -94,6 +138,7 @@ class TaskUpdate(BaseModel):
     attachments: list[dict] | None = None
     estimate_hours: float | None = None
     actual_hours: float | None = None
+    priority_score: int | None = None
     plan_start: str | None = None
     deadline: str | None = None
     start_at: str | None = None
@@ -109,20 +154,30 @@ class BugCreate(BaseModel):
     title: str
     description: str = ""
     severity: int = 3
+    priority_score: int | None = None
     tags: list[str] = []
     collaborators: list[str] = []
     attachments: list[dict] = []
     assignee_id: str | None = None
+    # 历史保留字段：与 assignee_id 共同表示「负责人」，前端展示口径为 assignee_id || developer_id。
+    # 自 2026-05-06 起前端写入时双写以保持一致；新接入方建议只填 assignee_id，由调用层同步。
+    developer_id: str | None = None
     plan_start: str | None = None
     deadline: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
+    repo_id: str | None = None
+    branch: str | None = None
 
 class BugUpdate(BaseModel):
     project_id: str | None = None
     title: str | None = None
     description: str | None = None
     severity: int | None = None
+    priority_score: int | None = None
     state: str | None = None
     assignee_id: str | None = None
+    developer_id: str | None = None
     tags: list[str] | None = None
     collaborators: list[str] | None = None
     attachments: list[dict] | None = None

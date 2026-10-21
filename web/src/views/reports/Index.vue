@@ -4,15 +4,17 @@ import { useRoute, useRouter } from "vue-router";
 import {
     getReports, getPublications, deletePublication, getReportStats,
     sendReminders, sendSummary, getSubmissionStats,
-    markReportRead, markAllReportsRead,
+    markReportRead, markAllReportsRead, getReportDetail,
 } from "@/api";
 import { Plus, Search, Clock, Users, Bell, Pencil, ChevronRight, ChevronDown, CheckCheck } from "lucide-vue-next";
 import { message } from "@openvort/vort-ui";
+import { formatLocalDate } from "@/utils/format";
 import { useUserStore } from "@/stores";
 import PublicationDrawer from "./components/PublicationDrawer.vue";
 import WriteReportDrawer from "./components/WriteReportDrawer.vue";
 import ReportDetailDrawer from "./components/ReportDetailDrawer.vue";
 import SubmissionDetailModal from "./components/SubmissionDetailModal.vue";
+import ReactionPhraseDrawer from "./components/ReactionPhraseDrawer.vue";
 
 // ---- Types ----
 
@@ -88,12 +90,26 @@ const route = useRoute();
 const router = useRouter();
 const userStore = useUserStore();
 const isAdmin = computed(() => userStore.isAdmin || userStore.userInfo.roles?.includes("manager"));
-const validTabs = ["read", "publish"];
-const activeTab = ref(validTabs.includes(route.query.tab as string) ? (route.query.tab as string) : "read");
-const readSubTab = ref("submitted");
+const validTabs = ["submitted", "received", "publish"];
+
+// Resolve initial tab, with backward-compat for legacy ?tab=read
+// Legacy ?tab=read came from IM "查看详情" links sent to receivers
+function resolveInitialTab(): string {
+    const raw = route.query.tab as string | undefined;
+    if (raw === "read") return "received";
+    if (raw && validTabs.includes(raw)) return raw;
+    // If query carries a report_id without tab, default to received
+    if (route.query.report_id) return "received";
+    return "submitted";
+}
+const activeTab = ref(resolveInitialTab());
 
 watch(activeTab, (tab) => {
-    router.replace({ query: { ...route.query, tab } });
+    const query = { ...route.query, tab };
+    // Strip report_id from URL once the user manually switches tab to avoid
+    // re-opening the detail drawer on accidental navigation.
+    if (query.report_id) delete query.report_id;
+    router.replace({ query });
 });
 
 // Reports
@@ -117,6 +133,9 @@ const submissionStats = ref<SubmissionStat[]>([]);
 
 // Expand/collapse
 const expandedGroups = ref<Set<string>>(new Set());
+// Group key from a deep-link (?report_id=xxx); kept across watch triggers
+// so that initExpandedGroups prefers it over the default first group.
+const pendingDeepLinkGroupKey = ref<string | null>(null);
 
 // Drawers
 const pubDrawerOpen = ref(false);
@@ -130,6 +149,9 @@ const submissionModalOpen = ref(false);
 const submissionModalPubId = ref("");
 const submissionModalDate = ref("");
 const submissionModalTab = ref<"submitted" | "not_submitted">("submitted");
+
+// Reaction phrase config drawer
+const phraseDrawerOpen = ref(false);
 
 // ---- Helpers ----
 
@@ -175,9 +197,8 @@ function formatMemberSummary(names: string[], max = 3): string {
     return `${names.slice(0, max).join("、")} 等 ${names.length} 人`;
 }
 
-// unique reporter list for the person filter
 const reporterOptions = computed(() => {
-    const reports = readSubTab.value === "received" ? receivedReports.value : myReports.value;
+    const reports = activeTab.value === "received" ? receivedReports.value : myReports.value;
     const map = new Map<string, string>();
     reports.forEach(r => { if (r.reporter_id && r.reporter_name) map.set(r.reporter_id, r.reporter_name); });
     return Array.from(map, ([id, name]) => ({ id, name }));
@@ -244,10 +265,10 @@ function refreshReportData() {
 }
 
 function reloadCurrentTab() {
-    if (readSubTab.value === "received") {
+    if (activeTab.value === "received") {
         loadReceivedReports();
         loadSubmissionStats();
-    } else {
+    } else if (activeTab.value === "submitted") {
         loadMyReports();
     }
 }
@@ -333,26 +354,45 @@ function isGroupExpanded(key: string): boolean {
 
 function initExpandedGroups(groups: DateGroup[]) {
     expandedGroups.value.clear();
-    if (groups.length > 0) {
-        expandedGroups.value.add(groups[0]!.key);
+    if (groups.length === 0) return;
+    if (pendingDeepLinkGroupKey.value) {
+        const target = groups.find(g => g.key === pendingDeepLinkGroupKey.value);
+        if (target) {
+            expandedGroups.value.add(target.key);
+            return;
+        }
     }
+    expandedGroups.value.add(groups[0]!.key);
 }
 
 watch(groupedReceived, (groups) => {
-    if (readSubTab.value === "received" && groups.length > 0 && expandedGroups.value.size === 0) {
+    if (activeTab.value === "received" && groups.length > 0 && expandedGroups.value.size === 0) {
         initExpandedGroups(groups);
     }
 });
 watch(groupedMy, (groups) => {
-    if (readSubTab.value === "submitted" && groups.length > 0 && expandedGroups.value.size === 0) {
+    if (activeTab.value === "submitted" && groups.length > 0 && expandedGroups.value.size === 0) {
         initExpandedGroups(groups);
+    }
+});
+
+// Reset expanded groups + filters when switching among submitted / received
+watch(activeTab, (next, prev) => {
+    if (next === prev) return;
+    expandedGroups.value.clear();
+    if (next === "submitted" || next === "received") {
+        filterReporter.value = undefined;
+        filterDate.value = "";
+        filterStatus.value = undefined;
+        searchKeyword.value = "";
+        reloadCurrentTab();
     }
 });
 
 // ---- Read/unread ----
 
 const todayReceivedCount = computed(() => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = formatLocalDate();
     return receivedReports.value.filter(r => r.report_date === today).length;
 });
 
@@ -438,11 +478,53 @@ async function handleSendSummary(id: string) {
     } catch { message.error("发送失败"); }
 }
 
-// ---- Init ----
+// ---- Deep link via query ----
+
+// Handle ?report_id=xxx by opening detail drawer and expanding the matching group.
+// Triggered both on mount and whenever the query changes.
+async function handleDeepLinkReport(reportId: string) {
+    if (!reportId) return;
+    try {
+        const detail: any = await getReportDetail(reportId);
+        if (!detail || detail.error) {
+            message.warning("汇报不存在或无权查看");
+            return;
+        }
+        const isOwn = detail.reporter_id === userStore.userInfo.member_id;
+        const targetTab = isOwn ? "submitted" : "received";
+
+        if (detail.report_date && detail.publication_id) {
+            pendingDeepLinkGroupKey.value = `${detail.report_date}__${detail.publication_id}`;
+        }
+
+        if (activeTab.value !== targetTab) {
+            activeTab.value = targetTab;
+        } else if (pendingDeepLinkGroupKey.value) {
+            expandedGroups.value.add(pendingDeepLinkGroupKey.value);
+        }
+
+        if (!isOwn) {
+            try { await markReportRead(reportId); } catch { /* ignore */ }
+            const item = receivedReports.value.find(r => r.id === reportId);
+            if (item) item.is_read = true;
+        }
+
+        detailReportId.value = reportId;
+        detailDrawerOpen.value = true;
+    } catch {
+        message.error("打开汇报详情失败");
+    }
+}
+
+watch(() => route.query.report_id, (rid) => {
+    if (rid) handleDeepLinkReport(rid as string);
+});
 
 onMounted(() => {
     refreshReportData();
     loadPublications();
+    const rid = route.query.report_id as string | undefined;
+    if (rid) handleDeepLinkReport(rid);
 });
 </script>
 
@@ -452,29 +534,23 @@ onMounted(() => {
         <div class="bg-white rounded-xl p-6">
             <!-- Tabs -->
             <VortTabs v-model:activeKey="activeTab" :hide-content="true" class="mb-5">
-                <VortTabPane tab-key="read" tab="我的汇报" />
+                <VortTabPane tab-key="submitted" tab="我提交的" />
+                <VortTabPane tab-key="received" tab="我收到的">
+                    <template #tab>
+                        我收到的
+                        <span v-if="todayReceivedCount > 0" class="ml-1 inline-flex items-center justify-center min-w-[16px] h-[16px] px-0.5 text-[10px] font-medium text-gray-500 bg-gray-200 rounded-full leading-none align-middle">{{ todayReceivedCount }}</span>
+                    </template>
+                </VortTabPane>
                 <VortTabPane v-if="isAdmin" tab-key="publish" tab="汇报计划" />
             </VortTabs>
 
-            <!-- ===== 读汇报 content ===== -->
-            <div v-show="activeTab === 'read'">
+            <!-- ===== 我提交的 / 我收到的 共用工具栏 ===== -->
+            <div v-if="activeTab === 'submitted' || activeTab === 'received'">
                     <!-- Toolbar -->
                     <div class="flex items-center flex-wrap gap-2 mb-5">
                         <vort-select v-model="filterPubId" placeholder="所有汇报计划" allow-clear style="width: 150px" @change="reloadCurrentTab">
                             <vort-select-option v-for="pub in publications" :key="pub.id" :value="pub.id">{{ pub.name }}</vort-select-option>
                         </vort-select>
-                        <div class="flex items-center gap-1 bg-gray-50 rounded-lg p-0.5 flex-shrink-0">
-                            <button
-                                class="px-4 py-1.5 rounded-md text-sm font-medium transition-all whitespace-nowrap"
-                                :class="readSubTab === 'submitted' ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'"
-                                @click="readSubTab = 'submitted'; resetFilters()"
-                            >我提交的</button>
-                            <button
-                                class="px-4 py-1.5 rounded-md text-sm font-medium transition-all whitespace-nowrap relative"
-                                :class="readSubTab === 'received' ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'"
-                                @click="readSubTab = 'received'; resetFilters()"
-                            >我收到的<span v-if="todayReceivedCount > 0" class="ml-1 inline-flex items-center justify-center min-w-[16px] h-[16px] px-0.5 text-[10px] font-medium text-gray-500 bg-gray-200 rounded-full leading-none">{{ todayReceivedCount }}</span></button>
-                        </div>
                         <vort-select v-model="filterReporter" placeholder="所有人" allow-clear style="width: 110px" @change="reloadCurrentTab">
                             <vort-select-option v-for="m in reporterOptions" :key="m.id" :value="m.id">{{ m.name }}</vort-select-option>
                         </vort-select>
@@ -484,7 +560,7 @@ onMounted(() => {
                             <vort-select-option value="draft">草稿</vort-select-option>
                         </vort-select>
                         <div class="flex items-center gap-2 ml-auto flex-shrink-0">
-                            <vort-button v-if="readSubTab === 'received' && unreadCount > 0" size="small" @click="handleMarkAllRead">
+                            <vort-button v-if="activeTab === 'received' && unreadCount > 0" size="small" @click="handleMarkAllRead">
                                 <CheckCheck :size="14" class="mr-1" /> 全部已读
                             </vort-button>
                             <vort-input-search
@@ -500,7 +576,7 @@ onMounted(() => {
                     </div>
 
                     <!-- Received reports -->
-                    <div v-if="readSubTab === 'received'">
+                    <div v-if="activeTab === 'received'">
                         <vort-spin :spinning="loadingReceived">
                             <div v-if="hasReceivedData" class="space-y-2">
                                 <div v-for="group in groupedReceived" :key="group.key" class="border border-gray-100 rounded-lg overflow-hidden">
@@ -558,7 +634,7 @@ onMounted(() => {
                     </div>
 
                     <!-- Submitted reports -->
-                    <div v-if="readSubTab === 'submitted'">
+                    <div v-if="activeTab === 'submitted'">
                         <vort-spin :spinning="loadingMy">
                             <div v-if="hasMyData" class="space-y-2">
                                 <div v-for="group in groupedMy" :key="group.key" class="border border-gray-100 rounded-lg overflow-hidden">
@@ -608,9 +684,14 @@ onMounted(() => {
             <div v-if="isAdmin" v-show="activeTab === 'publish'">
                     <div class="flex items-center justify-between mb-4">
                         <h4 class="text-sm font-medium text-gray-600">已发布的汇报计划</h4>
-                        <vort-button variant="primary" @click="openPubDrawer()">
-                            <Plus :size="14" class="mr-1" /> 发布汇报计划
-                        </vort-button>
+                        <div class="flex items-center gap-2">
+                            <vort-button @click="phraseDrawerOpen = true">
+                                <Pencil :size="14" class="mr-1" /> 点评文案设置
+                            </vort-button>
+                            <vort-button variant="primary" @click="openPubDrawer()">
+                                <Plus :size="14" class="mr-1" /> 发布汇报计划
+                            </vort-button>
+                        </div>
                     </div>
 
                     <vort-spin :spinning="loadingPubs">
@@ -693,6 +774,11 @@ onMounted(() => {
             :report-date="submissionModalDate"
             :default-tab="submissionModalTab"
             @update:open="submissionModalOpen = $event"
+        />
+
+        <ReactionPhraseDrawer
+            :open="phraseDrawerOpen"
+            @update:open="phraseDrawerOpen = $event"
         />
     </div>
 </template>

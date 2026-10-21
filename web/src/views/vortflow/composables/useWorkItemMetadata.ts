@@ -5,7 +5,6 @@ import {
     getVortgitRepos,
     getVortgitRepoBranches,
     getVortflowTags,
-    getVortflowIterations,
     getVortflowDescriptionTemplates,
 } from "@/api";
 import type { WorkItemType, RowItem } from "@/components/vort-biz/work-item/WorkItemTable.types";
@@ -78,20 +77,22 @@ export function useWorkItemMetadata(options: UseWorkItemMetadataOptions) {
         }
     };
 
-    const loadIterationOptions = async () => {
-        if (!unref(useApi)) return;
-        const projectId = getActiveProjectId();
-        try {
-            const res: any = await getVortflowIterations({
-                ...(projectId ? { project_id: projectId } : {}),
-                page_size: 200,
-            });
-            apiIterations.value = ((res?.items || []) as any[])
-                .map((i: any) => ({ id: String(i.id || ""), name: String(i.name || "") }))
-                .filter((i) => i.id && i.name);
-        } catch {
-            apiIterations.value = [];
+    /**
+     * 迭代选项改由 IterationSelect 在用户打开/搜索/滚动到底部时请求。
+     * 这里仅负责接收选择器已加载的结果，供表格编辑和新建后的行回显使用。
+     */
+    const mergeIterationOptions = (items: Array<{ id: string; name: string; [key: string]: unknown }>) => {
+        const merged = new Map(apiIterations.value.map((item) => [item.id, item]));
+        for (const item of items || []) {
+            const id = String(item?.id || "");
+            const name = String(item?.name || "");
+            if (id && name) merged.set(id, { ...item, id, name });
         }
+        apiIterations.value = [...merged.values()];
+    };
+
+    const resetIterationOptions = () => {
+        apiIterations.value = [];
     };
 
     const loadBranchOptions = async (repoId?: string) => {
@@ -191,7 +192,8 @@ export function useWorkItemMetadata(options: UseWorkItemMetadataOptions) {
         getRepoNameById,
         getBranchOptions,
         loadRepoOptions,
-        loadIterationOptions,
+        mergeIterationOptions,
+        resetIterationOptions,
         loadBranchOptions,
         loadTagDefinitions,
         collectTagOptions,

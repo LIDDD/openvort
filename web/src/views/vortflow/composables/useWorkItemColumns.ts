@@ -1,4 +1,5 @@
-import { computed, ref } from "vue";
+import { computed, ref, unref } from "vue";
+import type { MaybeRef } from "vue";
 import type { ProTableColumn } from "@/components/vort-biz";
 import type { ColumnSettingItem } from "../components/ColumnSettingsDialog.vue";
 import type { RowItem } from "@/components/vort-biz/work-item/WorkItemTable.types";
@@ -6,6 +7,8 @@ import { useVortFlowStore } from "@/stores";
 
 export interface UseWorkItemColumnsOptions {
     workItemType: string;
+    /** 跨多项目视图时自动展示「关联项目」列（即使用户未手动开启） */
+    showProjectColumn?: MaybeRef<boolean>;
 }
 
 const ALL_COLUMN_DEFS: Array<ProTableColumn<RowItem> & { key: string }> = [
@@ -40,16 +43,60 @@ const DEFAULT_VISIBLE_KEYS = new Set([
     "createdAt", "collaborators", "type", "planTime", "creator",
 ]);
 
+// 按工作项类型覆盖默认可见列。需求列表额外默认展示「发布时间」列，
+// 便于直接通过列头筛选按发布时间范围过滤。
+const DEFAULT_VISIBLE_KEYS_BY_TYPE: Record<string, Set<string>> = {
+    "需求": new Set([...DEFAULT_VISIBLE_KEYS, "releaseTime"]),
+};
+
+// 工作墙：类型列前置 + 项目/迭代列默认显示（跨项目场景）+ 隐藏 progress（任务/需求/缺陷有差异）
+const DEFAULT_VISIBLE_KEYS_WALL = new Set([
+    "workNo", "title", "type", "status", "owner", "priority", "tags",
+    "planTime", "creator", "project", "iteration",
+]);
+
+const WALL_COLUMN_ORDER = [
+    "workNo", "title", "type", "status", "owner", "priority", "tags",
+    "planTime", "createdAt", "updatedAt", "creator", "collaborators",
+    "project", "iteration", "version", "estimateHours",
+    "startAt", "endAt", "testTime", "draftTime", "releaseTime",
+    "repo", "branch", "progress",
+];
+
 const EXCLUDED_COLUMNS_BY_TYPE: Record<string, Set<string>> = {
     "缺陷": new Set(["progress"]),
 };
 
 export function useWorkItemColumns(options: UseWorkItemColumnsOptions) {
-    const { workItemType } = options;
+    const { workItemType, showProjectColumn } = options;
     const vortFlowStore = useVortFlowStore();
 
+    const isWall = workItemType === "wall";
     const excludedKeys = EXCLUDED_COLUMNS_BY_TYPE[workItemType] ?? new Set<string>();
-    const typeColumnDefs = ALL_COLUMN_DEFS.filter(c => !excludedKeys.has(c.key));
+    const filteredDefs = ALL_COLUMN_DEFS.filter(c => !excludedKeys.has(c.key));
+    // 工作墙：把类型列前置到 status 之前
+    const typeColumnDefs = isWall
+        ? (() => {
+            const map = new Map(filteredDefs.map(c => [c.key, c]));
+            const ordered: typeof filteredDefs = [];
+            const seen = new Set<string>();
+            for (const k of WALL_COLUMN_ORDER) {
+                const def = map.get(k);
+                if (def) {
+                    ordered.push(def);
+                    seen.add(k);
+                }
+            }
+            for (const def of filteredDefs) {
+                if (!seen.has(def.key)) ordered.push(def);
+            }
+            return ordered;
+        })()
+        : filteredDefs;
+
+    const visibleKeyset = isWall
+        ? DEFAULT_VISIBLE_KEYS_WALL
+        : (DEFAULT_VISIBLE_KEYS_BY_TYPE[workItemType] ?? DEFAULT_VISIBLE_KEYS);
 
     const columnSettingsOpen = ref(false);
 
@@ -58,7 +105,7 @@ export function useWorkItemColumns(options: UseWorkItemColumnsOptions) {
             key: c.key,
             title: c.title || c.key,
             fixed: c.key === "workNo" || c.key === "title",
-            visible: DEFAULT_VISIBLE_KEYS.has(c.key),
+            visible: visibleKeyset.has(c.key),
         }));
 
     const loadColumnSettingsFromStore = (): ColumnSettingItem[] => {
@@ -141,6 +188,13 @@ export function useWorkItemColumns(options: UseWorkItemColumnsOptions) {
 
     const columns = computed<ProTableColumn<RowItem>[]>(() => {
         const orderedKeys = columnSettings.value.filter(s => s.visible).map(s => s.key);
+        // 跨多项目视图时，若用户未手动开启「关联项目」列，则自动插入到标题列之后，
+        // 便于区分混排工作项归属；不写入持久化设置。
+        if (unref(showProjectColumn) && !orderedKeys.includes("project")) {
+            const titleIdx = orderedKeys.indexOf("title");
+            if (titleIdx >= 0) orderedKeys.splice(titleIdx + 1, 0, "project");
+            else orderedKeys.unshift("project");
+        }
         const colMap = new Map(typeColumnDefs.map(c => [c.key, c]));
         const persisted = vortFlowStore.getColumnSettings(workItemType || "");
         const widthMap = new Map<string, number>();

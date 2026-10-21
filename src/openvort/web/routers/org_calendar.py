@@ -2,7 +2,7 @@
 
 from datetime import date
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from openvort.web.deps import get_db_session_factory
@@ -73,7 +73,7 @@ async def create_entry(req: CalendarEntryRequest):
             return {"success": True, "id": entry.id}
         except Exception:
             await session.rollback()
-            return {"success": False, "error": "该日期已存在日历条目"}
+            raise HTTPException(status_code=409, detail="该日期已存在日历条目")
 
 
 @router.post("/batch")
@@ -142,7 +142,7 @@ async def sync_holidays(year: int | None = None):
             data = resp.json()
 
         if data.get("code") != 0:
-            return {"success": False, "error": data.get("msg", "API 返回错误")}
+            raise HTTPException(status_code=502, detail=data.get("msg", "API 返回错误"))
 
         holidays = data.get("holiday", {})
         entries: list[CalendarEntryRequest] = []
@@ -169,9 +169,11 @@ async def sync_holidays(year: int | None = None):
             "skipped": result.get("skipped", 0),
         }
     except httpx.HTTPError as e:
-        return {"success": False, "error": f"请求节假日 API 失败: {e}"}
+        raise HTTPException(status_code=502, detail=f"请求节假日 API 失败: {e}")
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class UpdateWorkSettingsRequest(BaseModel):

@@ -14,7 +14,7 @@ const { activeViewFilters } = useVortFlowViews("任务");
         create-button-text="+ 新建任务"
         create-drawer-title="新建任务"
         detail-drawer-title="任务详情"
-        :project-id="store.selectedProjectId"
+        :project-ids="store.selectedProjectIds"
         :view-filters="activeViewFilters"
         use-api
     />

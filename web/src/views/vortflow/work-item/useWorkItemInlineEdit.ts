@@ -1,11 +1,18 @@
 import { computed, nextTick, reactive, ref, unref, type Ref } from "vue";
 import { message } from "@openvort/vort-ui";
+import { resolveCollaboratorIds } from "./workItemMembers";
 import type {
     Priority,
     Status,
     DateRange,
     RowItem,
 } from "@/components/vort-biz/work-item/WorkItemTable.types";
+import {
+    clampPriorityScore,
+    isRowPendingForDeadline,
+    priorityToDefaultScore,
+    scoreToPriority,
+} from "./useWorkItemCommon";
 
 export interface UseWorkItemInlineEditOptions {
     useApi: Ref<boolean> | boolean;
@@ -18,12 +25,17 @@ export interface UseWorkItemInlineEditOptions {
     getBackendStatesByDisplayStatus: (type: string, status: Status) => string[];
     dynamicTagOptions: Ref<string[]>;
     baseTagOptions: Ref<string[]> | string[];
-    tagDefinitions?: Ref<Array<{ name: string; color: string }>>;
+    tagDefinitions?: Ref<Array<{ id: string; name: string; color: string }>>;
     priorityModel: Record<string, Priority>;
+    priorityScoreModel: Record<string, number>;
     tagsModel: Record<string, string[]>;
     collaboratorsModel: Record<string, string[]>;
     planTimeModel: Record<string, any>;
     normalizeDateValue: (value: unknown) => string;
+    /** Called after a tag was created / updated so callers can reload tag definitions. */
+    onTagsChanged?: () => void | Promise<void>;
+    /** Called after a tag was renamed; receives oldName and newName. Optional. */
+    onTagRenamed?: (oldName: string, newName: string) => void | Promise<void>;
 }
 
 export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
@@ -31,11 +43,10 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
         syncRecordUpdateToApi,
         syncRecordStatusToApi,
         getMemberIdByName,
-        toBackendPriorityLevel,
-        toTaskEstimateHours,
         dynamicTagOptions,
         baseTagOptions,
         priorityModel,
+        priorityScoreModel,
         tagsModel,
         collaboratorsModel,
         planTimeModel,
@@ -55,10 +66,10 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
     const planTimePrevValue = ref<DateRange>([]);
     const planTimeCommitted = ref(false);
 
-    // --- Tag creation state ---
-    const newTagDialogOpen = ref(false);
-    const newTagName = ref("");
-    const newTagColor = ref<string>("");
+    // --- Tag dialog state ---
+    const tagDialogOpen = ref(false);
+    const tagDialogMode = ref<"add" | "edit">("add");
+    const tagDialogData = ref<{ id?: string; name?: string; color?: string }>({});
     const newTagTargetRecord = ref<RowItem | null>(null);
     const newTagTargetText = ref<string[] | undefined>(undefined);
 
@@ -86,25 +97,42 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
         return priorityModel[record.workNo] || text || record.priority;
     };
 
-    const selectPriority = async (record: RowItem, value: Priority) => {
+    const getRowPriorityScore = (record: RowItem): number => {
+        const cached = priorityScoreModel[record.workNo];
+        if (cached != null) return cached;
+        const fromRow = (record as any).priorityScore;
+        if (fromRow != null) return Number(fromRow);
+        return priorityToDefaultScore(record.priority);
+    };
+
+    /** 通过 score 设置优先级（三类型均传 priority_score；缺陷同步 severity） */
+    const selectPriorityScore = async (record: RowItem, score: number) => {
         const workNo = record.workNo;
-        const prev = getRowPriority(record, record.priority);
-        priorityModel[workNo] = value;
-        record.priority = value;
+        const prevScore = getRowPriorityScore(record);
+        const prevLevel = getRowPriority(record, record.priority);
+        const newScore = clampPriorityScore(score);
+        const newLevel = scoreToPriority(newScore);
+
+        priorityScoreModel[workNo] = newScore;
+        priorityModel[workNo] = newLevel;
+        record.priority = newLevel;
+        (record as any).priorityScore = newScore;
+
         try {
-            if (record.type === "缺陷") {
-                await syncRecordUpdateToApi(record, { severity: toBackendPriorityLevel(value) });
-            } else if (record.type === "任务") {
-                await syncRecordUpdateToApi(record, { estimate_hours: toTaskEstimateHours(value) });
-            } else {
-                await syncRecordUpdateToApi(record, { priority: toBackendPriorityLevel(value) });
-            }
+            await syncRecordUpdateToApi(record, { priority_score: newScore });
         } catch (error: any) {
-            priorityModel[workNo] = prev;
-            record.priority = prev;
+            priorityScoreModel[workNo] = prevScore;
+            priorityModel[workNo] = prevLevel;
+            record.priority = prevLevel;
+            (record as any).priorityScore = prevScore;
             message.error(error?.message || "优先级同步失败");
             return;
         }
+    };
+
+    /** 兼容：按等级设置优先级（自动取段起始值作为 score）。 */
+    const selectPriority = async (record: RowItem, value: Priority) => {
+        await selectPriorityScore(record, priorityToDefaultScore(value));
     };
 
     // --- Status ---
@@ -143,8 +171,18 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
                 return;
             }
             try {
+                // 所有类型的「负责人」统一写 assignee_id；需求同步 pm_id、缺陷同步 developer_id，
+                // 与 useWorkItemCrud / BatchPropertyEditor / 后端 owner 口径保持一致，避免双字段分叉。
                 if (record.type === "需求") {
-                    await syncRecordUpdateToApi(record, { pm_id: memberId || null });
+                    await syncRecordUpdateToApi(record, {
+                        assignee_id: memberId || null,
+                        pm_id: memberId || null,
+                    });
+                } else if (record.type === "缺陷") {
+                    await syncRecordUpdateToApi(record, {
+                        assignee_id: memberId || null,
+                        developer_id: memberId || null,
+                    });
                 } else {
                     await syncRecordUpdateToApi(record, { assignee_id: memberId || null });
                 }
@@ -163,10 +201,18 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
 
     const setRowCollaborators = async (record: RowItem, nextCollaborators: string[]) => {
         const prev = [...getRowCollaborators(record, record.collaborators)];
+        const { ids, unresolved } = resolveCollaboratorIds(
+            nextCollaborators, getMemberIdByName, record.collaboratorIds,
+        );
+        if (unresolved.length > 0) {
+            message.error(`未识别的协作人：${unresolved.join("、")}，请重新选择`);
+            return;
+        }
         collaboratorsModel[record.workNo] = [...nextCollaborators];
         record.collaborators = [...nextCollaborators];
         try {
-            await syncRecordUpdateToApi(record, { collaborators: nextCollaborators });
+            await syncRecordUpdateToApi(record, { collaborators: ids });
+            record.collaboratorIds = [...ids];
         } catch (error: any) {
             collaboratorsModel[record.workNo] = prev;
             record.collaborators = prev;
@@ -175,19 +221,22 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
     };
 
     // --- Tags ---
-    const tagColorPalette = ["#ef4444", "#d946ef", "#eab308", "#22c55e", "#3b82f6", "#f97316", "#14b8a6", "#8b5cf6"];
-    const tagColorOverrides = reactive<Record<string, string>>({});
+    // Fallback palette only used when a tag has no backend definition (e.g. legacy free-form tag
+    // strings still attached to a row). Backend-defined tags always use their persisted color.
+    const FALLBACK_TAG_PALETTE = [
+        "#ef4444", "#d946ef", "#eab308", "#22c55e",
+        "#3b82f6", "#f97316", "#14b8a6", "#8b5cf6",
+    ];
 
     const getTagColor = (name: string): string => {
-        if (tagColorOverrides[name]) return tagColorOverrides[name]!;
         const defs = options.tagDefinitions?.value;
         if (defs) {
             const match = defs.find(t => t.name === name);
-            if (match) return match.color;
+            if (match?.color) return match.color;
         }
         let hash = 0;
         for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
-        return tagColorPalette[hash % tagColorPalette.length]!;
+        return FALLBACK_TAG_PALETTE[hash % FALLBACK_TAG_PALETTE.length]!;
     };
 
     const getRowTags = (record: RowItem, text?: string[]): string[] => {
@@ -210,39 +259,77 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
     };
 
     const openCreateTagDialog = (record?: RowItem | null, text?: string[]) => {
-        newTagName.value = "";
-        newTagColor.value = tagColorPalette[0] || "#3b82f6";
         newTagTargetRecord.value = record || null;
         newTagTargetText.value = text;
-        newTagDialogOpen.value = true;
+        tagDialogMode.value = "add";
+        tagDialogData.value = {};
+        tagDialogOpen.value = true;
     };
 
-    const handleCancelCreateTag = () => {
-        newTagDialogOpen.value = false;
+    const openEditTagDialog = (option: { value: string; label?: string; color?: string }) => {
+        const defs = options.tagDefinitions?.value || [];
+        const def = defs.find(t => t.name === option.value);
+        if (!def?.id) {
+            message.warning("该标签暂未持久化，无法编辑。请刷新页面后重试");
+            return;
+        }
+        newTagTargetRecord.value = null;
+        newTagTargetText.value = undefined;
+        tagDialogMode.value = "edit";
+        tagDialogData.value = { id: def.id, name: def.name, color: def.color };
+        tagDialogOpen.value = true;
     };
 
-    const handleConfirmCreateTag = async () => {
-        const name = newTagName.value.trim();
-        if (!name) {
-            message.error("请输入标签名称");
-            return;
+    const handleTagDialogSaved = async (saved: { id: string; name: string; color: string }) => {
+        const mode = tagDialogMode.value;
+        const previousName = mode === "edit" ? tagDialogData.value.name : undefined;
+
+        if (options.onTagsChanged) {
+            try {
+                await options.onTagsChanged();
+            } catch { /* swallow refresh errors; UI keeps previous data */ }
         }
-        const existing = new Set<string>([...unref(baseTagOptions), ...dynamicTagOptions.value]);
-        if (existing.has(name)) {
-            message.error("该标签已存在");
-            return;
-        }
-        dynamicTagOptions.value = [...dynamicTagOptions.value, name];
-        if (newTagColor.value) {
-            tagColorOverrides[name] = newTagColor.value;
-        }
-        if (newTagTargetRecord.value) {
-            const currentTags = getRowTags(newTagTargetRecord.value, newTagTargetText.value);
-            if (!currentTags.includes(name)) {
-                await setRowTags(newTagTargetRecord.value, [...currentTags, name]);
+
+        if (mode === "edit" && previousName && saved.name && previousName !== saved.name) {
+            // Backend already replaced tag references in items; reflect that locally so cached
+            // rows pick up the new name without waiting for a full reload.
+            for (const workNo of Object.keys(tagsModel)) {
+                const list = tagsModel[workNo];
+                if (Array.isArray(list) && list.includes(previousName)) {
+                    tagsModel[workNo] = list.map(t => (t === previousName ? saved.name : t));
+                }
+            }
+            // Drop the renamed tag from dynamicTagOptions so collectTagOptions / baseTagOptions
+            // become the source of truth on the next refresh; meanwhile inject the new name.
+            const idx = dynamicTagOptions.value.indexOf(previousName);
+            if (idx >= 0) {
+                const next = [...dynamicTagOptions.value];
+                next.splice(idx, 1);
+                if (!next.includes(saved.name)) next.push(saved.name);
+                dynamicTagOptions.value = next;
+            }
+            if (options.onTagRenamed) {
+                try { await options.onTagRenamed(previousName, saved.name); } catch { /* ignore */ }
             }
         }
-        newTagDialogOpen.value = false;
+
+        if (mode === "add" && saved.name) {
+            // Surface the newly-created tag in the picker immediately, ahead of the next
+            // collectTagOptions pass triggered by table refresh.
+            if (dynamicTagOptions.value.length && !dynamicTagOptions.value.includes(saved.name)) {
+                dynamicTagOptions.value = [...dynamicTagOptions.value, saved.name];
+            }
+            if (newTagTargetRecord.value) {
+                const currentTags = getRowTags(newTagTargetRecord.value, newTagTargetText.value);
+                if (!currentTags.includes(saved.name)) {
+                    await setRowTags(newTagTargetRecord.value, [...currentTags, saved.name]);
+                }
+            }
+        }
+
+        newTagTargetRecord.value = null;
+        newTagTargetText.value = undefined;
+        tagDialogOpen.value = false;
     };
 
     // --- Plan time ---
@@ -256,11 +343,7 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
             record.planTime = ["", ""];
             openPlanTimeFor.value = null;
             try {
-                if (record.type === "缺陷") {
-                    message.warning("缺陷暂不支持计划时间同步到后端");
-                } else {
-                    await syncRecordUpdateToApi(record, { plan_start: "", deadline: "" });
-                }
+                await syncRecordUpdateToApi(record, { plan_start: "", deadline: "" });
             } catch (error: any) {
                 planTimeModel[workNo] = prev;
                 record.planTime = prev;
@@ -278,11 +361,7 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
         record.planTime = [start, end];
         openPlanTimeFor.value = null;
         try {
-            if (record.type === "缺陷") {
-                message.warning("缺陷暂不支持计划时间同步到后端");
-            } else {
-                await syncRecordUpdateToApi(record, { plan_start: start, deadline: end });
-            }
+            await syncRecordUpdateToApi(record, { plan_start: start, deadline: end });
         } catch (error: any) {
             planTimeModel[workNo] = prev;
             record.planTime = prev;
@@ -329,6 +408,8 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
         const value = getRowPlanTime(record, text);
         const end = normalizeDateValue(value[1]);
         if (!end) return null;
+        // 需求计划时间只覆盖开发阶段；进入待测试或后续状态后不再展示开发逾期。
+        if (record.type === "需求" && !isRowPendingForDeadline(record)) return null;
         const endDate = new Date(end + "T00:00:00");
         const isDone = DONE_STATUSES.has(record.status);
         const refDate = new Date();
@@ -339,6 +420,23 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
         const diffDays = Math.floor((refDate.getTime() - endDate.getTime()) / 86400000);
         if (diffDays <= 0) return null;
         return { days: diffDays, completed: isDone };
+    };
+
+    /**
+     * 工作项停滞判定：与成员级 stale_count 口径一致。
+     * - 仅在「在手」状态下计算（已完成/已关闭/已取消等终态不展示）
+     * - 默认 7 天无 Event/Comment（last_activity_at）即视为停滞
+     */
+    const STALE_DAYS = 7;
+    const getRowStaleInfo = (record: RowItem): { days: number } | null => {
+        if (DONE_STATUSES.has(record.status)) return null;
+        const lastRaw = record._lastActivityAtRaw || record._updatedAtRaw;
+        if (!lastRaw) return null;
+        const lastTs = new Date(lastRaw).getTime();
+        if (Number.isNaN(lastTs)) return null;
+        const diffDays = Math.floor((Date.now() - lastTs) / 86400000);
+        if (diffDays < STALE_DAYS) return null;
+        return { days: diffDays };
     };
 
     const togglePlanTimeMenu = (workNo: string, record?: RowItem, text?: DateRange) => {
@@ -375,7 +473,9 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
         openCellPickerOnBackgroundClick,
 
         getRowPriority,
+        getRowPriorityScore,
         selectPriority,
+        selectPriorityScore,
         getRowStatus,
         selectRowStatus,
         getRowOwner,
@@ -387,19 +487,19 @@ export function useWorkItemInlineEdit(options: UseWorkItemInlineEditOptions) {
         rowTagOptions,
         getRowPlanTimeText,
         getRowOverdueInfo,
+        getRowStaleInfo,
         onPlanTimeChange,
         onPlanTimeOpenChange,
         getRowPlanTime,
         togglePlanTimeMenu,
 
         getTagColor,
-        tagColorPalette,
         openCreateTagDialog,
-        handleCancelCreateTag,
-        handleConfirmCreateTag,
-        newTagName,
-        newTagColor,
-        newTagDialogOpen,
+        openEditTagDialog,
+        handleTagDialogSaved,
+        tagDialogOpen,
+        tagDialogMode,
+        tagDialogData,
 
         openPlanTimeFor,
         planTimePickerOpen,

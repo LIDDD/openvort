@@ -1,6 +1,6 @@
 """Webhook 管理路由（CRUD + 预置模板）"""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from openvort.web.webhooks import (
@@ -58,7 +58,7 @@ async def get_preset_detail(preset_id: str):
     """获取指定预置模板的详细信息（含集成指南）"""
     preset = get_preset(preset_id)
     if not preset:
-        return {"success": False, "error": f"预置模板 '{preset_id}' 不存在"}
+        raise HTTPException(status_code=404, detail=f"预置模板 '{preset_id}' 不存在")
     return {
         **preset,
         "installed": preset["name"] in _webhooks,
@@ -76,12 +76,12 @@ async def install_preset(preset_id: str, req: PresetInstallRequest | None = None
     """安装预置模板 Webhook（可选绑定 AI 员工）"""
     preset = get_preset(preset_id)
     if not preset:
-        return {"success": False, "error": f"预置模板 '{preset_id}' 不存在"}
+        raise HTTPException(status_code=404, detail=f"预置模板 '{preset_id}' 不存在")
 
     body = req or PresetInstallRequest()
     name = body.name.strip() if body.name else preset["name"]
     if name in _webhooks:
-        return {"success": False, "error": f"Webhook '{name}' 已存在"}
+        raise HTTPException(status_code=409, detail=f"Webhook '{name}' 已存在")
 
     cfg = preset["config"]
     config = WebhookConfig(
@@ -101,7 +101,7 @@ async def install_preset(preset_id: str, req: PresetInstallRequest | None = None
 async def create_webhook(req: WebhookItem):
     """创建 Webhook"""
     if req.name in _webhooks:
-        return {"success": False, "error": f"Webhook '{req.name}' 已存在"}
+        raise HTTPException(status_code=409, detail=f"Webhook '{req.name}' 已存在")
     config = WebhookConfig(
         name=req.name, secret=req.secret, action_type=req.action_type,
         prompt_template=req.prompt_template, channel=req.channel,
@@ -115,7 +115,7 @@ async def create_webhook(req: WebhookItem):
 async def update_webhook(name: str, req: WebhookItem):
     """更新 Webhook"""
     if name not in _webhooks:
-        return {"success": False, "error": f"Webhook '{name}' 不存在"}
+        raise HTTPException(status_code=404, detail=f"Webhook '{name}' 不存在")
     config = WebhookConfig(
         name=req.name, secret=req.secret, action_type=req.action_type,
         prompt_template=req.prompt_template, channel=req.channel,
@@ -131,6 +131,6 @@ async def update_webhook(name: str, req: WebhookItem):
 async def delete_webhook(name: str):
     """删除 Webhook"""
     if name not in _webhooks:
-        return {"success": False, "error": f"Webhook '{name}' 不存在"}
+        raise HTTPException(status_code=404, detail=f"Webhook '{name}' 不存在")
     _webhooks.pop(name)
     return {"success": True}

@@ -172,6 +172,95 @@ def _check_log_to_dict(l: CertCheckLog) -> dict:
         "status": l.status,
         "error_message": l.error_message,
         "serial_number": l.serial_number,
+        "source": getattr(l, "source", "") or "",
+    }
+
+
+# ============ Domain status derivation ============
+
+async def refresh_domain_status(session, domain_id: str) -> dict:
+    """Refresh `cert_domains` status fields by deriving from the latest active certificate.
+
+    Source of truth: the most recently issued `cert_certificates` record with status='active'
+    for the given domain. If no such record exists, the domain is marked as `unchecked`
+    (semantically: not yet issued).
+
+    Side effect: mutates `cert_domains` row in-place. Caller must commit.
+    Returns a dict describing the derived state.
+    """
+    from openvort.plugins.vortcert.cert_inspector import classify_status, parse_certificate
+
+    domain_obj = await session.get(CertDomain, domain_id)
+    if not domain_obj:
+        return {"ok": False, "message": "domain not found"}
+
+    cert_q = (
+        select(CertCertificate)
+        .where(
+            CertCertificate.domain_id == domain_id,
+            CertCertificate.status == "active",
+        )
+        .order_by(
+            CertCertificate.expires_at.desc().nullslast(),
+            CertCertificate.issued_at.desc().nullslast(),
+            CertCertificate.created_at.desc(),
+        )
+        .limit(1)
+    )
+    cert = (await session.execute(cert_q)).scalar_one_or_none()
+
+    domain_obj.last_check_at = _utcnow()
+
+    if cert is None:
+        domain_obj.last_check_status = ""
+        domain_obj.expires_at = None
+        domain_obj.issuer = ""
+        return {
+            "ok": True,
+            "domain": domain_obj.domain,
+            "status": "",
+            "expires_at": None,
+            "issuer": "",
+            "days_remaining": None,
+        }
+
+    expires_at = cert.expires_at
+    issuer_dn = ""
+    if cert.cert_pem:
+        try:
+            info = parse_certificate(decrypt_value(cert.cert_pem))
+            if info.ok:
+                if expires_at is None:
+                    expires_at = info.not_after
+                issuer_dn = info.issuer
+        except Exception as exc:
+            log.warning("Failed to parse cert pem for domain %s: %s", domain_obj.domain, exc)
+
+    if expires_at is None:
+        domain_obj.last_check_status = ""
+        domain_obj.expires_at = None
+        domain_obj.issuer = ""
+        return {
+            "ok": True,
+            "domain": domain_obj.domain,
+            "status": "",
+            "expires_at": None,
+            "issuer": "",
+            "days_remaining": None,
+        }
+
+    status, days_remaining = classify_status(expires_at)
+    domain_obj.last_check_status = status
+    domain_obj.expires_at = _strip_tz(expires_at)
+    domain_obj.issuer = issuer_dn or cert.issued_by or ""
+
+    return {
+        "ok": True,
+        "domain": domain_obj.domain,
+        "status": status,
+        "expires_at": domain_obj.expires_at.isoformat() if domain_obj.expires_at else None,
+        "issuer": domain_obj.issuer,
+        "days_remaining": days_remaining,
     }
 
 
@@ -396,11 +485,16 @@ async def import_domains(body: DomainImport):
     return {"imported": imported, "skipped": skipped}
 
 
-# ============ Certificate check / probe ============
+# ============ Certificate status refresh / online probe ============
 
 @router.post("/check")
 async def check_all_domains():
-    """Trigger a full certificate check for all domains (with alert notifications)."""
+    """Refresh certificate status for all domains by re-deriving from cert_certificates.
+
+    This does NOT make any network requests; it reads the latest active certificate
+    for each domain and updates `cert_domains.last_check_status / expires_at / issuer`.
+    Patrol notifications (warning/critical/expired) are also emitted via the plugin.
+    """
     from openvort.plugins.vortcert.plugin import VortCertPlugin
     from openvort.web.deps import get_registry
 
@@ -409,7 +503,13 @@ async def check_all_domains():
     if isinstance(plugin, VortCertPlugin):
         await plugin.run_patrol()
     else:
-        raise HTTPException(500, "VortCert plugin not loaded")
+        sf = get_session_factory()
+        async with sf() as session:
+            result = await session.execute(select(CertDomain))
+            domains = result.scalars().all()
+            for d in domains:
+                await refresh_domain_status(session, d.id)
+            await session.commit()
 
     sf = get_session_factory()
     async with sf() as session:
@@ -432,7 +532,52 @@ async def check_all_domains():
 
 @router.post("/check/{domain_id}")
 async def check_single_domain(domain_id: str):
-    """Check certificate for a single domain."""
+    """Refresh certificate status for a single domain by deriving from cert_certificates.
+
+    Does NOT touch the network. Use `/probe/{domain_id}` for live 443 probing.
+    """
+    sf = get_session_factory()
+    async with sf() as session:
+        domain_obj = await session.get(CertDomain, domain_id)
+        if not domain_obj:
+            raise HTTPException(404, "Domain not found")
+
+        derived = await refresh_domain_status(session, domain_id)
+
+        log_entry = CertCheckLog(
+            id=uuid.uuid4().hex,
+            domain_id=domain_id,
+            domain=domain_obj.domain,
+            checked_at=_utcnow(),
+            expires_at=_strip_tz(domain_obj.expires_at),
+            issuer=domain_obj.issuer,
+            status=domain_obj.last_check_status or "",
+            error_message="",
+            serial_number="",
+            source="derived",
+        )
+        session.add(log_entry)
+        await session.commit()
+
+    return {
+        "domain": derived.get("domain"),
+        "status": derived.get("status") or "",
+        "expires_at": derived.get("expires_at"),
+        "days_remaining": derived.get("days_remaining"),
+        "issuer": derived.get("issuer", ""),
+        "error_message": "",
+    }
+
+
+@router.post("/probe/{domain_id}")
+async def probe_single_domain(domain_id: str):
+    """Live 443 SSL probe of the domain — fetches the certificate currently deployed
+    on the target server and returns its details.
+
+    This is independent from the domain's main status (`cert_domains.last_check_status`):
+    the probe result is returned to the caller and stored as a `source='probe'` check log,
+    but does NOT mutate `cert_domains`.
+    """
     from openvort.plugins.vortcert.checker import check_domain_cert
 
     sf = get_session_factory()
@@ -444,26 +589,19 @@ async def check_single_domain(domain_id: str):
 
     check_result = await check_domain_cert(domain_name)
 
-    now = _utcnow()
     sf2 = get_session_factory()
     async with sf2() as session:
-        domain_obj = await session.get(CertDomain, domain_id)
-        if domain_obj:
-            domain_obj.last_check_at = now
-            domain_obj.last_check_status = check_result.status
-            domain_obj.expires_at = _strip_tz(check_result.expires_at)
-            domain_obj.issuer = check_result.issuer
-
         log_entry = CertCheckLog(
             id=uuid.uuid4().hex,
             domain_id=domain_id,
             domain=domain_name,
-            checked_at=now,
+            checked_at=_utcnow(),
             expires_at=_strip_tz(check_result.expires_at),
             issuer=check_result.issuer,
             status=check_result.status,
             error_message=check_result.error_message,
             serial_number=check_result.serial_number,
+            source="probe",
         )
         session.add(log_entry)
         await session.commit()
@@ -475,12 +613,15 @@ async def check_single_domain(domain_id: str):
         "days_remaining": check_result.days_remaining,
         "issuer": check_result.issuer,
         "error_message": check_result.error_message,
+        "san_list": getattr(check_result, "san_list", []) or [],
+        "probe_target": getattr(check_result, "probe_target", "") or domain_name,
     }
 
 
 @router.get("/check-logs")
 async def list_check_logs(
     domain_id: str = Query(""),
+    source: str = Query(""),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
@@ -489,6 +630,8 @@ async def list_check_logs(
         q = select(CertCheckLog)
         if domain_id:
             q = q.where(CertCheckLog.domain_id == domain_id)
+        if source:
+            q = q.where(CertCheckLog.source == source)
         total = await session.scalar(select(func.count()).select_from(q.subquery()))
         q = q.order_by(CertCheckLog.checked_at.desc()).offset((page - 1) * page_size).limit(page_size)
         result = await session.execute(q)
@@ -551,7 +694,7 @@ def _get_acme_email() -> str:
 @router.post("/certificates/issue")
 async def issue_certificate(body: CertIssueRequest):
     """Issue a new certificate via acme.sh."""
-    from openvort.plugins.vortcert.issuer import issue_certificate as _issue, read_cert_file
+    from openvort.plugins.vortcert.issuer import issue_certificate as _issue, read_cert_file, read_chain_pem
 
     sf = get_session_factory()
     async with sf() as session:
@@ -588,20 +731,13 @@ async def issue_certificate(body: CertIssueRequest):
 
     cert_pem = read_cert_file(result.cert_path)
     key_pem = read_cert_file(result.key_path)
-    chain_pem = read_cert_file(result.chain_path)
+    chain_pem = read_chain_pem(result)
 
-    # Parse expiry from the issued cert
-    expires_at = None
-    try:
-        import ssl
-        import tempfile
-        if cert_pem:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as f:
-                f.write(cert_pem)
-                f.flush()
-                cert_info = ssl.PEM_cert_to_DER_cert(cert_pem)
-    except Exception:
-        pass
+    from openvort.plugins.vortcert.cert_inspector import parse_certificate
+    cert_info = parse_certificate(cert_pem)
+    if not cert_info.ok:
+        log.warning("Issued cert PEM unparseable for %s: %s", domain_name, cert_info.error)
+    expires_at = _strip_tz(cert_info.not_after)
 
     now = _utcnow()
     sf2 = get_session_factory()
@@ -621,6 +757,7 @@ async def issue_certificate(body: CertIssueRequest):
             expires_at=expires_at,
         )
         session.add(cert_record)
+        await refresh_domain_status(session, body.domain_id)
         await session.commit()
         await session.refresh(cert_record)
         return _cert_to_dict(cert_record)
@@ -629,7 +766,7 @@ async def issue_certificate(body: CertIssueRequest):
 @router.post("/certificates/{cert_id}/renew")
 async def renew_certificate(cert_id: str):
     """Renew an existing certificate."""
-    from openvort.plugins.vortcert.issuer import renew_certificate as _renew, read_cert_file
+    from openvort.plugins.vortcert.issuer import renew_certificate as _renew, read_cert_file, read_chain_pem
 
     sf = get_session_factory()
     async with sf() as session:
@@ -649,7 +786,13 @@ async def renew_certificate(cert_id: str):
 
     cert_pem = read_cert_file(result.cert_path)
     key_pem = read_cert_file(result.key_path)
-    chain_pem = read_cert_file(result.chain_path)
+    chain_pem = read_chain_pem(result)
+
+    from openvort.plugins.vortcert.cert_inspector import parse_certificate
+    cert_info = parse_certificate(cert_pem)
+    if not cert_info.ok:
+        log.warning("Renewed cert PEM unparseable for %s: %s", domain_name, cert_info.error)
+    new_expires_at = _strip_tz(cert_info.not_after)
 
     now = _utcnow()
     sf2 = get_session_factory()
@@ -661,6 +804,10 @@ async def renew_certificate(cert_id: str):
             cert.chain_pem = chain_pem
             cert.issued_at = now
             cert.status = "active"
+            if new_expires_at is not None:
+                cert.expires_at = new_expires_at
+            if cert.domain_id:
+                await refresh_domain_status(session, cert.domain_id)
             await session.commit()
             await session.refresh(cert)
             return _cert_to_dict(cert)
@@ -825,6 +972,7 @@ async def deploy_certificate_to_targets(body: DeployRequest):
     import json as _json
 
     from openvort.plugins.vortcert.deployer import deploy_certificate as _deploy
+    from openvort.plugins.vortcert.issuer import count_certs
 
     sf = get_session_factory()
     async with sf() as session:
@@ -839,6 +987,12 @@ async def deploy_certificate_to_targets(body: DeployRequest):
             raise HTTPException(400, "Certificate has no PEM content")
 
     fullchain_pem = (cert_pem + "\n" + chain_pem).strip() if chain_pem else cert_pem
+    if count_certs(fullchain_pem) < 2:
+        raise HTTPException(
+            400,
+            "证书链不完整：缺少中间证书，已阻止部署。请重新签发或续期该证书后再试，"
+            "否则浏览器可正常访问但 Java / curl 等严格 TLS 客户端会校验失败。",
+        )
 
     results = []
     for tid in body.target_ids:
@@ -862,7 +1016,7 @@ async def deploy_certificate_to_targets(body: DeployRequest):
             target_name = target.name
             target_type = target.target_type
 
-        deploy_result = await _deploy(
+        deploy_results = await _deploy(
             target_type=target_type,
             config=config,
             cert_pem=fullchain_pem,
@@ -874,24 +1028,39 @@ async def deploy_certificate_to_targets(body: DeployRequest):
 
         now = _utcnow()
         async with sf() as session:
-            log_entry = CertDeployLog(
-                id=uuid.uuid4().hex,
-                certificate_id=body.certificate_id,
-                deploy_target_id=tid,
-                target_name=target_name,
-                domain=cert_domain,
-                status="success" if deploy_result.ok else "failed",
-                error_message="" if deploy_result.ok else deploy_result.message,
-                deployed_at=now if deploy_result.ok else None,
-            )
-            session.add(log_entry)
+            for r in deploy_results:
+                site_domain = r.target_name or cert_domain
+                log_entry = CertDeployLog(
+                    id=uuid.uuid4().hex,
+                    certificate_id=body.certificate_id,
+                    deploy_target_id=tid,
+                    target_name=target_name,
+                    domain=site_domain,
+                    status="success" if r.ok else "failed",
+                    error_message="" if r.ok else r.message,
+                    deployed_at=now if r.ok else None,
+                )
+                session.add(log_entry)
             await session.commit()
+
+        all_ok = bool(deploy_results) and all(r.ok for r in deploy_results)
+        details = [
+            {"site": r.target_name, "ok": r.ok, "message": r.message}
+            for r in deploy_results
+        ]
+        if len(deploy_results) == 1:
+            summary_message = deploy_results[0].message
+        else:
+            ok_count = sum(1 for r in deploy_results if r.ok)
+            fail_count = len(deploy_results) - ok_count
+            summary_message = f"{ok_count} succeeded, {fail_count} failed"
 
         results.append({
             "target_id": tid,
             "target_name": target_name,
-            "ok": deploy_result.ok,
-            "message": deploy_result.message,
+            "ok": all_ok,
+            "message": summary_message,
+            "details": details,
         })
 
     return {"results": results}

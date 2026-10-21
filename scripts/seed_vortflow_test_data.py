@@ -182,7 +182,6 @@ async def main() -> None:
                 priority=(i % 4) + 1,
                 submitter_id=pick_member(member_ids, i),
                 pm_id=pick_member(member_ids, i + 1),
-                reviewer_id=pick_member(member_ids, i + 2),
                 tags_json=pick_tags(i),
                 collaborators_json=pick_collaborators(member_ids, i),
                 deadline=now + timedelta(days=(i % 30) + 3),

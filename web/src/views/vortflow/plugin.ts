@@ -10,6 +10,7 @@ export default {
             children: [
                 { path: "", redirect: "/vortflow/board" },
                 { path: "board", name: "vortflow-board", component: () => import("./Board.vue"), meta: { title: "项目看板" } },
+                { path: "wall", name: "vortflow-wall", component: () => import("./Wall.vue"), meta: { title: "工作墙" } },
                 { path: "stories", name: "vortflow-stories", component: () => import("./Stories.vue"), meta: { title: "需求列表" } },
                 { path: "tasks", name: "vortflow-tasks", component: () => import("./TaskTracking.vue"), meta: { title: "任务管理" } },
                 { path: "bugs", name: "vortflow-bugs", component: () => import("./Bugs.vue"), meta: { title: "缺陷跟踪" } },
@@ -33,6 +34,7 @@ export default {
             title: "VortFlow", icon: "kanban", label: "研发协作",
             children: [
                 { title: "项目看板", icon: "layout-dashboard", path: "/vortflow/board" },
+                { title: "工作墙", icon: "clipboard-list", path: "/vortflow/wall" },
                 { title: "需求列表", icon: "list-checks", path: "/vortflow/stories" },
                 { title: "任务管理", icon: "check-square", path: "/vortflow/tasks" },
                 { title: "缺陷跟踪", icon: "bug", path: "/vortflow/bugs" },

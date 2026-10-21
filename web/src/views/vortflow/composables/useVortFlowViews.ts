@@ -57,24 +57,27 @@ export const SYSTEM_VIEWS: VortFlowView[] = [
     },
 ];
 
-export function useVortFlowViews(type: WorkItemType) {
+export function useVortFlowViews(type: WorkItemType | "wall") {
     const store = useVortFlowStore();
     const userStore = useUserStore();
 
     const currentViewId = computed(() => store.getViewId(type));
 
     const allViews = computed<VortFlowView[]>(() => {
-        const custom: VortFlowView[] = store.customViews
-            .filter(v => v.visible)
-            .sort((a, b) => a.order - b.order)
-            .map(v => ({
-                id: v.id,
-                name: v.name,
-                scope: v.scope,
-                // Custom views restore their saved toolbar/column state in WorkItemTable.
-                // They should not inject the same snapshot into request-time view filters again.
-                getFilters: () => ({}),
-            }));
+        // 工作墙暂不展示按单类型保存的自定义视图（避免跨类型语义混淆）
+        const custom: VortFlowView[] = type === "wall"
+            ? []
+            : store.customViews
+                .filter(v => v.visible)
+                .sort((a, b) => a.order - b.order)
+                .map(v => ({
+                    id: v.id,
+                    name: v.name,
+                    scope: v.scope,
+                    // Custom views restore their saved toolbar/column state in WorkItemTable.
+                    // They should not inject the same snapshot into request-time view filters again.
+                    getFilters: () => ({}),
+                }));
         return [...SYSTEM_VIEWS, ...custom];
     });
 
@@ -88,7 +91,7 @@ export function useVortFlowViews(type: WorkItemType) {
     });
 
     const setView = (viewId: string) => {
-        store.setViewId(type, viewId);
+        store.setViewId(type as string, viewId);
     };
 
     return {

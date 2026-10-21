@@ -55,3 +55,41 @@ def test_openai_compatible_tool_call_message_keeps_text_content():
 
     assert converted[1]["content"] == "我来处理。"
     assert converted[1]["tool_calls"][0]["function"]["name"] == "node_shell"
+
+
+def test_openai_compatible_length_finish_reason_maps_to_max_tokens():
+    data = {
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {"name": "node_file_write", "arguments": '{"path": "/a.java", "content": "cla'},
+                }],
+            },
+            "finish_reason": "length",
+        }],
+        "usage": {},
+    }
+
+    resp = OpenAICompatibleProvider._parse_response(data)
+
+    assert resp.stop_reason == "max_tokens"
+
+
+def test_truncated_tool_results_skip_incomplete_tool_calls():
+    from openvort.core.engine.agent import AgentRuntime
+    from openvort.core.engine.llm import LLMResponse, ToolUseBlock
+
+    resp = LLMResponse(
+        content=[ToolUseBlock(id="call_1", name="node_file_write", input={})],
+        stop_reason="max_tokens",
+    )
+    results = AgentRuntime._truncated_tool_results(resp)
+
+    assert len(results) == 1
+    assert results[0]["tool_use_id"] == "call_1"
+    assert results[0]["is_error"] is True
+
+    resp.stop_reason = "tool_use"
+    assert AgentRuntime._truncated_tool_results(resp) == []

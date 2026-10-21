@@ -25,14 +25,19 @@ log = get_logger("core.remote_node")
 
 
 def _encrypt(plaintext: str) -> str:
-    """Encrypt token using VortGit's Fernet key (shared infrastructure)."""
+    """Encrypt token using VortGit's Fernet key (shared infrastructure).
+
+    Fail closed: if encryption is unavailable we must never persist the raw
+    token, otherwise a DB dump would leak the gateway credential in plaintext.
+    """
     if not plaintext:
         return ""
     try:
         from openvort.plugins.vortgit.crypto import encrypt_token
         return encrypt_token(plaintext)
-    except Exception:
-        return plaintext
+    except Exception as e:
+        log.error(f"Token encryption failed, refusing to store plaintext: {type(e).__name__}: {e}")
+        raise RuntimeError("gateway token encryption failed") from e
 
 
 def _decrypt(ciphertext: str) -> str:

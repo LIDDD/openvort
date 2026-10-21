@@ -1,13 +1,68 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from "vue";
 import { useRouter } from "vue-router";
-import { Bell, Clock, Bot, CheckCheck, Settings, ExternalLink, GitPullRequestArrow } from "lucide-vue-next";
+import { Bell, BellOff, Clock, Bot, CheckCheck, Settings, ExternalLink, GitPullRequestArrow, MonitorSmartphone } from "lucide-vue-next";
 import { getNotifications, batchReadNotifications } from "@/api";
 import { message } from "@openvort/vort-ui";
 import { useNotificationStore } from "@/stores/modules/notification";
+import { useDesktopNotification } from "@/composables/useDesktopNotification";
 
 const router = useRouter();
 const notificationStore = useNotificationStore();
+const desktop = useDesktopNotification();
+
+async function handleEnableDesktop() {
+    if (desktop.isActive.value) {
+        desktop.disable();
+        message.success("已关闭桌面通知");
+        return;
+    }
+    if (!desktop.supported) {
+        message.error("当前浏览器不支持桌面通知");
+        return;
+    }
+    if (desktop.isDenied.value) {
+        message.warning("通知权限被浏览器拒绝，请到浏览器设置中允许 OpenVort 发送通知");
+        return;
+    }
+    const ok = await desktop.enable();
+    if (ok) {
+        message.success("桌面通知已开启");
+        desktop.notify({
+            title: "OpenVort",
+            body: "桌面通知已开启，新消息将出现在系统通知中心",
+            tag: "openvort:welcome",
+            force: true,
+        });
+    } else {
+        message.warning("未获得通知权限");
+    }
+}
+
+async function handleSendTest() {
+    if (!desktop.supported) {
+        message.error("当前浏览器不支持桌面通知");
+        return;
+    }
+    if (desktop.isDenied.value) {
+        message.warning("通知权限被浏览器拒绝，请到浏览器设置中允许 OpenVort 发送通知");
+        return;
+    }
+    if (!desktop.isGranted.value) {
+        const ok = await desktop.enable();
+        if (!ok) {
+            message.warning("未获得通知权限");
+            return;
+        }
+    }
+    await desktop.notify({
+        title: "OpenVort 测试通知",
+        body: `这是一条测试通知 · ${new Date().toLocaleTimeString()}`,
+        tag: `openvort:test:${Date.now()}`,
+        force: true,
+    });
+    message.info("已发送测试通知，请查看系统通知中心");
+}
 
 interface NotificationItem {
     id: number;
@@ -146,6 +201,18 @@ onMounted(() => {
                     <span class="text-sm font-medium text-gray-800">通知</span>
                     <div class="flex items-center gap-1">
                         <button
+                            v-if="desktop.supported"
+                            class="flex items-center justify-center w-6 h-6 rounded transition-colors"
+                            :class="desktop.isActive.value
+                                ? 'text-blue-600 bg-blue-50 hover:bg-blue-100'
+                                : 'text-gray-400 hover:text-blue-600 hover:bg-blue-50'"
+                            :title="desktop.isActive.value ? '关闭桌面通知' : '开启桌面通知（系统通知中心）'"
+                            @click="handleEnableDesktop"
+                        >
+                            <MonitorSmartphone v-if="desktop.isActive.value" :size="13" />
+                            <BellOff v-else :size="13" />
+                        </button>
+                        <button
                             class="flex items-center gap-1 px-2 py-1 text-[11px] text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
                             @click="handleBatchRead"
                         >
@@ -159,6 +226,41 @@ onMounted(() => {
                             <Settings :size="13" />
                         </button>
                     </div>
+                </div>
+
+                <!-- 桌面通知引导横幅：仅在浏览器支持且未授权/未开启时显示 -->
+                <div
+                    v-if="desktop.supported && !desktop.isActive.value && !desktop.isDenied.value"
+                    class="mt-2 flex items-center gap-2 px-2.5 py-2 bg-blue-50/60 border border-blue-100 rounded-lg"
+                >
+                    <Bell :size="14" class="text-blue-500 flex-shrink-0" />
+                    <span class="text-[12px] text-gray-600 flex-1">开启桌面通知，第一时间收到系统提醒</span>
+                    <button
+                        class="px-2 py-0.5 text-[11px] text-white bg-blue-600 hover:bg-blue-700 rounded transition-colors"
+                        @click="handleEnableDesktop"
+                    >
+                        开启
+                    </button>
+                </div>
+                <div
+                    v-else-if="desktop.supported && desktop.isActive.value"
+                    class="mt-2 flex items-center gap-2 px-2.5 py-2 bg-green-50/60 border border-green-100 rounded-lg"
+                >
+                    <MonitorSmartphone :size="14" class="text-green-600 flex-shrink-0" />
+                    <span class="text-[12px] text-gray-600 flex-1">桌面通知已开启（页面前台聚焦时不弹）</span>
+                    <button
+                        class="px-2 py-0.5 text-[11px] text-blue-600 hover:bg-blue-100 border border-blue-200 rounded transition-colors"
+                        @click="handleSendTest"
+                    >
+                        测试
+                    </button>
+                </div>
+                <div
+                    v-else-if="desktop.supported && desktop.isDenied.value"
+                    class="mt-2 flex items-center gap-2 px-2.5 py-2 bg-amber-50/60 border border-amber-100 rounded-lg"
+                >
+                    <BellOff :size="14" class="text-amber-500 flex-shrink-0" />
+                    <span class="text-[12px] text-gray-600 flex-1">桌面通知被浏览器拒绝，请到浏览器设置开启</span>
                 </div>
 
                 <!-- List -->

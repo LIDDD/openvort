@@ -241,7 +241,7 @@ watch(pendingPrompt, (prompt) => {
 <style scoped>
 .ai-float-container {
     position: fixed;
-    z-index: 2000;
+    z-index: 1000;
 }
 .ai-float-snapping {
     transition: right 0.3s cubic-bezier(0.25, 1, 0.5, 1), bottom 0.3s cubic-bezier(0.25, 1, 0.5, 1);
@@ -393,4 +393,10 @@ watch(pendingPrompt, (prompt) => {
 }
 .ai-float-icon-enter-from { transform: rotate(-90deg) scale(0.5); opacity: 0; }
 .ai-float-icon-leave-to { transform: rotate(90deg) scale(0.5); opacity: 0; }
+</style>
+
+<style>
+.ai-float-overlay {
+    z-index: 2050 !important;
+}
 </style>

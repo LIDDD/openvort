@@ -4,7 +4,7 @@ import json
 import secrets
 import string
 import uuid
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select, text, func as sa_func
 
@@ -59,80 +59,86 @@ def _extract_member_posts(member) -> list[str]:
 async def _cleanup_member_references(session, member_ids: list[str]):
     """Clean up all foreign key references to members before deletion.
 
-    Nullable FK columns are SET NULL; non-nullable association/owned records are DELETEd.
+    The database schema is the source of truth here.  A hard-coded table/column
+    list becomes invalid whenever an optional plugin is absent or a migration
+    adds/removes a member foreign key.  Nullable references are therefore set
+    to NULL and non-nullable association/owned records are deleted based on the
+    foreign keys that actually exist in PostgreSQL.
     """
     if not member_ids:
         return
 
-    _SET_NULL_SPECS: list[tuple[str, str]] = [
-        # VortFlow
-        ("flow_projects", "owner_id"),
-        ("flow_stories", "submitter_id"),
-        ("flow_stories", "assignee_id"),
-        ("flow_stories", "pm_id"),
-        ("flow_stories", "designer_id"),
-        ("flow_stories", "reviewer_id"),
-        ("flow_tasks", "assignee_id"),
-        ("flow_tasks", "creator_id"),
-        ("flow_bugs", "reporter_id"),
-        ("flow_bugs", "assignee_id"),
-        ("flow_bugs", "developer_id"),
-        ("flow_events", "actor_id"),
-        ("flow_iterations", "owner_id"),
-        ("flow_versions", "owner_id"),
-        ("flow_work_item_links", "created_by"),
-        ("flow_test_cases", "maintainer_id"),
-        ("flow_test_case_work_items", "created_by"),
-        ("flow_test_plans", "owner_id"),
-        ("flow_test_plan_cases", "created_by"),
-        ("flow_test_plan_executions", "executor_id"),
-        ("flow_test_plan_reviews", "reviewer_id"),
-        ("flow_test_plan_reviews", "added_by"),
-        ("flow_test_plan_review_histories", "actor_id"),
-        # VortGit
-        ("git_providers", "owner_id"),
-        # Report
-        ("report_publications", "owner_id"),
-        # System
-        ("voice_providers", "owner_id"),
-    ]
+    params = {"ids": member_ids}
 
-    _DELETE_SPECS: list[tuple[str, str]] = [
-        ("member_roles", "member_id"),
-        ("match_suggestions", "target_member_id"),
-        ("flow_project_members", "member_id"),
-        ("flow_views", "owner_id"),
-        ("flow_column_settings", "member_id"),
-        ("flow_comments", "author_id"),
-        ("git_repo_members", "member_id"),
-        ("git_workspaces", "member_id"),
-        ("git_code_tasks", "member_id"),
-        ("schedule_jobs", "owner_id"),
-        ("work_assignments", "requested_by_member_id"),
-        ("work_assignments", "assignee_member_id"),
-        ("member_skills", "member_id"),
-        ("member_plugin_settings", "member_id"),
-        ("channel_bots", "member_id"),
-        ("reporting_relations", "reporter_id"),
-        ("reporting_relations", "supervisor_id"),
-        ("reports", "reporter_id"),
-        ("report_publication_submitters", "member_id"),
-        ("report_publication_whitelist", "member_id"),
-        ("report_publication_receivers", "member_id"),
-        ("sketches", "created_by"),
-    ]
+    # These are second-level references to rows that are themselves owned by a
+    # member.  Clear them before the direct member references discovered below.
+    await session.execute(
+        text("""
+            DELETE FROM match_suggestions suggestion
+            USING platform_identities identity
+            WHERE suggestion.source_identity_id = identity.id
+              AND identity.member_id = ANY(:ids)
+        """),
+        params,
+    )
+    await session.execute(
+        text("""
+            UPDATE work_assignments
+            SET related_schedule_id = NULL
+            WHERE related_schedule_id IN (
+                SELECT id FROM schedule_jobs WHERE owner_id = ANY(:ids)
+            )
+        """),
+        params,
+    )
 
-    for table, col in _SET_NULL_SPECS:
-        await session.execute(
-            text(f'UPDATE "{table}" SET "{col}" = NULL WHERE "{col}" = ANY(:ids)'),
-            {"ids": member_ids},
-        )
+    result = await session.execute(text("""
+        SELECT
+            child_schema.nspname AS schema_name,
+            child_table.relname AS table_name,
+            child_column.attname AS column_name,
+            NOT child_column.attnotnull AS is_nullable,
+            fk.confdeltype::text AS delete_action
+        FROM pg_constraint fk
+        JOIN pg_class child_table ON child_table.oid = fk.conrelid
+        JOIN pg_namespace child_schema ON child_schema.oid = child_table.relnamespace
+        JOIN pg_attribute child_column
+          ON child_column.attrelid = child_table.oid
+         AND child_column.attnum = fk.conkey[1]
+        JOIN pg_attribute parent_column
+          ON parent_column.attrelid = fk.confrelid
+         AND parent_column.attnum = fk.confkey[1]
+        WHERE fk.contype = 'f'
+          AND fk.confrelid = 'members'::regclass
+          AND parent_column.attname = 'id'
+          AND cardinality(fk.conkey) = 1
+          AND cardinality(fk.confkey) = 1
+        ORDER BY child_schema.nspname, child_table.relname, child_column.attname
+    """))
 
-    for table, col in _DELETE_SPECS:
-        await session.execute(
-            text(f'DELETE FROM "{table}" WHERE "{col}" = ANY(:ids)'),
-            {"ids": member_ids},
-        )
+    references = result.mappings().all()
+    for reference in references:
+        # Let PostgreSQL perform constraints that already declare an action:
+        # c = CASCADE, n = SET NULL, d = SET DEFAULT.
+        if reference["delete_action"] in {"c", "n", "d"}:
+            continue
+
+        schema = _quote_pg_identifier(reference["schema_name"])
+        table = _quote_pg_identifier(reference["table_name"])
+        column = _quote_pg_identifier(reference["column_name"])
+        qualified_table = f"{schema}.{table}"
+
+        if reference["is_nullable"]:
+            statement = f"UPDATE {qualified_table} SET {column} = NULL WHERE {column} = ANY(:ids)"
+        else:
+            statement = f"DELETE FROM {qualified_table} WHERE {column} = ANY(:ids)"
+        await session.execute(text(statement), params)
+
+
+def _quote_pg_identifier(identifier: str) -> str:
+    """Quote an identifier returned by PostgreSQL's system catalog."""
+    escaped = identifier.replace('"', '""')
+    return f'"{escaped}"'
 
 
 # ---- 请求模型 ----
@@ -227,7 +233,7 @@ async def create_role(req: CreateRoleRequest):
     auth_service = get_auth_service()
     result = await auth_service.create_role(req.name, req.display_name, req.permissions)
     if result is None:
-        return {"success": False, "error": "角色名已存在"}
+        raise HTTPException(status_code=409, detail="角色名已存在")
     return {"success": True, "role": result}
 
 
@@ -237,7 +243,7 @@ async def update_role(role_id: int, req: UpdateRoleRequest):
     auth_service = get_auth_service()
     ok = await auth_service.update_role(role_id, req.display_name, req.permissions)
     if not ok:
-        return {"success": False, "error": "角色不存在"}
+        raise HTTPException(status_code=404, detail="角色不存在")
     return {"success": True}
 
 
@@ -247,7 +253,7 @@ async def delete_role(role_id: int):
     auth_service = get_auth_service()
     ok = await auth_service.delete_role(role_id)
     if not ok:
-        return {"success": False, "error": "角色不存在或为内置角色，无法删除"}
+        raise HTTPException(status_code=404, detail="角色不存在或为内置角色，无法删除")
     return {"success": True}
 
 
@@ -480,7 +486,7 @@ async def get_member(member_id: str):
         result = await session.execute(stmt)
         member = result.scalar_one_or_none()
         if not member:
-            return {"error": "成员不存在"}, 404
+            raise HTTPException(status_code=404, detail="成员不存在")
 
         roles = await auth_service.get_member_roles(member.id)
         permissions = list(await auth_service.get_member_permissions(member.id))
@@ -550,7 +556,7 @@ async def update_member(member_id: str, req: UpdateMemberRequest):
         result = await session.execute(stmt)
         member = result.scalar_one_or_none()
         if not member:
-            return {"success": False, "error": "成员不存在"}
+            raise HTTPException(status_code=404, detail="成员不存在")
 
         if req.name is not None:
             member.name = req.name
@@ -604,11 +610,11 @@ async def upload_member_avatar(member_id: str, file: UploadFile = File(...)):
 
     allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     if file.content_type not in allowed:
-        return {"error": "仅支持 jpg/png/gif/webp 格式"}
+        raise HTTPException(status_code=400, detail="仅支持 jpg/png/gif/webp 格式")
 
     content = await file.read()
     if len(content) > 5 * 1024 * 1024:
-        return {"error": "文件大小不能超过 5MB"}
+        raise HTTPException(status_code=413, detail="文件大小不能超过 5MB")
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     ext = file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "png"
@@ -622,7 +628,7 @@ async def upload_member_avatar(member_id: str, file: UploadFile = File(...)):
         result = await session.execute(stmt)
         member = result.scalar_one_or_none()
         if not member:
-            return {"error": "成员不存在"}
+            raise HTTPException(status_code=404, detail="成员不存在")
 
         avatar_url = get_upload_url(f"/uploads/avatars/{filename}")
         member.avatar_url = avatar_url
@@ -645,7 +651,7 @@ async def reset_password(member_id: str, req: ResetPasswordRequest):
         result = await session.execute(stmt)
         member = result.scalar_one_or_none()
         if not member:
-            return {"success": False, "error": "成员不存在"}
+            raise HTTPException(status_code=404, detail="成员不存在")
 
         new_password = req.password or _generate_random_password()
         member.password_hash = hash_password(new_password)
@@ -671,7 +677,7 @@ async def toggle_account(member_id: str):
         result = await session.execute(stmt)
         member = result.scalar_one_or_none()
         if not member:
-            return {"success": False, "error": "成员不存在"}
+            raise HTTPException(status_code=404, detail="成员不存在")
 
         member.is_account = not member.is_account
         initial_password = ""
@@ -700,7 +706,7 @@ async def delete_member(member_id: str):
         result = await session.execute(stmt)
         member = result.scalar_one_or_none()
         if not member:
-            return {"success": False, "error": "成员不存在"}
+            raise HTTPException(status_code=404, detail="成员不存在")
 
         await _cleanup_member_references(session, [member_id])
         await session.delete(member)
@@ -861,5 +867,3 @@ async def remove_role(member_id: str, role_name: str):
     if ok:
         auth_service.clear_cache()
     return {"success": ok}
-
-

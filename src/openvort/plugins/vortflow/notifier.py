@@ -237,8 +237,17 @@ class Notifier:
         project_id: str = "",
     ) -> None:
         label = _ENTITY_TYPE_LABEL.get(entity_type, entity_type)
+        log.info(
+            "notify_assignment: entity=%s/%s title=%r actor=%s new_assignee=%s project=%s",
+            entity_type, entity_id, title, actor_id, new_assignee_id, project_id,
+        )
         recipients = self._collect_recipients(actor_id, assignee_id=new_assignee_id)
         if not recipients:
+            log.info(
+                "notify_assignment skipped (no recipients): actor=%s new_assignee=%s "
+                "(actor 与 new_assignee 相同时不重复通知自己)",
+                actor_id, new_assignee_id,
+            )
             return
 
         ctx = await self._resolve_context(
@@ -267,7 +276,12 @@ class Notifier:
             "entity_id": entity_id,
             "project_id": project_id,
         }
-        await self._fan_out(recipients, "任务分配", summary, entity_id, data, im_text=im_text)
+        # 负责人变更属于「需要被分配人立刻知道」的事件，跳过 30s 聚合窗口直接推送，
+        # 避免新负责人一直觉得没收到通知（聚合一旦合到下一批 IM 文本里也容易被忽略）。
+        await self._fan_out(
+            recipients, "任务分配", summary, entity_id, data,
+            im_text=im_text, immediate=True,
+        )
 
     async def notify_comment(
         self,
@@ -416,6 +430,72 @@ class Notifier:
             "project_id": project_id,
         }
         await self._fan_out(recipients, notif_title, summary, entity_id, data, im_text=im_text)
+
+    async def notify_member_workload(
+        self,
+        *,
+        actor_id: str,
+        recipient_id: str,
+        notify_type: str = "remind",
+        custom_message: str = "",
+        project_id: str = "",
+        pending_total: int = 0,
+        overdue: int = 0,
+        due_soon: int = 0,
+        stale_count: int = 0,
+    ) -> None:
+        """Remind / urge a member to take care of their pending workload.
+
+        This is unbound to any specific work item — the source is the member
+        themselves. Triggered from the member-watchlist health dashboard.
+        """
+        if not recipient_id or recipient_id == actor_id:
+            return
+        if notify_type not in ("remind", "urge"):
+            notify_type = "remind"
+
+        ctx = await self._resolve_context(actor_id=actor_id, project_id=project_id)
+        actor = ctx["actor_name"] or "某人"
+        proj = ctx["project_name"]
+
+        if notify_type == "urge":
+            notif_title = "工作量催办"
+            action_word = "催促"
+        else:
+            notif_title = "工作量提醒"
+            action_word = "提醒"
+
+        summary = f"{actor} {action_word}你关注当前在手工作量"
+
+        im_lines = [self._im_header(notif_title, proj)]
+        im_lines.append(f"{actor} {action_word}你关注在手工作量")
+        extras: list[str] = []
+        if pending_total > 0:
+            extras.append(f"在手 {pending_total}")
+        if overdue > 0:
+            extras.append(f"逾期 {overdue}")
+        if due_soon > 0:
+            extras.append(f"即将到期 {due_soon}")
+        if stale_count > 0:
+            extras.append(f"停滞 {stale_count}")
+        if extras:
+            im_lines.append(" / ".join(extras))
+        if custom_message:
+            im_lines.append(f"附言: {custom_message}")
+        im_text = "\n".join(im_lines)
+
+        # entity_type="member_workload" so the notification center can later
+        # tell these apart from work-item driven manual reminders. _build_item_url
+        # does not know this type and will return "" — no link is appended.
+        data = {
+            "action": notify_type,
+            "entity_type": "member_workload",
+            "entity_id": recipient_id,
+            "project_id": project_id,
+        }
+        await self._fan_out(
+            [recipient_id], notif_title, summary, recipient_id, data, im_text=im_text,
+        )
 
     async def notify_field_changes(
         self,

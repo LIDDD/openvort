@@ -2,6 +2,7 @@
 Report plugin — AI-driven enterprise reporting management.
 """
 
+import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,20 @@ class ReportPlugin(BasePlugin):
 
         for prompt in self.get_prompts():
             api.register_prompt(prompt, source=f"plugin:{self.name}")
+
+        asyncio.create_task(self._seed_defaults())
+
+    @staticmethod
+    async def _seed_defaults() -> None:
+        """Insert built-in reaction phrases on first start. Idempotent."""
+        await asyncio.sleep(3)
+        try:
+            from openvort.db.engine import get_session_factory
+            from openvort.plugins.report.service import ReportService
+            service = ReportService(get_session_factory())
+            await service.seed_default_reaction_phrases()
+        except Exception as exc:
+            log.warning("Failed to seed default reaction phrases: %s", exc)
 
     def get_tools(self) -> list[BaseTool]:
         from openvort.db.engine import get_session_factory

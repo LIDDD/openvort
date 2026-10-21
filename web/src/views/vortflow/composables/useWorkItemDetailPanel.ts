@@ -16,6 +16,7 @@ export interface UseWorkItemDetailPanelOptions {
     loadItemById: (id: string | undefined, type: WorkItemType | string) => Promise<RowItem | null>;
     loadChildItems: (parentId: string, type: string, projectId?: string) => Promise<RowItem[]>;
     getRowPriority: (record: RowItem, text?: Priority) => Priority;
+    getRowPriorityScore: (record: RowItem) => number;
     getRowTags: (record: RowItem, text?: string[]) => string[];
     planTimeModel: Record<string, any>;
 }
@@ -26,6 +27,7 @@ export function useWorkItemDetailPanel(options: UseWorkItemDetailPanelOptions) {
         loadItemById,
         loadChildItems,
         getRowPriority,
+        getRowPriorityScore,
         getRowTags,
         planTimeModel,
     } = options;
@@ -178,6 +180,7 @@ export function useWorkItemDetailPanel(options: UseWorkItemDetailPanelOptions) {
 
         return {
             priority: getRowPriority(record, record.priority),
+            priorityScore: getRowPriorityScore(record),
             tags: getRowTags(record, record.tags),
             planTime: planTimeModel[record.workNo] || record.planTime,
         };

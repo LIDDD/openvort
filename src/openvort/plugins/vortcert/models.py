@@ -72,7 +72,13 @@ class CertCertificate(Base):
 
 
 class CertCheckLog(Base):
-    """Certificate check / probe log entries."""
+    """Certificate check / probe log entries.
+
+    `source` distinguishes between status derivations from the certificate table
+    (`derived`) and live 443 SSL probes against the target server (`probe`).
+    Existing rows default to `probe` since pre-refactor entries all came from the
+    443 prober that previously backed `cert_domains.last_check_status`.
+    """
 
     __tablename__ = "cert_check_logs"
 
@@ -85,6 +91,7 @@ class CertCheckLog(Base):
     status: Mapped[str] = mapped_column(String(16), default="ok")  # ok/warning/critical/expired/error
     error_message: Mapped[str] = mapped_column(Text, default="")
     serial_number: Mapped[str] = mapped_column(String(128), default="")
+    source: Mapped[str] = mapped_column(String(16), default="probe")  # derived / probe
 
 
 class CertDeployTarget(Base):
